@@ -1,0 +1,66 @@
+name: Task
+description: Erstelle ein strukturiertes Issue für den Agenten.
+title: "feat/fix: [Kurzbeschreibung]"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### Task-Spezifikation für den Agenten
+        Bitte fülle diese Felder aus. Der Agent benötigt diese strukturierte Beschreibung, um den Task autonom bearbeiten zu können. 
+        **Hinweis:** Füge das Label `ready-for-agent` nach dem Erstellen manuell hinzu, um den Agenten zu starten.
+  - type: textarea
+    id: what-to-build
+    attributes:
+      label: What to build
+      description: Präzise Beschreibung des Features oder Bugfixes.
+      placeholder: Detaillierte technische Beschreibung...
+    validations:
+      required: true
+  - type: input
+    id: scope
+    attributes:
+      label: Scope
+      description: Subsystem-Name für Conventional Commits (z. B. auth, api, ui, db, ci).
+      placeholder: z. B. api
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Rahmenbedingungen und ADR-Referenzen (z. B. - [ADR-0001](./docs/adr/0001-single-model-runtime.md)).
+    validations:
+      required: true
+  - type: textarea
+    id: edge-cases
+    attributes:
+      label: Edge cases
+      description: Getestete Randfälle und Concurrency-Bedingungen.
+    validations:
+      required: true
+  - type: textarea
+    id: cross-cutting-concerns
+    attributes:
+      label: Cross-cutting concerns
+      description: Übergreifende Aspekte (z. B. Caching, API-Envelopes).
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: Testbare Akzeptanzkriterien (als Checkliste).
+      value: |
+        - [ ] Kriterium 1
+        - [ ] All new code paths have test coverage
+        - [ ] Local checks pass
+    validations:
+      required: true
+  - type: input
+    id: blocked-by
+    attributes:
+      label: Blocked by
+      description: Blockierende Issues (z. B. #42, #10).
+      placeholder: optional
+    validations:
+      required: false
