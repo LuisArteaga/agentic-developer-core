@@ -33,3 +33,14 @@ Instead, the entire system will be implemented as a pure Python application:
 ### Cons
 - **Tool Development**: We must implement and test custom file-editing tools (such as regex-based search-and-replace or diff patching) to ensure the LLM can modify code accurately without causing formatting issues.
 - **Loss of Built-in Smart Features**: We lose the out-of-the-box shell intelligence, automatic terminal command retries, and interactive recovery mechanisms built into Claude Code CLI.
+
+## Rejected Alternatives
+
+### 1. Wrapped CLI with Structured JSON Output (`--output-format json`)
+We rejected utilizing the Claude Code CLI with its structured JSON output flags (e.g. `--output-format json` / `--json-schema`).
+* **Why**: Although structured output resolves basic stdout parsing fragility, it still treats the Worker agent as a black box. The orchestrator cannot programmatically enforce the **Read-Before-Edit** safety check (verifying that the agent read the file in the current cycle) or the **Block-Based Patching** constraint (failing on multi-match ambiguity) because the CLI's internal editor tool handles modifications invisibly.
+
+### 2. Complete File Rewrite on Edit Ambiguity (Anthropic SDK Default)
+The Anthropic Agent SDK recommends recovering from `old_string is not unique in the file` errors by performing a full file read followed by a complete file overwrite (`Write` tool). We rejected this recovery strategy.
+* **Why**: Under the **Lazy Coding Principle**, rewriting entire files is highly inefficient, consumes excessive output tokens, and introduces the risk of code truncation (where the LLM laziness results in stubbed files). Instead, we enforce finding a unique surrounding block of context (`old_string`) to execute a targeted search-and-replace, keeping PR diffs minimal and safe.
+
