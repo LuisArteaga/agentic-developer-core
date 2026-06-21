@@ -106,7 +106,11 @@ def get_agent_logs_dir() -> str:
         return local_logs
     # Fallback to temp logs if nothing else works
     tmp_logs = "/tmp/agent_logs"
-    os.makedirs(tmp_logs, exist_ok=True)
+    try:
+        os.makedirs(tmp_logs, mode=0o700, exist_ok=True)
+        os.chmod(tmp_logs, 0o700)
+    except Exception:
+        pass
     return tmp_logs
 
 
@@ -163,7 +167,10 @@ _span_stack = []
 
 
 # Module-level state for in-process tracking
-_STATE_FILE = "/tmp/telemetry_state.json"
+def _get_state_file_path() -> str:
+    """Returns a secure, user-private path for the telemetry state file."""
+    logs_dir = get_agent_logs_dir()
+    return os.path.join(logs_dir, "telemetry_state.json")
 
 _state = {
     "loop_start_time": None,
@@ -176,9 +183,10 @@ _state = {
 
 def _load_state():
     global _state
-    if os.path.exists(_STATE_FILE):
+    state_file = _get_state_file_path()
+    if os.path.exists(state_file):
         try:
-            with open(_STATE_FILE, "r") as f:
+            with open(state_file, "r") as f:
                 loaded = json.load(f)
                 for k, v in loaded.items():
                     if k == "phases":
@@ -191,7 +199,8 @@ def _load_state():
 
 def _save_state():
     try:
-        with open(_STATE_FILE, "w") as f:
+        state_file = _get_state_file_path()
+        with open(state_file, "w") as f:
             json.dump(_state, f)
     except Exception:
         pass
@@ -212,9 +221,10 @@ def init_telemetry(in_memory_exporter=None, reset_state=True):
             "loop_issue_number": None,
             "phases": {}
         }
-        if os.path.exists(_STATE_FILE):
+        state_file = _get_state_file_path()
+        if os.path.exists(state_file):
             try:
-                os.remove(_STATE_FILE)
+                os.remove(state_file)
             except Exception:
                 pass
 
@@ -290,9 +300,10 @@ def start_orchestrator_loop(issue_number=None):
         "loop_issue_number": None,
         "phases": {}
     }
-    if os.path.exists(_STATE_FILE):
+    state_file = _get_state_file_path()
+    if os.path.exists(state_file):
         try:
-            os.remove(_STATE_FILE)
+            os.remove(state_file)
         except Exception:
             pass
 
@@ -313,9 +324,10 @@ def end_orchestrator_loop(exit_code=0):
     
     _export_recorded_spans()
     
-    if os.path.exists(_STATE_FILE):
+    state_file = _get_state_file_path()
+    if os.path.exists(state_file):
         try:
-            os.remove(_STATE_FILE)
+            os.remove(state_file)
         except Exception:
             pass
 
