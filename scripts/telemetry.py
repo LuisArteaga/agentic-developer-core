@@ -432,11 +432,11 @@ def _export_recorded_spans():
             phase_span.set_attribute("llm.model_name", phase_data["model_name"])
             
         status_code = trace.StatusCode.OK if p_exit == 0 else trace.StatusCode.ERROR
-        phase_span.set_status(trace.Status(status_code, f"exit code {p_exit}" if p_exit != 0 else ""))
+        phase_span.set_status(trace.Status(status_code, f"exit code {p_exit}" if p_exit != 0 else None))
         phase_span.end(end_time=p_end_nano)
         
     exit_code = _state.get("loop_exit_code", 0)
     loop_span.set_attribute("command.exit_code", exit_code)
     status_code = trace.StatusCode.OK if exit_code == 0 else trace.StatusCode.ERROR
-    loop_span.set_status(trace.Status(status_code, f"exit code {exit_code}" if exit_code != 0 else ""))
+    loop_span.set_status(trace.Status(status_code, f"exit code {exit_code}" if exit_code != 0 else None))
     loop_span.end(end_time=loop_end_nano)
