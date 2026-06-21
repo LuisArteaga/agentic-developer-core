@@ -29,6 +29,7 @@ class AgentState(TypedDict):
     branch: Optional[str]
     model: str
     plan: Optional[str]
+    read_files: list[str]
     updated_at: str
 
 DEFAULT_STATE: AgentState = {
@@ -39,6 +40,7 @@ DEFAULT_STATE: AgentState = {
     "branch": None,
     "model": "",
     "plan": None,
+    "read_files": [],
     "updated_at": "",
 }
 
@@ -131,7 +133,7 @@ def load(filepath: Optional[Union[str, Path]] = None) -> AgentState:
             raise ValueError("State JSON root is not a dictionary")
 
         # Validate that all required keys exist
-        required_keys = {"issue_number", "status", "phase", "attempts", "branch", "model", "plan", "updated_at"}
+        required_keys = {"issue_number", "status", "phase", "attempts", "branch", "model", "plan", "read_files", "updated_at"}
         missing_keys = required_keys - data.keys()
         if missing_keys:
             raise ValueError(f"State is missing required keys: {missing_keys}")
@@ -143,6 +145,10 @@ def load(filepath: Optional[Union[str, Path]] = None) -> AgentState:
         # Validate attempts type
         if not isinstance(data["attempts"], dict):
             raise ValueError("Field 'attempts' must be a dictionary")
+
+        # Validate read_files type
+        if not isinstance(data["read_files"], list):
+            raise ValueError("Field 'read_files' must be a list")
 
         # Return successfully parsed state
         return data
