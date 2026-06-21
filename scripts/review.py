@@ -129,41 +129,7 @@ SYSTEM_PROMPT_ARCH = (
     "</findings>"
 )
 
-def sanitize_json_str(s):
-    """Sanitizes unescaped control characters in JSON strings."""
-    res = []
-    in_string = False
-    escaped = False
-    for char in s:
-        if char == '"':
-            if in_string:
-                if escaped:
-                    res.append(char)
-                    escaped = False
-                else:
-                    res.append(char)
-                    in_string = False
-            else:
-                res.append(char)
-                in_string = True
-        elif char == '\\':
-            res.append(char)
-            if in_string:
-                escaped = not escaped
-        else:
-            if in_string and ord(char) < 32:
-                if char == '\n':
-                    res.append('\\n')
-                elif char == '\t':
-                    res.append('\\t')
-                elif char == '\r':
-                    res.append('\\r')
-                else:
-                    res.append(f'\\u{ord(char):04x}')
-            else:
-                res.append(char)
-            escaped = False
-    return "".join(res)
+
 
 def run_command(cmd, env=None):
     """Runs a shell command and returns code, stdout, stderr."""
@@ -232,8 +198,7 @@ def call_llm_for_review(model, system_prompt, diff, api_key):
                 status, body = call_openrouter_api(model, messages, api_key)
                 
                 # Pre-validate structure before considering it OK
-                sanitized_body = sanitize_json_str(body)
-                parsed_body = json.loads(sanitized_body)
+                parsed_body = json.loads(body, strict=False)
                 
                 if "error" in parsed_body:
                     err = parsed_body["error"]
@@ -333,8 +298,7 @@ def evaluate_response(raw_response: str) -> Tuple[str, str, List[str]]:
     Returns (verdict, reasoning, findings_list)
     where verdict is 'Pass', 'Fail', or 'Needs Review'.
     """
-    sanitized_response = sanitize_json_str(raw_response)
-    data = json.loads(sanitized_response)
+    data = json.loads(raw_response, strict=False)
     content = data["choices"][0]["message"]["content"]
     
     if not content:
@@ -355,7 +319,7 @@ def evaluate_response(raw_response: str) -> Tuple[str, str, List[str]]:
         if not line:
             continue
         try:
-            f = json.loads(sanitize_json_str(line))
+            f = json.loads(line, strict=False)
             if not isinstance(f, dict):
                 continue
             sev = f.get("severity", "bug").lower()

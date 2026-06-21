@@ -1,6 +1,6 @@
 name: Task
 description: Erstelle ein strukturiertes Issue für den Agenten.
-title: "feat/fix: [Kurzbeschreibung]"
+title: "feat: [Kurzbeschreibung]"
 body:
   - type: markdown
     attributes:
