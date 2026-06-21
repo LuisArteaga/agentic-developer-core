@@ -1,10 +1,10 @@
-# ADR 0005: Pure Python LangGraph Orchestration without CLI Harnesses
+# ADR 0009: Pure Python LangGraph Orchestration without CLI Harnesses
 
 ## Status
 Accepted
 
 ## Context
-The previous architecture (outlined in earlier drafts of ADR-0005) proposed a hybrid orchestrator model where a Python LangGraph process managed the high-level loop (poll, plan, verify, PR, merge) and spawned the Claude Code CLI as a subprocess worker to perform file-editing and local testing. 
+The previous architecture (outlined in [ADR-0005](./0005-hybrid-langgraph-orchestrator-with-claude-code-worker.md)) proposed a hybrid orchestrator model where a Python LangGraph process managed the high-level loop (poll, plan, verify, PR, merge) and spawned the Claude Code CLI as a subprocess worker to perform file-editing and local testing. 
 
 However, invoking the Claude Code CLI (or similar CLI harnesses like OpenCode) headlessly in an autonomous loop introduces several critical complexities:
 1. **State & Session Persistence**: Claude Code CLI keeps its transcript and session state in a container-internal directory (`/home/claude/.claude/projects/`). Retaining this across container crashes requires persistent Docker host mounts.
