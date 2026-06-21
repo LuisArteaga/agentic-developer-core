@@ -57,29 +57,20 @@ VALID_STATUSES = {
 }
 
 def get_state_filepath() -> Path:
-    """Resolve and return the path to the state.json file, aligning with telemetry directory logic."""
-    # 1. Check if /workspace/.agent_logs exists and is writable (inside container)
-    workspace_logs = Path("/workspace/.agent_logs")
-    if workspace_logs.exists() and os.access(workspace_logs, os.W_OK):
-        return workspace_logs / "state.json"
+    """Resolve and return the path to the state.json file, honoring the AGENT_LOG_PATH env var."""
+    log_dir_name = os.getenv("AGENT_LOG_PATH", ".agent_logs")
+    log_dir = Path(log_dir_name)
+    
+    # If the path is relative, resolve it relative to the project root
+    if not log_dir.is_absolute():
+        project_root = Path(__file__).resolve().parent.parent
+        log_dir = project_root / log_dir_name
 
-    # 2. Check local .agent_logs relative to project root
-    project_root = Path(__file__).resolve().parent.parent
-    local_logs = project_root / ".agent_logs"
     try:
-        local_logs.mkdir(parents=True, exist_ok=True)
-        if os.access(local_logs, os.W_OK):
-            return local_logs / "state.json"
+        log_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
-
-    # 3. Fallback to /tmp/agent_logs if local directory is not writable
-    tmp_logs = Path("/tmp/agent_logs")
-    try:
-        tmp_logs.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    return tmp_logs / "state.json"
+    return log_dir / "state.json"
 
 def save(state: AgentState, filepath: Optional[Union[str, Path]] = None) -> None:
     """Save the agent state atomically to the specified filepath or default state.json path.

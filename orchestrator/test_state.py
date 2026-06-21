@@ -5,8 +5,6 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
-
 from orchestrator.state import DEFAULT_STATE, get_state_filepath, load, save
 
 
@@ -143,44 +141,35 @@ class TestStatePersistence(unittest.TestCase):
 
 
 class TestGetStateFilepath(unittest.TestCase):
-    @patch("orchestrator.state.os.access")
-    def test_workspace_logs_selected(self, mock_access):
-        """Test that /workspace/.agent_logs is selected if it exists and is writable."""
-        mock_access.return_value = True
-        original_exists = Path.exists
-        try:
-            Path.exists = lambda self: str(self) == "/workspace/.agent_logs"
-            filepath = get_state_filepath()
-            self.assertEqual(filepath, Path("/workspace/.agent_logs/state.json"))
-        finally:
-            Path.exists = original_exists
+    def setUp(self):
+        self.original_env = os.environ.get("AGENT_LOG_PATH")
 
-    @patch("orchestrator.state.os.access")
-    @patch("orchestrator.state.Path.mkdir")
-    def test_local_logs_selected(self, mock_mkdir, mock_access):
-        """Test that project_root/.agent_logs is selected if workspace logs do not exist."""
-        mock_access.return_value = True
-        original_exists = Path.exists
-        try:
-            Path.exists = lambda self: False
-            filepath = get_state_filepath()
-            self.assertTrue(str(filepath).endswith(".agent_logs/state.json"))
-            mock_mkdir.assert_called()
-        finally:
-            Path.exists = original_exists
+    def tearDown(self):
+        if self.original_env is not None:
+            os.environ["AGENT_LOG_PATH"] = self.original_env
+        elif "AGENT_LOG_PATH" in os.environ:
+            del os.environ["AGENT_LOG_PATH"]
 
-    @patch("orchestrator.state.os.access")
-    @patch("orchestrator.state.Path.mkdir")
-    def test_fallback_to_tmp(self, mock_mkdir, mock_access):
-        """Test fallback to /tmp/agent_logs if both workspace and local logs are not writable."""
-        mock_access.return_value = False
-        original_exists = Path.exists
-        try:
-            Path.exists = lambda self: False
-            filepath = get_state_filepath()
-            self.assertEqual(filepath, Path("/tmp/agent_logs/state.json"))
-        finally:
-            Path.exists = original_exists
+    def test_custom_agent_log_path(self):
+        """Test that get_state_filepath uses the path from AGENT_LOG_PATH env var when set."""
+        os.environ["AGENT_LOG_PATH"] = "/custom/path/to/logs"
+        filepath = get_state_filepath()
+        self.assertEqual(filepath, Path("/custom/path/to/logs/state.json"))
+
+    def test_relative_agent_log_path(self):
+        """Test that relative paths in AGENT_LOG_PATH are resolved against the project root."""
+        os.environ["AGENT_LOG_PATH"] = "custom_relative"
+        filepath = get_state_filepath()
+        project_root = Path(__file__).resolve().parent.parent
+        self.assertEqual(filepath, project_root / "custom_relative" / "state.json")
+
+    def test_default_agent_log_path_when_unset(self):
+        """Test that get_state_filepath defaults to .agent_logs relative to project root when env var is unset."""
+        if "AGENT_LOG_PATH" in os.environ:
+            del os.environ["AGENT_LOG_PATH"]
+        filepath = get_state_filepath()
+        project_root = Path(__file__).resolve().parent.parent
+        self.assertEqual(filepath, project_root / ".agent_logs" / "state.json")
 
 
 if __name__ == "__main__":
