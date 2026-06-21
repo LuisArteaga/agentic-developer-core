@@ -97,9 +97,6 @@ def save(state: AgentState, filepath: Optional[Union[str, Path]] = None) -> None
     try:
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
-            f.flush()
-            # Flush file buffers to disk for crash safety
-            os.fsync(f.fileno())
 
         # Atomically replace target file with the temp file
         os.replace(temp_path, target_path)

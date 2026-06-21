@@ -1,6 +1,4 @@
-.PHONY: verify test
+.PHONY: verify
 
-verify: test
-
-test:
-	.venv/bin/python -m unittest discover -s . -p "test_*.py"
+verify:
+	python3 -m unittest discover -s . -p "test_*.py"

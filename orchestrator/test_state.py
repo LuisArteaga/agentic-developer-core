@@ -5,8 +5,9 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from orchestrator.state import DEFAULT_STATE, load, save
+from orchestrator.state import DEFAULT_STATE, get_state_filepath, load, save
 
 
 class TestStatePersistence(unittest.TestCase):
@@ -125,6 +126,47 @@ class TestStatePersistence(unittest.TestCase):
 
         loaded_state = load(self.state_file)
         self.assertEqual(loaded_state, DEFAULT_STATE)
+
+
+class TestGetStateFilepath(unittest.TestCase):
+    @patch("orchestrator.state.os.access")
+    def test_workspace_logs_selected(self, mock_access):
+        """Test that /workspace/.agent_logs is selected if it exists and is writable."""
+        mock_access.return_value = True
+        original_exists = Path.exists
+        try:
+            Path.exists = lambda self: str(self) == "/workspace/.agent_logs"
+            filepath = get_state_filepath()
+            self.assertEqual(filepath, Path("/workspace/.agent_logs/state.json"))
+        finally:
+            Path.exists = original_exists
+
+    @patch("orchestrator.state.os.access")
+    @patch("orchestrator.state.Path.mkdir")
+    def test_local_logs_selected(self, mock_mkdir, mock_access):
+        """Test that project_root/.agent_logs is selected if workspace logs do not exist."""
+        mock_access.return_value = True
+        original_exists = Path.exists
+        try:
+            Path.exists = lambda self: False
+            filepath = get_state_filepath()
+            self.assertTrue(str(filepath).endswith(".agent_logs/state.json"))
+            mock_mkdir.assert_called()
+        finally:
+            Path.exists = original_exists
+
+    @patch("orchestrator.state.os.access")
+    @patch("orchestrator.state.Path.mkdir")
+    def test_fallback_to_tmp(self, mock_mkdir, mock_access):
+        """Test fallback to /tmp/agent_logs if both workspace and local logs are not writable."""
+        mock_access.return_value = False
+        original_exists = Path.exists
+        try:
+            Path.exists = lambda self: False
+            filepath = get_state_filepath()
+            self.assertEqual(filepath, Path("/tmp/agent_logs/state.json"))
+        finally:
+            Path.exists = original_exists
 
 
 if __name__ == "__main__":
