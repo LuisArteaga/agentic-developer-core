@@ -427,7 +427,7 @@ def main():
             sec_span.set_attribute("eval.findings_count", len(sec_findings))
             
             status_code = trace.StatusCode.OK if sec_verdict == "Pass" else trace.StatusCode.ERROR
-            sec_span.set_status(trace.Status(status_code, f"Verdict: {sec_verdict}"))
+            sec_span.set_status(trace.Status(status_code, f"Verdict: {sec_verdict}" if status_code == trace.StatusCode.ERROR else None))
             
         # 2. RUN ARCHITECTURE COMPLIANCE EVALUATION
         arch_verdict = "Needs Review"
@@ -460,7 +460,7 @@ def main():
             arch_span.set_attribute("eval.findings_count", len(arch_findings))
             
             status_code = trace.StatusCode.OK if arch_verdict == "Pass" else trace.StatusCode.ERROR
-            arch_span.set_status(trace.Status(status_code, f"Verdict: {arch_verdict}"))
+            arch_span.set_status(trace.Status(status_code, f"Verdict: {arch_verdict}" if status_code == trace.StatusCode.ERROR else None))
             
         # 3. POST DISCRETE REVIEWS AND COMPUTE EXIT CODE
         security_failed = (sec_verdict in ["Fail", "Needs Review"])
