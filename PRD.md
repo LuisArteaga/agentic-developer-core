@@ -33,7 +33,7 @@ All git reset, cleaning, and workspace preparation logic is handled programmatic
 ### 2.3 Local-State Serialization for Resume
 The graph state is written atomically to `.agent_logs/state.json` on every state transition. Since there is no external CLI, true work resume is simple:
 - When the orchestrator starts, it loads `state.json`.
-- If an in-progress issue and branch are detected, it skips the workspace wipe, checks out the existing branch, and resumes execution at the recorded graph node.
+- If an in-progress issue and branch are detected, it checks out the existing branch, cleans up untracked files, and restarts the target phase node from scratch.
 - No Docker host mounts for CLI session files are required.
 
 ### 2.4 Custom Tool Suite
@@ -68,7 +68,7 @@ orchestrator/
 | `tools.py` | Standard Python code tools for safe file edits, ripgrep, and subprocess running. |
 
 ### 3.2 Telemetry Integration
-Telemetry spans are created using the existing [scripts/telemetry.py](file:///home/larteaga/projects/agentic-developer-core/scripts/telemetry.py) module. Because the orchestrator runs natively in Python, nodes import the tracing helpers directly, establishing clean parent-child span trees (e.g., `orchestrator_loop` parent containing `orchestrator_phase_plan`, `orchestrator_phase_execute`, etc.) without resorting to shell execution boundaries.
+Telemetry spans are created using the existing [scripts/telemetry.py](./scripts/telemetry.py) module. Because the orchestrator runs natively in Python, nodes import the tracing helpers directly, establishing clean parent-child span trees (e.g., `orchestrator_loop` parent containing `orchestrator_phase_plan`, `orchestrator_phase_execute`, etc.) without resorting to shell execution boundaries.
 
 ---
 
@@ -94,5 +94,5 @@ Telemetry spans are created using the existing [scripts/telemetry.py](file:///ho
 - **AC2. LangGraph State Machine**: Workflow transitions, conditional routing, and phase recovery are modeled as a LangGraph.
 - **AC3. Persistent Resume**: State transitions are written atomically to `.agent_logs/state.json`. Interrupted cycles can resume by reading this file, restoring git state, and restarting from the recorded node.
 - **AC4. Custom Agent Tools**: The ReAct Worker agent uses custom Python tools for reading, patching, searching, and running tests. Tool output is clean, formatted, and easily consumed by the agent.
-- **AC5. Telemetry Integration**: High-level spans are recorded in-process via [scripts/telemetry.py](file:///home/larteaga/projects/agentic-developer-core/scripts/telemetry.py) imports, forming structured span trees.
+- **AC5. Telemetry Integration**: High-level spans are recorded in-process via [scripts/telemetry.py](./scripts/telemetry.py) imports, forming structured span trees.
 - **AC6. Test Compatibility**: The supervisor remains thin and compatible with workflow exit-code checks. All validation scripts pass cleanly.
