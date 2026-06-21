@@ -170,10 +170,33 @@ def run_command(cmd, env=None):
     res = subprocess.run(cmd, capture_output=True, text=True, env=env)
     return res.returncode, res.stdout, res.stderr
 
+ROUTING_PREFERENCES = {
+    "moonshotai/kimi-k2.7-code": {
+        "only": ["together", "moonshotai"],
+        "allow_fallbacks": True,
+        "sort": "latency"
+    },
+    "deepseek/deepseek-v4-pro": {
+        "only": ["baidu", "novita", "deepinfra"],
+        "allow_fallbacks": True,
+        "sort": "latency"
+    },
+    "deepseek/deepseek-v4-flash": {
+        "only": ["deepinfra", "baidu", "novita"],
+        "allow_fallbacks": True,
+        "sort": "latency"
+    }
+}
+
 def call_openrouter_api(model, messages, api_key):
     """Performs HTTP request to OpenRouter chat completions API."""
     url = "https://openrouter.ai/api/v1/chat/completions"
-    payload = json.dumps({"model": model, "messages": messages})
+    
+    payload_dict = {"model": model, "messages": messages}
+    if model in ROUTING_PREFERENCES:
+        payload_dict["provider"] = ROUTING_PREFERENCES[model]
+        
+    payload = json.dumps(payload_dict)
     data = payload.encode("utf-8")
     req = urllib.request.Request(
         url,
