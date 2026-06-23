@@ -20,32 +20,13 @@ PATTERNS = {
     "high-entropy-base64": re.compile(r"(?:[A-Za-z0-9+/]{40,}(?:={0,2})\n?){2,}"),
 }
 
-ALLOWLIST_FILES = {
-    ".env.example",
-}
-
-ALLOWLIST_PATHS = {
-    Path(".env.example"),
-}
-
-BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico",
-    ".pyc", ".pyo", ".so", ".dll", ".dylib", ".exe",
-    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".mp3", ".mp4", ".avi", ".mkv", ".mov", ".wav", ".flac",
-    ".ttf", ".otf", ".woff", ".woff2", ".eot",
-    ".class", ".jar", ".war", ".ear",
-    ".bin", ".dat", ".o", ".a", ".obj",
-}
-
-
 def is_binary(path: Path) -> bool:
-    if path.suffix.lower() in BINARY_EXTENSIONS:
+    try:
+        with path.open("rb") as f:
+            chunk = f.read(8192)
+        return b"\0" in chunk
+    except Exception:
         return True
-    with path.open("rb") as f:
-        chunk = f.read(8192)
-    return b"\0" in chunk
 
 
 def scan_text(text: str, filename: str):
@@ -57,12 +38,13 @@ def scan_text(text: str, filename: str):
 
 
 def scan_file(path: Path) -> list:
-    if path.name in ALLOWLIST_FILES or path in ALLOWLIST_PATHS:
+    if path.name == ".env.example":
         return []
     if is_binary(path):
         return []
     with path.open("r", encoding="utf-8", errors="replace") as f:
         return scan_text(f.read(), str(path))
+
 
 
 def get_staged_files() -> list[Path]:
