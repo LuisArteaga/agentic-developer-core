@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from orchestrator import state
-from orchestrator.tools import read_file, list_directory, grep_search
+from orchestrator.tools import read_file, list_directory, grep_search, patch_file
 
 class TestCodebaseTools(unittest.TestCase):
     def setUp(self):
@@ -154,6 +154,61 @@ class TestCodebaseTools(unittest.TestCase):
     def test_grep_search_errors(self):
         """Test grep_search path validation."""
         self.assertIn("does not exist", grep_search("test", "nonexistent_path"))
+
+    def test_patch_file_success(self):
+        """Test successful patch_file execution after reading the file first."""
+        # 1. Read the file first to register it in state
+        read_file(str(self.text_file))
+        
+        # 2. Patch a unique line
+        res = patch_file(str(self.text_file), "line two", "line modified")
+        self.assertIn("patched successfully", res)
+        
+        # 3. Read it again to verify content
+        updated_content = read_file(str(self.text_file))
+        self.assertEqual(updated_content, "line one\nline modified\nline three\nline four")
+
+    def test_patch_file_read_before_edit_violation(self):
+        """Test that patch_file aborts if the file was not read in the current cycle."""
+        # Do NOT call read_file
+        res = patch_file(str(self.text_file), "line two", "line modified")
+        self.assertIn("Read-Before-Edit validation failed", res)
+
+    def test_patch_file_zero_matches(self):
+        """Test that patch_file aborts if target_content is not found."""
+        read_file(str(self.text_file))
+        res = patch_file(str(self.text_file), "nonexistent line", "replacement")
+        self.assertIn("was not found", res)
+
+    def test_patch_file_multiple_matches(self):
+        """Test that patch_file aborts if target_content is ambiguous (multiple occurrences)."""
+        # Create a file with duplicate lines
+        dup_file = self.temp_dir_path / "duplicate.txt"
+        dup_file.write_text("duplicate\nsome other text\nduplicate", encoding="utf-8")
+        
+        read_file(str(dup_file))
+        res = patch_file(str(dup_file), "duplicate", "single replacement")
+        self.assertIn("matches multiple times", res)
+
+    def test_patch_file_binary(self):
+        """Test that patch_file aborts when targeting a binary file."""
+        # Hand-register the binary file to bypass Read-Before-Edit check
+        loaded = state.load(self.state_file_path)
+        loaded["read_files"].append(str(self.binary_file.resolve()))
+        state.save(loaded, self.state_file_path)
+        
+        res = patch_file(str(self.binary_file), "hello", "world")
+        self.assertIn("is a binary file", res)
+
+    def test_patch_file_nonexistent(self):
+        """Test that patch_file aborts for nonexistent files even if registered in state."""
+        # Hand-register a nonexistent file to bypass Read-Before-Edit check
+        loaded = state.load(self.state_file_path)
+        loaded["read_files"].append("ghost.txt")
+        state.save(loaded, self.state_file_path)
+        
+        res = patch_file("ghost.txt", "something", "else")
+        self.assertIn("does not exist", res)
 
 if __name__ == "__main__":
     unittest.main()

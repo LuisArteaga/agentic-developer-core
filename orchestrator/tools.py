@@ -165,3 +165,61 @@ def grep_search(query: str, path: str) -> str:
         return f"No matches found for query '{query}' in '{path}'."
         
     return "\n".join(matches)
+
+def patch_file(path: str, target_content: str, replacement_content: str) -> str:
+    """Perform exact search-and-replace of target_content with replacement_content.
+    
+    Enforces 'Read-Before-Edit' by verifying that the normalized path has been registered in the
+    'read_files' list inside the orchestrator state.
+    Enforces 'Ambiguity Abort' by verifying that target_content matches exactly once in the file.
+    """
+    abs_path, rel_str = _normalize_path(path)
+    
+    # 1. Read-Before-Edit Constraint
+    try:
+        curr_state = state.load()
+        read_files = curr_state.get("read_files", [])
+    except Exception:
+        read_files = []
+        
+    if rel_str not in read_files:
+        return f"Error: Read-Before-Edit validation failed. File '{path}' has not been read in the current execution cycle. Please call 'read_file' first."
+
+    # 2. Path Validation & Existence
+    if not abs_path.exists():
+        return f"Error: File '{path}' does not exist."
+    if not abs_path.is_file():
+        return f"Error: '{path}' is a directory, not a file."
+
+    # 3. Binary & Decode checks
+    try:
+        # Binary check: search for null byte in the first chunk
+        with open(abs_path, "rb") as f:
+            chunk = f.read(1024)
+            if b"\0" in chunk:
+                return f"Error: File '{path}' is a binary file."
+                
+        with open(abs_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        return f"Error: File '{path}' cannot be decoded with UTF-8 encoding."
+    except Exception as e:
+        return f"Error: Failed to read file '{path}': {e}"
+
+    # 4. Ambiguity Abort Rule (Uniqueness Check)
+    matches_count = content.count(target_content)
+    if matches_count == 0:
+        return f"Error: The target_content was not found in the file. It is possible the file was modified or you have outdated/incorrect context lines. Please call 'read_file' first to synchronize your state with the disk, then try again with the updated content."
+    elif matches_count > 1:
+        return f"Error: The target_content matches multiple times ({matches_count} occurrences). To resolve this ambiguity, please include more surrounding context lines in 'target_content' so that the match is unique."
+
+    # 5. Perform the edit
+    new_content = content.replace(target_content, replacement_content, 1)
+    
+    try:
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except Exception as e:
+        return f"Error: Failed to write to file '{path}': {e}"
+        
+    return f"Success: File '{path}' patched successfully. One occurrence replaced."
