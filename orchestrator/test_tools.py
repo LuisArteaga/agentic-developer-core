@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from orchestrator import state
+from orchestrator import state, tools
 from orchestrator.tools import read_file, list_directory, grep_search, patch_file
 
 class TestCodebaseTools(unittest.TestCase):
@@ -11,6 +11,9 @@ class TestCodebaseTools(unittest.TestCase):
         # Create a temporary directory for each test
         self.temp_dir = tempfile.TemporaryDirectory()
         self.temp_dir_path = Path(self.temp_dir.name).resolve()
+        
+        # Override project root for safety checks in tests
+        tools._PROJECT_ROOT = self.temp_dir_path
         
         # We will point AGENT_LOG_PATH to this temporary directory so that state file updates write there
         self.original_env = os.environ.get("AGENT_LOG_PATH")
@@ -50,7 +53,8 @@ class TestCodebaseTools(unittest.TestCase):
         self.ignored_file.write_text("this should not be found by grep", encoding="utf-8")
 
     def tearDown(self):
-        # Restore environment and clean up
+        # Restore project root and environment, and clean up
+        tools._PROJECT_ROOT = None
         if self.original_env is not None:
             os.environ["AGENT_LOG_PATH"] = self.original_env
         elif "AGENT_LOG_PATH" in os.environ:
@@ -65,7 +69,7 @@ class TestCodebaseTools(unittest.TestCase):
         
         # Check that path was registered in state.json
         loaded = state.load(self.state_file_path)
-        resolved_read_files = [str(Path(p).resolve()) for p in loaded["read_files"]]
+        resolved_read_files = [str((self.temp_dir_path / p).resolve()) for p in loaded["read_files"]]
         self.assertIn(str(self.text_file.resolve()), resolved_read_files)
 
     def test_read_file_success_slice(self):
@@ -194,7 +198,8 @@ class TestCodebaseTools(unittest.TestCase):
         """Test that patch_file aborts when targeting a binary file."""
         # Hand-register the binary file to bypass Read-Before-Edit check
         loaded = state.load(self.state_file_path)
-        loaded["read_files"].append(str(self.binary_file.resolve()))
+        _, rel_str = tools._normalize_path(str(self.binary_file))
+        loaded["read_files"].append(rel_str)
         state.save(loaded, self.state_file_path)
         
         res = patch_file(str(self.binary_file), "hello", "world")
@@ -209,6 +214,20 @@ class TestCodebaseTools(unittest.TestCase):
         
         res = patch_file("ghost.txt", "something", "else")
         self.assertIn("does not exist", res)
+
+    def test_path_traversal_protection(self):
+        """Test that paths outside the project root are rejected with Access denied."""
+        res = read_file("/etc/passwd")
+        self.assertIn("Access denied", res)
+        
+        res = list_directory("/etc")
+        self.assertIn("Access denied", res)
+        
+        res = grep_search("root", "/etc/passwd")
+        self.assertIn("Access denied", res)
+        
+        res = patch_file("/etc/passwd", "root", "toot")
+        self.assertIn("Access denied", res)
 
 if __name__ == "__main__":
     unittest.main()

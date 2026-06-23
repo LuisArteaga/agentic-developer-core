@@ -3,9 +3,15 @@ from pathlib import Path
 from typing import Optional
 from orchestrator import state
 
+# Can be overridden for testing purposes
+_PROJECT_ROOT: Optional[Path] = None
+
 def _normalize_path(path_str: str) -> tuple[Path, str]:
-    """Helper to resolve a path and return its absolute Path object and project-relative string path."""
-    project_root = Path(__file__).resolve().parent.parent
+    """Helper to resolve a path and return its absolute Path object and project-relative string path.
+    
+    Enforces path safety by raising ValueError if the resolved path is outside the project root.
+    """
+    project_root = _PROJECT_ROOT or Path(__file__).resolve().parent.parent
     p = Path(path_str)
     if not p.is_absolute():
         abs_path = (project_root / p).resolve()
@@ -16,7 +22,7 @@ def _normalize_path(path_str: str) -> tuple[Path, str]:
         rel_path = abs_path.relative_to(project_root)
         rel_str = str(rel_path)
     except ValueError:
-        rel_str = str(abs_path)
+        raise ValueError("Access denied: Path is outside the project root directory.")
     
     return abs_path, rel_str
 
@@ -25,7 +31,10 @@ def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[in
     
     Registers the file path in the 'read_files' list inside the orchestrator state.
     """
-    abs_path, rel_str = _normalize_path(path)
+    try:
+        abs_path, rel_str = _normalize_path(path)
+    except ValueError as e:
+        return f"Error: {e}"
     
     if not abs_path.exists():
         return f"Error: File '{path}' does not exist."
@@ -89,7 +98,10 @@ def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[in
 
 def list_directory(path: str) -> str:
     """List the contents of a directory, sorted alphabetically with directories first, followed by files."""
-    abs_path, _ = _normalize_path(path)
+    try:
+        abs_path, _ = _normalize_path(path)
+    except ValueError as e:
+        return f"Error: {e}"
     
     if not abs_path.exists():
         return f"Error: Directory '{path}' does not exist."
@@ -125,7 +137,10 @@ def grep_search(query: str, path: str) -> str:
     
     Ignores common non-code / environment directories.
     """
-    abs_path, _ = _normalize_path(path)
+    try:
+        abs_path, _ = _normalize_path(path)
+    except ValueError as e:
+        return f"Error: {e}"
     
     if not abs_path.exists():
         return f"Error: Path '{path}' does not exist."
@@ -173,7 +188,10 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
     'read_files' list inside the orchestrator state.
     Enforces 'Ambiguity Abort' by verifying that old_string matches exactly once in the file.
     """
-    abs_path, rel_str = _normalize_path(path)
+    try:
+        abs_path, rel_str = _normalize_path(path)
+    except ValueError as e:
+        return f"Error: {e}"
     
     # 1. Read-Before-Edit Constraint
     try:
