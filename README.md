@@ -8,10 +8,6 @@ An autonomous software engineer agent using LangGraph and LangChain for stateful
 
 ### Prerequisites
 - **Python 3.12+**
-- **Gitleaks** (Must be installed on your local system PATH; `make setup` only configures the hook harness, not the system binary itself):
-  - *macOS*: `brew install gitleaks`
-  - *Linux (Ubuntu/Debian)*: `sudo apt install gitleaks`
-  - *Other*: Download from the [Gitleaks Releases](https://github.com/gitleaks/gitleaks/releases) page and add to your PATH.
 - **OpenRouter API Key** (for LLM backend access)
 - **GitHub PAT** (with repo permission to manage PRs and issues)
 
@@ -32,8 +28,8 @@ An autonomous software engineer agent using LangGraph and LangChain for stateful
    cp .env.example .env
    ```
 
-3. **Install Pre-Commit Hooks:**
-   Run the setup target to install `pre-commit` and configure the local Gitleaks commit checks:
+3. **Install Pre-Commit Hook:**
+   Run the setup target to install a native git pre-commit hook that checks staged files using our lightweight, zero-dependency Python secret scanner:
    ```bash
    make setup
    ```
@@ -43,7 +39,7 @@ An autonomous software engineer agent using LangGraph and LangChain for stateful
 ## Development & Verification
 
 ### Running Verification
-To execute the unit tests and ensure code quality:
+To execute the unit tests and run the secret scanner check:
 ```bash
 make verify
 ```
@@ -53,5 +49,6 @@ For details about the terminology, agent roles, and design specifications, refer
 - [CONTEXT.md](CONTEXT.md) - Canonical glossary of terms, including:
   - **Stateful Resume**: Crashed or restarted loops recover state atomically from `.agent_logs/state.json`.
   - **Read-Before-Edit Constraint**: Agents must read files in the active loop cycle prior to applying patches.
-  - **AGENT_DECISION** & **AGENT_RESOLVED**: Standardized comment formats for self-documenting undocumented code choices and spec conflict resolutions.
+  - **Blocked by**: Structured dependency checking for claimed issues.
 - [PRD.md](PRD.md) - Product Requirement Document outlining the Python LangGraph transition path.
+

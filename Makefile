@@ -1,11 +1,15 @@
-.PHONY: verify setup
+.PHONY: verify setup secret-scan
 
 setup:
-	@if ! command -v pre-commit >/dev/null 2>&1; then \
-		echo "Installing pre-commit..."; \
-		pip install pre-commit || pip install --break-system-packages pre-commit || (echo "Error: Please activate your virtual environment or install pre-commit manually (e.g. 'pipx install pre-commit' or 'sudo apt install pre-commit')" && exit 1); \
-	fi
-	pre-commit install
+	@echo "Installing native git pre-commit hook..."
+	@echo "#!/bin/sh" > .git/hooks/pre-commit
+	@echo "python3 scripts/secret_scan.py --staged" >> .git/hooks/pre-commit
+	@chmod +x .git/hooks/pre-commit
+	@echo "Git hook setup completed successfully."
 
-verify:
+secret-scan:
+	python3 scripts/secret_scan.py
+
+verify: secret-scan
 	python3 -m unittest discover -s . -p "test_*.py"
+
