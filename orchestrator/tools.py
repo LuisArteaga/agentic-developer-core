@@ -3,9 +3,15 @@ from pathlib import Path
 from typing import Optional
 from orchestrator import state
 
+# Can be overridden for testing purposes
+_PROJECT_ROOT: Optional[Path] = None
+
 def _normalize_path(path_str: str) -> tuple[Path, str]:
-    """Helper to resolve a path and return its absolute Path object and project-relative string path."""
-    project_root = Path(__file__).resolve().parent.parent
+    """Helper to resolve a path and return its absolute Path object and project-relative string path.
+    
+    Enforces path safety by raising ValueError if the resolved path is outside the project root.
+    """
+    project_root = _PROJECT_ROOT or Path(__file__).resolve().parent.parent
     p = Path(path_str)
     if not p.is_absolute():
         abs_path = (project_root / p).resolve()
@@ -16,7 +22,7 @@ def _normalize_path(path_str: str) -> tuple[Path, str]:
         rel_path = abs_path.relative_to(project_root)
         rel_str = str(rel_path)
     except ValueError:
-        rel_str = str(abs_path)
+        raise ValueError("Access denied: Path is outside the project root directory.")
     
     return abs_path, rel_str
 
@@ -25,7 +31,10 @@ def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[in
     
     Registers the file path in the 'read_files' list inside the orchestrator state.
     """
-    abs_path, rel_str = _normalize_path(path)
+    try:
+        abs_path, rel_str = _normalize_path(path)
+    except ValueError as e:
+        return f"Error: {e}"
     
     if not abs_path.exists():
         return f"Error: File '{path}' does not exist."
@@ -89,7 +98,10 @@ def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[in
 
 def list_directory(path: str) -> str:
     """List the contents of a directory, sorted alphabetically with directories first, followed by files."""
-    abs_path, _ = _normalize_path(path)
+    try:
+        abs_path, _ = _normalize_path(path)
+    except ValueError as e:
+        return f"Error: {e}"
     
     if not abs_path.exists():
         return f"Error: Directory '{path}' does not exist."
@@ -125,7 +137,10 @@ def grep_search(query: str, path: str) -> str:
     
     Ignores common non-code / environment directories.
     """
-    abs_path, _ = _normalize_path(path)
+    try:
+        abs_path, _ = _normalize_path(path)
+    except ValueError as e:
+        return f"Error: {e}"
     
     if not abs_path.exists():
         return f"Error: Path '{path}' does not exist."
@@ -165,3 +180,64 @@ def grep_search(query: str, path: str) -> str:
         return f"No matches found for query '{query}' in '{path}'."
         
     return "\n".join(matches)
+
+def patch_file(path: str, old_string: str, new_string: str) -> str:
+    """Perform exact search-and-replace of old_string with new_string.
+    
+    Enforces 'Read-Before-Edit' by verifying that the normalized path has been registered in the
+    'read_files' list inside the orchestrator state.
+    Enforces 'Ambiguity Abort' by verifying that old_string matches exactly once in the file.
+    """
+    try:
+        abs_path, rel_str = _normalize_path(path)
+    except ValueError as e:
+        return f"Error: {e}"
+    
+    # 1. Read-Before-Edit Constraint
+    try:
+        curr_state = state.load()
+        read_files = curr_state.get("read_files", [])
+    except Exception:
+        read_files = []
+        
+    if rel_str not in read_files:
+        return f"Error: Read-Before-Edit validation failed. File '{path}' has not been read in the current execution cycle. Please call 'read_file' first."
+
+    # 2. Path Validation & Existence
+    if not abs_path.exists():
+        return f"Error: File '{path}' does not exist."
+    if not abs_path.is_file():
+        return f"Error: '{path}' is a directory, not a file."
+
+    # 3. Binary & Decode checks
+    try:
+        # Binary check: search for null byte in the first chunk
+        with open(abs_path, "rb") as f:
+            chunk = f.read(1024)
+            if b"\0" in chunk:
+                return f"Error: File '{path}' is a binary file."
+                
+        with open(abs_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        return f"Error: File '{path}' cannot be decoded with UTF-8 encoding."
+    except Exception as e:
+        return f"Error: Failed to read file '{path}': {e}"
+
+    # 4. Ambiguity Abort Rule (Uniqueness Check)
+    matches_count = content.count(old_string)
+    if matches_count == 0:
+        return f"Error: The old_string was not found in the file. It is possible the file was modified or you have outdated/incorrect context lines. Please call 'read_file' first to synchronize your state with the disk, then try again with the updated content."
+    elif matches_count > 1:
+        return f"Error: The old_string matches multiple times ({matches_count} occurrences). To resolve this ambiguity, please include more surrounding context lines in 'old_string' so that the match is unique."
+
+    # 5. Perform the edit
+    new_content = content.replace(old_string, new_string, 1)
+    
+    try:
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except Exception as e:
+        return f"Error: Failed to write to file '{path}': {e}"
+        
+    return f"Success: File '{path}' patched successfully. One occurrence replaced."
