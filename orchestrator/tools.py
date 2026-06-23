@@ -166,12 +166,12 @@ def grep_search(query: str, path: str) -> str:
         
     return "\n".join(matches)
 
-def patch_file(path: str, target_content: str, replacement_content: str) -> str:
-    """Perform exact search-and-replace of target_content with replacement_content.
+def patch_file(path: str, old_string: str, new_string: str) -> str:
+    """Perform exact search-and-replace of old_string with new_string.
     
     Enforces 'Read-Before-Edit' by verifying that the normalized path has been registered in the
     'read_files' list inside the orchestrator state.
-    Enforces 'Ambiguity Abort' by verifying that target_content matches exactly once in the file.
+    Enforces 'Ambiguity Abort' by verifying that old_string matches exactly once in the file.
     """
     abs_path, rel_str = _normalize_path(path)
     
@@ -207,14 +207,14 @@ def patch_file(path: str, target_content: str, replacement_content: str) -> str:
         return f"Error: Failed to read file '{path}': {e}"
 
     # 4. Ambiguity Abort Rule (Uniqueness Check)
-    matches_count = content.count(target_content)
+    matches_count = content.count(old_string)
     if matches_count == 0:
-        return f"Error: The target_content was not found in the file. It is possible the file was modified or you have outdated/incorrect context lines. Please call 'read_file' first to synchronize your state with the disk, then try again with the updated content."
+        return f"Error: The old_string was not found in the file. It is possible the file was modified or you have outdated/incorrect context lines. Please call 'read_file' first to synchronize your state with the disk, then try again with the updated content."
     elif matches_count > 1:
-        return f"Error: The target_content matches multiple times ({matches_count} occurrences). To resolve this ambiguity, please include more surrounding context lines in 'target_content' so that the match is unique."
+        return f"Error: The old_string matches multiple times ({matches_count} occurrences). To resolve this ambiguity, please include more surrounding context lines in 'old_string' so that the match is unique."
 
     # 5. Perform the edit
-    new_content = content.replace(target_content, replacement_content, 1)
+    new_content = content.replace(old_string, new_string, 1)
     
     try:
         with open(abs_path, "w", encoding="utf-8") as f:

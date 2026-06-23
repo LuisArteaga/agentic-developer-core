@@ -175,13 +175,13 @@ class TestCodebaseTools(unittest.TestCase):
         self.assertIn("Read-Before-Edit validation failed", res)
 
     def test_patch_file_zero_matches(self):
-        """Test that patch_file aborts if target_content is not found."""
+        """Test that patch_file aborts if old_string is not found."""
         read_file(str(self.text_file))
         res = patch_file(str(self.text_file), "nonexistent line", "replacement")
         self.assertIn("was not found", res)
 
     def test_patch_file_multiple_matches(self):
-        """Test that patch_file aborts if target_content is ambiguous (multiple occurrences)."""
+        """Test that patch_file aborts if old_string is ambiguous (multiple occurrences)."""
         # Create a file with duplicate lines
         dup_file = self.temp_dir_path / "duplicate.txt"
         dup_file.write_text("duplicate\nsome other text\nduplicate", encoding="utf-8")
