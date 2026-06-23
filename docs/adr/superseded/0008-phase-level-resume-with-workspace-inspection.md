@@ -1,7 +1,7 @@
 # ADR 0008: Phase-Level Resume and Graph State Planning
 
 ## Status
-Accepted
+Superseded by [ADR 0009: Pure Python LangGraph Orchestration without CLI Harnesses](../0009-pure-python-langgraph-orchestrator.md)
 
 ## Context
 In an autonomous development loop running inside containerized environments (like GitHub Actions or Docker containers), the process can be killed, timed out, or restarted. We need a way to resume the execution loop safely. 
