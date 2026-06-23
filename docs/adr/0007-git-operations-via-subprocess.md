@@ -1,7 +1,7 @@
 # ADR 0007: Git Operations via Python Subprocess
 
 ## Status
-Superseded by [ADR 0009: Pure Python LangGraph Orchestration without CLI Harnesses](../0009-pure-python-langgraph-orchestrator.md)
+Accepted
 
 ## Context
 The Python-based orchestrator needs to perform git workspace hygiene and lifecycle commands (such as cloning repositories, checking out feature branches, committing changes, pushing commits, and running `git clean` or `git reset`). We need to decide how to interface with Git from our Python code.
