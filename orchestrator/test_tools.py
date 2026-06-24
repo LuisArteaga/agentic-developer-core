@@ -2,9 +2,10 @@ import copy
 import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from orchestrator import state, tools
-from orchestrator.tools import read_file, list_directory, grep_search, patch_file
+from orchestrator.tools import read_file, list_directory, grep_search, patch_file, run_command
 
 class TestCodebaseTools(unittest.TestCase):
     def setUp(self):
@@ -228,6 +229,72 @@ class TestCodebaseTools(unittest.TestCase):
         
         res = patch_file("/etc/passwd", "root", "toot")
         self.assertIn("Access denied", res)
+
+    def test_run_command_success(self):
+        """Test that run_command executes a simple python command successfully."""
+        res = run_command("python3 -c \"print('hello')\"")
+        self.assertEqual(res.strip(), "hello")
+
+    def test_run_command_empty_output(self):
+        """Test that run_command handles commands with empty output correctly."""
+        res = run_command("python3 -c \"pass\"")
+        self.assertEqual(res, "(Command completed successfully with no output.)")
+
+    def test_run_command_parse_error(self):
+        """Test that run_command handles malformed command strings gracefully."""
+        res = run_command("echo 'unmatched quote")
+        self.assertIn("Failed to parse command string", res)
+
+    @unittest.mock.patch("subprocess.run")
+    def test_run_command_timeout(self, mock_run):
+        """Test that run_command catches subprocess.TimeoutExpired and returns partial output."""
+        import subprocess
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["sleep", "10"], timeout=300, output=b"partial execution output")
+        res = run_command("sleep 10")
+        self.assertIn("timed out after 300 seconds", res)
+        self.assertIn("partial execution output", res)
+
+    @unittest.mock.patch("subprocess.run")
+    def test_run_command_truncation_lines(self, mock_run):
+        """Test that run_command truncates output exceeding 150 lines, showing first 30 and last 100 lines."""
+        import subprocess
+        mock_stdout = b"\n".join([f"line {i}".encode() for i in range(1, 201)])
+        mock_run.return_value = subprocess.CompletedProcess(args=["dummy"], returncode=0, stdout=mock_stdout)
+        res = run_command("dummy")
+        self.assertIn("Output truncated", res)
+        self.assertIn("70 lines", res)  # 200 - 130 = 70 lines removed
+        lines = res.splitlines()
+        self.assertEqual(lines[0], "line 1")
+        self.assertEqual(lines[29], "line 30")
+        self.assertEqual(lines[-1], "line 200")
+        self.assertEqual(lines[-100], "line 101")
+
+    @unittest.mock.patch("subprocess.run")
+    def test_run_command_truncation_bytes(self, mock_run):
+        """Test that run_command truncates output exceeding 10 KB, preventing duplication when total lines <= 130."""
+        import subprocess
+        # 50 lines of 300 bytes each = 15000 bytes (> 10 KB)
+        long_line = b"a" * 300
+        mock_stdout = b"\n".join([long_line for _ in range(50)])
+        mock_run.return_value = subprocess.CompletedProcess(args=["dummy"], returncode=0, stdout=mock_stdout)
+        res = run_command("dummy")
+        self.assertIn("Output truncated", res)
+        self.assertIn("0 lines", res)
+        self.assertIn("lines kept without duplication due to length <= 130", res)
+        lines = res.splitlines()
+        # Should have first 30 lines, the truncation note (which takes 3 lines), and the remaining 20 lines
+        self.assertEqual(len(lines), 53)
+        self.assertEqual(lines[0], "a" * 300)
+        self.assertEqual(lines[29], "a" * 300)
+        self.assertEqual(lines[-1], "a" * 300)
+
+    @unittest.mock.patch("subprocess.run")
+    def test_run_command_non_utf8(self, mock_run):
+        """Test that run_command gracefully decodes non-UTF-8 outputs using errors='replace'."""
+        import subprocess
+        mock_run.return_value = subprocess.CompletedProcess(args=["dummy"], returncode=0, stdout=b"hello \xff world")
+        res = run_command("dummy")
+        self.assertEqual(res, "hello \ufffd world")
 
 if __name__ == "__main__":
     unittest.main()

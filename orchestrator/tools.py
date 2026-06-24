@@ -241,3 +241,82 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
         return f"Error: Failed to write to file '{path}': {e}"
         
     return f"Success: File '{path}' patched successfully. One occurrence replaced."
+
+def run_command(command: str) -> str:
+    """Execute a shell command safely in a subprocess with shell=False.
+    
+    Captures stdout and stderr together. If the output exceeds 150 lines or 10 KB,
+    it is truncated showing the first 30 lines and the last 100 lines, with a truncation note.
+    A timeout of 300 seconds is enforced.
+    """
+    import shlex
+    import subprocess
+    
+    project_root = _PROJECT_ROOT or Path(__file__).resolve().parent.parent
+    
+    try:
+        args = shlex.split(command)
+    except Exception as e:
+        return f"Error: Failed to parse command string: {e}"
+        
+    if not args:
+        return "Error: Empty command provided."
+        
+    try:
+        # Run the command with a 300 second timeout, capturing stdout and stderr together
+        result = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=project_root,
+            timeout=300
+        )
+        output_bytes = result.stdout
+        timed_out = False
+    except subprocess.TimeoutExpired as e:
+        output_bytes = e.stdout or b""
+        timed_out = True
+    except Exception as e:
+        return f"Error: Failed to run command: {e}"
+        
+    # Decode gracefully
+    output = output_bytes.decode("utf-8", errors="replace")
+    
+    # Handle empty output
+    if not output and not timed_out:
+        return "(Command completed successfully with no output.)"
+    elif not output and timed_out:
+        return "Error: Command timed out after 300 seconds with no output."
+        
+    # Check truncation conditions: > 150 lines or > 10 KB (10240 bytes)
+    output_size_bytes = len(output_bytes)
+    lines = output.splitlines()
+    total_lines = len(lines)
+    
+    is_too_long = total_lines > 150
+    is_too_large = output_size_bytes > 10240
+    
+    if is_too_long or is_too_large:
+        # Apply truncation
+        if total_lines <= 130:
+            # Avoid overlap/duplication: first 30 lines, truncation note, and the rest
+            first_part = lines[:30]
+            last_part = lines[30:]
+            removed_lines = 0
+            truncation_note = f"\n\n... [Output truncated: {removed_lines} lines and {output_size_bytes} bytes processed (lines kept without duplication due to length <= 130)] ...\n\n"
+            output = "\n".join(first_part) + truncation_note + "\n".join(last_part)
+        else:
+            first_part = lines[:30]
+            last_part = lines[-100:]
+            removed_lines = total_lines - 130
+            # Calculate bytes of removed lines
+            removed_lines_content = "\n".join(lines[30:-100])
+            removed_bytes = len(removed_lines_content.encode("utf-8", errors="replace"))
+            truncation_note = f"\n\n... [Output truncated: {removed_lines} lines and {removed_bytes} bytes removed due to exceeding limits] ...\n\n"
+            output = "\n".join(first_part) + truncation_note + "\n".join(last_part)
+            
+    if timed_out:
+        return f"Error: Command '{command}' timed out after 300 seconds.\nOutput captured before timeout:\n{output}"
+        
+    return output
+
