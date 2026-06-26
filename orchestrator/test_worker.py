@@ -205,3 +205,41 @@ class TestWorkerAgent(unittest.TestCase):
         )
         
         self.assertEqual(final_answer, "Sorry, need more steps to process this request.")
+
+    def test_run_command_security_validation(self):
+        """Test that the command security validation correctly allows safe commands and blocks unsafe ones."""
+        
+        # 1. Allowed commands
+        res = get_worker_tools()[4].invoke("make verify")
+        # Should not be blocked by safety check (may fail if make is not configured, but won't return security validation error)
+        self.assertNotIn("Security validation failed", res)
+        
+        res = get_worker_tools()[4].invoke("python3 -m unittest discover -s . -p 'test_*.py'")
+        self.assertNotIn("Security validation failed", res)
+
+        res = get_worker_tools()[4].invoke("pytest")
+        self.assertNotIn("Security validation failed", res)
+        
+        # 2. Blocked executables
+        res = get_worker_tools()[4].invoke("rm -rf /")
+        self.assertIn("Security validation failed: Executable 'rm' is not in the permitted allowlist", res)
+        
+        res = get_worker_tools()[4].invoke("curl http://example.com")
+        self.assertIn("Security validation failed: Executable 'curl' is not in the permitted allowlist", res)
+        
+        # 3. Blocked inline Python scripts (-c flag)
+        res = get_worker_tools()[4].invoke("python3 -c \"print(1)\"")
+        self.assertIn("Security validation failed: Executing arbitrary inline Python scripts via the '-c' flag is blocked", res)
+        
+        res = get_worker_tools()[4].invoke("python -c 'print(1)'")
+        self.assertIn("Security validation failed: Executing arbitrary inline Python scripts via the '-c' flag is blocked", res)
+
+        # 4. Blocked shell-injection characters
+        res = get_worker_tools()[4].invoke("make verify ; rm -rf /")
+        self.assertIn("Security validation failed: Command contains blocked character ';'", res)
+        
+        res = get_worker_tools()[4].invoke("make verify | grep test")
+        self.assertIn("Security validation failed: Command contains blocked character '|'", res)
+        
+        res = get_worker_tools()[4].invoke("make verify && pytest")
+        self.assertIn("Security validation failed: Command contains blocked character '&'", res)
