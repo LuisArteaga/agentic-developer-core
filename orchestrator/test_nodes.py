@@ -57,36 +57,35 @@ class TestClaimNode(unittest.TestCase):
         # Clean up directories
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
-        
-        # Reset state module internal cache/path if any (resolved dynamically, so no need)
 
-    @patch("orchestrator.nodes._run_gh")
-    def test_normal_claim_flow(self, mock_gh):
+    @patch("orchestrator.nodes._github_api_request")
+    def test_normal_claim_flow(self, mock_api):
         """Test a normal claim flow: polls, finds one ready, claims it, resets workspace, and creates branch."""
-        # Setup mock behavior for gh commands
-        def gh_side_effect(args):
-            cmd_str = " ".join(args)
-            if "issue list" in cmd_str and "agent-blocked" in cmd_str:
-                # No blocked issues
-                return "[]"
-            elif "issue list" in cmd_str and "agent-ready" in cmd_str:
-                # One ready issue
-                return json.dumps([
-                    {
-                        "number": 10,
-                        "title": "Add database migration",
-                        "body": "We need to add a migration script."
-                    }
-                ])
-            elif "issue view 10" in cmd_str and "labels" in cmd_str:
-                # Verify labels check: still has agent-ready
-                return json.dumps({"labels": [{"name": "agent-ready"}]})
-            elif "issue edit 10" in cmd_str:
-                # Label transition edit
-                return ""
-            raise ValueError(f"Unexpected gh call: {args}")
+        # Setup mock behavior for GitHub API requests
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if "/issues" in path and "labels=agent-blocked" in path:
+                    # No blocked issues
+                    return []
+                elif "/issues" in path and "labels=agent-ready" in path:
+                    # One ready issue
+                    return [
+                        {
+                            "number": 10,
+                            "title": "Add database migration",
+                            "body": "We need to add a migration script."
+                        }
+                    ]
+                elif path.endswith("/issues/10"):
+                    # Verify labels check: still has agent-ready
+                    return {"labels": [{"name": "agent-ready"}]}
+            elif method in ("POST", "DELETE"):
+                if "/issues/10/labels" in path:
+                    # Label transition edits
+                    return {}
+            raise ValueError(f"Unexpected API call: {method} {path} {body}")
 
-        mock_gh.side_effect = gh_side_effect
+        mock_api.side_effect = api_side_effect
 
         # Create a dirty untracked file to verify workspace cleanup runs on fresh claim
         dirty_file = self.workspace_dir / "dirty.txt"
@@ -115,8 +114,8 @@ class TestClaimNode(unittest.TestCase):
         branch_res = subprocess.run(["git", "branch", "--show-current"], cwd=str(self.workspace_dir), capture_output=True, text=True, check=True)
         self.assertEqual(branch_res.stdout.strip(), "feat/issue-10")
 
-    @patch("orchestrator.nodes._run_gh")
-    def test_resume_flow(self, mock_gh):
+    @patch("orchestrator.nodes._github_api_request")
+    def test_resume_flow(self, mock_api):
         """Test resume flow: detects resume, skips clean/reset, checks out branch, preserves dirty files."""
         # Create the feature branch and a dirty file in it
         subprocess.run(["git", "checkout", "-b", "feat/issue-10"], cwd=str(self.workspace_dir), check=True, capture_output=True)
@@ -149,35 +148,36 @@ class TestClaimNode(unittest.TestCase):
         branch_res = subprocess.run(["git", "branch", "--show-current"], cwd=str(self.workspace_dir), capture_output=True, text=True, check=True)
         self.assertEqual(branch_res.stdout.strip(), "feat/issue-10")
         
-        # gh should not have been called since we skip polling on resume
-        mock_gh.assert_not_called()
+        # GitHub API should not have been called since we skip polling on resume
+        mock_api.assert_not_called()
 
-    @patch("orchestrator.nodes._run_gh")
-    def test_blocked_issue_detection(self, mock_gh):
+    @patch("orchestrator.nodes._github_api_request")
+    def test_blocked_issue_detection(self, mock_api):
         """Test that a ready issue with an open dependency gets transitioned to agent-blocked."""
         # Setup mock behavior
-        def gh_side_effect(args):
-            cmd_str = " ".join(args)
-            if "issue list" in cmd_str and "agent-blocked" in cmd_str:
-                return "[]"
-            elif "issue list" in cmd_str and "agent-ready" in cmd_str:
-                # Issue 11 is ready, but blocked by Issue 5
-                return json.dumps([
-                    {
-                        "number": 11,
-                        "title": "Add user dashboard",
-                        "body": "Depends on ## Blocked by\n- #5"
-                    }
-                ])
-            elif "issue view 5" in cmd_str and "state" in cmd_str:
-                # Dependency issue 5 is still OPEN
-                return json.dumps({"state": "OPEN"})
-            elif "issue edit 11" in cmd_str and "agent-blocked" in cmd_str:
-                # Transition to blocked
-                return ""
-            raise ValueError(f"Unexpected gh call: {args}")
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if "/issues" in path and "labels=agent-blocked" in path:
+                    return []
+                elif "/issues" in path and "labels=agent-ready" in path:
+                    # Issue 11 is ready, but blocked by Issue 5
+                    return [
+                        {
+                            "number": 11,
+                            "title": "Add user dashboard",
+                            "body": "Depends on ## Blocked by\n- #5"
+                        }
+                    ]
+                elif path.endswith("/issues/5"):
+                    # Dependency issue 5 is still open (OPEN)
+                    return {"state": "open"}
+            elif method in ("POST", "DELETE"):
+                if "/issues/11/labels" in path:
+                    # Transition edits
+                    return {}
+            raise ValueError(f"Unexpected API call: {method} {path} {body}")
 
-        mock_gh.side_effect = gh_side_effect
+        mock_api.side_effect = api_side_effect
 
         new_state = claim_node(DEFAULT_STATE.copy())
 
@@ -185,82 +185,84 @@ class TestClaimNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "idle")
         self.assertIsNone(new_state["issue_number"])
         
-        # Verify the transition edit was called on issue 11
-        edit_calls = [call for call in mock_gh.mock_calls if "edit" in str(call) and "11" in str(call)]
+        # Verify the transition edit was called on issue 11 (adding agent-blocked)
+        edit_calls = [call for call in mock_api.mock_calls if "11" in str(call) and "agent-blocked" in str(call)]
         self.assertTrue(len(edit_calls) > 0)
 
-    @patch("orchestrator.nodes._run_gh")
-    def test_self_healing_unblock(self, mock_gh):
+    @patch("orchestrator.nodes._github_api_request")
+    def test_self_healing_unblock(self, mock_api):
         """Test that a blocked issue with all closed dependencies gets transitioned to agent-ready."""
         # Setup mock behavior
-        def gh_side_effect(args):
-            cmd_str = " ".join(args)
-            if "issue list" in cmd_str and "agent-blocked" in cmd_str:
-                # Issue 12 is blocked by 5 and 6
-                return json.dumps([
-                    {
-                        "number": 12,
-                        "body": "## Blocked by\n- #5\n- #6"
-                    }
-                ])
-            elif "issue view 5" in cmd_str and "state" in cmd_str:
-                # Dependency 5 is closed
-                return json.dumps({"state": "CLOSED"})
-            elif "issue view 6" in cmd_str and "state" in cmd_str:
-                # Dependency 6 is closed
-                return json.dumps({"state": "CLOSED"})
-            elif "issue edit 12" in cmd_str and "agent-ready" in cmd_str:
-                # Unblock transition
-                return ""
-            elif "issue list" in cmd_str and "agent-ready" in cmd_str:
-                # No ready issues (simulate that it gets unblocked but we don't claim it in this run yet)
-                return "[]"
-            raise ValueError(f"Unexpected gh call: {args}")
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if "/issues" in path and "labels=agent-blocked" in path:
+                    # Issue 12 is blocked by 5 and 6
+                    return [
+                        {
+                            "number": 12,
+                            "body": "## Blocked by\n- #5\n- #6"
+                        }
+                    ]
+                elif path.endswith("/issues/5"):
+                    # Dependency 5 is closed
+                    return {"state": "closed"}
+                elif path.endswith("/issues/6"):
+                    # Dependency 6 is closed
+                    return {"state": "closed"}
+                elif "/issues" in path and "labels=agent-ready" in path:
+                    # No ready issues (simulate that it gets unblocked but we don't claim it in this run yet)
+                    return []
+            elif method in ("POST", "DELETE"):
+                if "/issues/12/labels" in path:
+                    # Unblock transition edits
+                    return {}
+            raise ValueError(f"Unexpected API call: {method} {path} {body}")
 
-        mock_gh.side_effect = gh_side_effect
+        mock_api.side_effect = api_side_effect
 
         new_state = claim_node(DEFAULT_STATE.copy())
 
         self.assertEqual(new_state["status"], "idle")
         
-        # Verify unblock call was made
-        unblock_calls = [call for call in mock_gh.mock_calls if "edit" in str(call) and "12" in str(call) and "agent-ready" in str(call)]
+        # Verify unblock call was made (adding agent-ready to issue 12)
+        unblock_calls = [call for call in mock_api.mock_calls if "12" in str(call) and "agent-ready" in str(call)]
         self.assertTrue(len(unblock_calls) > 0)
 
-    @patch("orchestrator.nodes._run_gh")
-    def test_empty_queue(self, mock_gh):
+    @patch("orchestrator.nodes._github_api_request")
+    def test_empty_queue(self, mock_api):
         """Test that if there are no ready or blocked issues, the state transitions to idle."""
-        mock_gh.return_value = "[]"
+        mock_api.return_value = []
 
         new_state = claim_node(DEFAULT_STATE.copy())
         self.assertEqual(new_state["status"], "idle")
         self.assertIsNone(new_state["issue_number"])
 
-    @patch("orchestrator.nodes._run_gh")
-    def test_race_condition(self, mock_gh):
+    @patch("orchestrator.nodes._github_api_request")
+    def test_race_condition(self, mock_api):
         """Test race condition: issue 10 missing ready label in view check, so it claims issue 11 instead."""
-        def gh_side_effect(args):
-            cmd_str = " ".join(args)
-            if "issue list" in cmd_str and "agent-blocked" in cmd_str:
-                return "[]"
-            elif "issue list" in cmd_str and "agent-ready" in cmd_str:
-                # Return two issues
-                return json.dumps([
-                    {"number": 10, "title": "Task 1", "body": ""},
-                    {"number": 11, "title": "Task 2", "body": ""}
-                ])
-            elif "issue view 10" in cmd_str and "labels" in cmd_str:
-                # Issue 10 was already claimed by someone else (does not have agent-ready)
-                return json.dumps({"labels": [{"name": "in-progress"}]})
-            elif "issue view 11" in cmd_str and "labels" in cmd_str:
-                # Issue 11 is still ready
-                return json.dumps({"labels": [{"name": "agent-ready"}]})
-            elif "issue edit 11" in cmd_str:
-                # Claim issue 11
-                return ""
-            raise ValueError(f"Unexpected gh call: {args}")
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if "/issues" in path and "labels=agent-blocked" in path:
+                    return []
+                elif "/issues" in path and "labels=agent-ready" in path:
+                    # Return two issues
+                    return [
+                        {"number": 10, "title": "Task 1", "body": ""},
+                        {"number": 11, "title": "Task 2", "body": ""}
+                    ]
+                elif path.endswith("/issues/10"):
+                    # Issue 10 was already claimed by someone else (does not have agent-ready)
+                    return {"labels": [{"name": "in-progress"}]}
+                elif path.endswith("/issues/11"):
+                    # Issue 11 is still ready
+                    return {"labels": [{"name": "agent-ready"}]}
+            elif method in ("POST", "DELETE"):
+                if "/issues/11/labels" in path:
+                    # Claim issue 11
+                    return {}
+            raise ValueError(f"Unexpected API call: {method} {path} {body}")
 
-        mock_gh.side_effect = gh_side_effect
+        mock_api.side_effect = api_side_effect
 
         new_state = claim_node(DEFAULT_STATE.copy())
 

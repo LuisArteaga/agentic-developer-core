@@ -154,3 +154,40 @@ def current_branch(repo_dir: Path | str) -> str:
             return sym_result.stdout.strip()
         except GitError:
             return "HEAD"
+
+def get_remote_url(repo_dir: Path | str, remote: str = "origin") -> str:
+    """Returns the remote URL for the specified remote name."""
+    result = _run_git(repo_dir, ["remote", "get-url", remote])
+    return result.stdout.strip()
+
+def clone(repo_dir: Path | str, github_repo: str, token: Optional[str] = None) -> None:
+    """Clones the target GitHub repository into the specified directory.
+    
+    Utilizes Git's credential helper with an environment variable reference to prevent
+    persisting the plaintext token in the local git config.
+    """
+    Path(repo_dir).mkdir(parents=True, exist_ok=True)
+    clean_url = f"https://github.com/{github_repo}.git"
+    
+    if token:
+        token_stripped = token.strip()
+        import os
+        # Ensure the token is set in the environment of any subprocess
+        # referencing GH_PAT (or GITHUB_TOKEN if needed)
+        os.environ["GH_PAT"] = token_stripped
+        
+        # Configure credential helper referencing the GH_PAT env var
+        helper_cmd = '!f() { echo "username=x-access-token"; echo "password=$GH_PAT"; }; f'
+        cmd = [
+            "clone",
+            "-c", f"credential.helper={helper_cmd}",
+            clean_url,
+            str(repo_dir)
+        ]
+    else:
+        cmd = ["clone", clean_url, str(repo_dir)]
+        
+    parent_dir = Path(repo_dir).parent
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    _run_git(parent_dir, cmd)
+

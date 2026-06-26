@@ -3,23 +3,69 @@ import logging
 import os
 import re
 import subprocess
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from orchestrator import state as state_module
 from orchestrator.state import AgentState
-from orchestrator.git import is_git_repository, checkout, clean, reset_hard
+from orchestrator.git import is_git_repository, checkout, clean, reset_hard, get_remote_url, clone
 
 logger = logging.getLogger("orchestrator.nodes")
 
-def _run_gh(args: list[str]) -> str:
-    """Run a GitHub CLI command and return its stdout, raising RuntimeError on failure."""
-    cmd = ["gh"] + args
-    logger.debug("Running gh command: %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"GitHub CLI command {' '.join(cmd)} failed (code {result.returncode}): {result.stderr.strip()}")
-    return result.stdout
+def _github_api_request(method: str, path: str, body: Optional[dict] = None) -> Union[dict, list]:
+    """Helper to make authenticated HTTP requests to the GitHub REST API using urllib."""
+    token = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+    
+    # Clean path (ensure leading slash)
+    if not path.startswith("/"):
+        path = "/" + path
+        
+    url = f"https://api.github.com{path}"
+    
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "agentic-developer-core",
+    }
+    if token:
+        headers["Authorization"] = f"token {token.strip()}"
+        
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            res_data = response.read().decode("utf-8")
+            if not res_data:
+                return {}
+            return json.loads(res_data)
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8")
+        except Exception:
+            err_body = ""
+        logger.error("GitHub API error: %d %s - %s", e.code, e.reason, err_body)
+        raise RuntimeError(f"GitHub API request {method} {path} failed: {e.code} {e.reason} - {err_body}") from e
+    except Exception as e:
+        logger.error("Failed to connect to GitHub API: %s", e)
+        raise RuntimeError(f"Failed to connect to GitHub API: {e}") from e
+
+def _add_label(github_repo: str, issue_num: int, label: str) -> None:
+    """Add a label to an issue via GitHub REST API."""
+    _github_api_request("POST", f"/repos/{github_repo}/issues/{issue_num}/labels", {"labels": [label]})
+
+def _remove_label(github_repo: str, issue_num: int, label: str) -> None:
+    """Remove a label from an issue via GitHub REST API, ignoring 404/not found errors."""
+    encoded_label = urllib.parse.quote(label)
+    try:
+        _github_api_request("DELETE", f"/repos/{github_repo}/issues/{issue_num}/labels/{encoded_label}")
+    except Exception as e:
+        logger.debug("Failed to remove label '%s' from issue #%d (might not exist): %s", label, issue_num, e)
 
 def _get_github_repository(workspace_path: Path) -> str:
     """Resolve the target owner/repo string, falling back to git remote origin if GITHUB_REPOSITORY is empty."""
@@ -28,15 +74,7 @@ def _get_github_repository(workspace_path: Path) -> str:
         return repo
 
     try:
-        result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            cwd=str(workspace_path),
-            capture_output=True,
-            text=True,
-            shell=False,
-            check=True
-        )
-        url = result.stdout.strip()
+        url = get_remote_url(workspace_path, "origin")
         # Parse owner/repo from SSH (git@github.com:owner/repo.git) or HTTPS (https://github.com/owner/repo.git)
         if "github.com/" in url:
             part = url.split("github.com/", 1)[1]
@@ -53,6 +91,7 @@ def _get_github_repository(workspace_path: Path) -> str:
         raise ValueError(
             f"GITHUB_REPOSITORY environment variable is not set and could not be resolved from git remote origin: {e}"
         )
+
 
 def _parse_dependencies(body: Optional[str]) -> list[int]:
     """Parse the '## Blocked by' section of an issue body and return a list of blocked-by issue numbers."""
@@ -131,27 +170,10 @@ def claim_node(state: AgentState) -> AgentState:
         # If the workspace directory doesn't exist or is not a git repo, clone it.
         if not workspace_path.exists() or not is_git_repository(workspace_path):
             logger.info("Workspace '%s' does not exist or is not a git repository. Cloning %s...", workspace_path, github_repo)
-            workspace_path.mkdir(parents=True, exist_ok=True)
-            
-            # Formulate authenticated clone URL if token is present, otherwise use standard HTTPS
             token = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
-            if token:
-                clone_url = f"https://x-access-token:{token.strip()}@github.com/{github_repo}.git"
-            else:
-                clone_url = f"https://github.com/{github_repo}.git"
-                
-            # Run git clone directly via subprocess to comply with ADR-0007
-            result = subprocess.run(
-                ["git", "clone", clone_url, str(workspace_path)],
-                capture_output=True,
-                text=True,
-                shell=False
-            )
-            if result.returncode != 0:
-                # Sanitize error message to prevent token leaks in log outputs
-                err_msg = result.stderr.replace(token, "******") if token else result.stderr
-                raise RuntimeError(f"Git clone failed (code {result.returncode}): {err_msg.strip()}")
-                
+            
+            # Call the centralized, secure clone helper from orchestrator.git
+            clone(workspace_path, github_repo, token)
             logger.info("Repository cloned successfully into %s.", workspace_path)
 
         if resume:
@@ -176,15 +198,13 @@ def claim_node(state: AgentState) -> AgentState:
     if not resume:
         logger.info("Step 1: Running Unblocking Scan for '%s' issues...", label_blocked)
         try:
-            blocked_issues_json = _run_gh([
-                "issue", "list",
-                "-R", github_repo,
-                "--label", label_blocked,
-                "--state", "open",
-                "--json", "number,body",
-                "--limit", "1000"
-            ])
-            blocked_issues = json.loads(blocked_issues_json)
+            # Get issues from GitHub REST API
+            issues_data = _github_api_request(
+                "GET",
+                f"/repos/{github_repo}/issues?labels={urllib.parse.quote(label_blocked)}&state=open&per_page=100"
+            )
+            # Filter out pull requests
+            blocked_issues = [issue for issue in issues_data if "pull_request" not in issue]
         except Exception as e:
             logger.error("Failed to poll blocked issues: %s", e)
             blocked_issues = []
@@ -200,14 +220,8 @@ def claim_node(state: AgentState) -> AgentState:
             all_closed = True
             for dep in dependencies:
                 try:
-                    dep_state_json = _run_gh([
-                        "issue", "view",
-                        str(dep),
-                        "-R", github_repo,
-                        "--json", "state"
-                    ])
-                    dep_state = json.loads(dep_state_json)
-                    if dep_state.get("state") != "CLOSED":
+                    dep_issue = _github_api_request("GET", f"/repos/{github_repo}/issues/{dep}")
+                    if dep_issue.get("state", "").upper() != "CLOSED":
                         all_closed = False
                         break
                 except Exception as e:
@@ -218,13 +232,8 @@ def claim_node(state: AgentState) -> AgentState:
             if all_closed:
                 logger.info("Unblocking issue #%d since all dependencies are closed.", issue_num)
                 try:
-                    _run_gh([
-                        "issue", "edit",
-                        str(issue_num),
-                        "-R", github_repo,
-                        "--add-label", label_ready,
-                        "--remove-label", label_blocked
-                    ])
+                    _add_label(github_repo, issue_num, label_ready)
+                    _remove_label(github_repo, issue_num, label_blocked)
                 except Exception as e:
                     logger.error("Failed to update labels for unblocked issue #%d: %s", issue_num, e)
 
@@ -233,15 +242,11 @@ def claim_node(state: AgentState) -> AgentState:
     if not resume:
         logger.info("Step 2: Running Claim Scan for '%s' issues...", label_ready)
         try:
-            ready_issues_json = _run_gh([
-                "issue", "list",
-                "-R", github_repo,
-                "--label", label_ready,
-                "--state", "open",
-                "--json", "number,title,body",
-                "--limit", "1000"
-            ])
-            ready_issues = json.loads(ready_issues_json)
+            issues_data = _github_api_request(
+                "GET",
+                f"/repos/{github_repo}/issues?labels={urllib.parse.quote(label_ready)}&state=open&per_page=100"
+            )
+            ready_issues = [issue for issue in issues_data if "pull_request" not in issue]
         except Exception as e:
             logger.error("Failed to poll ready issues: %s", e)
             ready_issues = []
@@ -256,14 +261,8 @@ def claim_node(state: AgentState) -> AgentState:
             has_open_dep = False
             for dep in dependencies:
                 try:
-                    dep_state_json = _run_gh([
-                        "issue", "view",
-                        str(dep),
-                        "-R", github_repo,
-                        "--json", "state"
-                    ])
-                    dep_state = json.loads(dep_state_json)
-                    if dep_state.get("state") != "CLOSED":
+                    dep_issue = _github_api_request("GET", f"/repos/{github_repo}/issues/{dep}")
+                    if dep_issue.get("state", "").upper() != "CLOSED":
                         has_open_dep = True
                         break
                 except Exception as e:
@@ -274,26 +273,15 @@ def claim_node(state: AgentState) -> AgentState:
             if has_open_dep:
                 logger.info("Issue #%d has open dependencies. Transitioning to '%s'...", issue_num, label_blocked)
                 try:
-                    _run_gh([
-                        "issue", "edit",
-                        str(issue_num),
-                        "-R", github_repo,
-                        "--add-label", label_blocked,
-                        "--remove-label", label_ready
-                    ])
+                    _add_label(github_repo, issue_num, label_blocked)
+                    _remove_label(github_repo, issue_num, label_ready)
                 except Exception as e:
                     logger.error("Failed to transition issue #%d to blocked: %s", issue_num, e)
                 continue
             
             # Double check if the issue is still ready (concurrency check)
             try:
-                view_json = _run_gh([
-                    "issue", "view",
-                    str(issue_num),
-                    "-R", github_repo,
-                    "--json", "labels"
-                ])
-                view_data = json.loads(view_json)
+                view_data = _github_api_request("GET", f"/repos/{github_repo}/issues/{issue_num}")
                 labels = [l["name"] for l in view_data.get("labels", [])]
                 if label_ready not in labels:
                     logger.warning("Issue #%d no longer has '%s' label. Skipping.", issue_num, label_ready)
@@ -304,13 +292,8 @@ def claim_node(state: AgentState) -> AgentState:
             
             # Attempt to claim the issue atomically
             try:
-                _run_gh([
-                    "issue", "edit",
-                    str(issue_num),
-                    "-R", github_repo,
-                    "--add-label", label_in_progress,
-                    "--remove-label", label_ready
-                ])
+                _add_label(github_repo, issue_num, label_in_progress)
+                _remove_label(github_repo, issue_num, label_ready)
                 logger.info("Successfully claimed issue #%d: '%s'.", issue_num, title)
                 claimed_issue = issue
                 break
