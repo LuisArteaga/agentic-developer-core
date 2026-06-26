@@ -641,10 +641,9 @@ def verify_node(state: AgentState) -> AgentState:
         raise e
         
     raw_output = output_bytes.decode("utf-8", errors="replace")
-    output = _truncate_output(raw_output)
-
     if timed_out:
-        output = f"Error: Command '{verify_cmd}' timed out after {timeout} seconds.\nOutput captured before timeout:\n{output}"
+        raw_output = f"Error: Command '{verify_cmd}' timed out after {timeout} seconds.\nOutput captured before timeout:\n{raw_output}"
+    output = _truncate_output(raw_output)
         
     if exit_code == 0 and not timed_out:
         logger.info("Verification succeeded. Resetting attempts and clearing feedback.")

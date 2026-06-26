@@ -775,6 +775,7 @@ class TestVerifyNode(unittest.TestCase):
     @patch("orchestrator.nodes.subprocess.run")
     def test_verify_node_timeout(self, mock_subprocess_run):
         """Test verification command timing out: captures timeout error, increments attempts."""
+        import subprocess
         mock_subprocess_run.side_effect = subprocess.TimeoutExpired(cmd=["make", "verify"], timeout=300, output=b"Starting tests...\n")
         
         # Setup initial state
