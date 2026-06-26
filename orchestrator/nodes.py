@@ -495,3 +495,189 @@ def plan_node(state: AgentState) -> AgentState:
     return state
 
 
+# ==============================================================================
+# Execute-Node & Verify-Node Implementation
+# ==============================================================================
+
+import shlex
+import subprocess
+
+def execute_node(state: AgentState) -> AgentState:
+    """Invokes the ReAct worker agent to perform codebase modifications based on the plan.
+    
+    If previous verification feedback exists in the state, it is appended to the issue
+    description to guide the worker's retry.
+    """
+    issue_num = state.get("issue_number")
+    if issue_num is None:
+        raise ValueError("Cannot run Execute-Node: 'issue_number' is not set in the state.")
+        
+    logger.info("Starting Execute phase for issue #%d...", issue_num)
+    
+    # 1. Update state status, phase, and reset read_files per CONTEXT / ADR-0006
+    state["status"] = "executing"
+    state["phase"] = "executing"
+    state["read_files"] = []
+    state_module.save(state)
+    
+    workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
+    workspace_path = Path(workspace_env).resolve()
+    
+    try:
+        # 2. Fetch target repository and issue details from GitHub API
+        github_repo = _get_github_repository(workspace_path)
+        issue_data = _github_api_request("GET", f"/repos/{github_repo}/issues/{issue_num}")
+        issue_title = issue_data.get("title", "")
+        issue_body = issue_data.get("body", "")
+        issue_description = f"Title: {issue_title}\n\n{issue_body}"
+        
+        # 3. Resolve LLM model name
+        model_name = state.get("model") or os.getenv("AGENT_MODEL") or "google/gemini-2.5-pro"
+        if not state.get("model"):
+            state["model"] = model_name
+            
+        # 4. Retrieve the generated plan
+        plan = state.get("plan")
+        if not plan:
+            raise ValueError(f"No development plan found in state for issue #{issue_num}.")
+            
+        # 5. Inject previous verification feedback if present
+        feedback = state.get("feedback")
+        if feedback:
+            logger.info("Feedback from previous run found. Injecting into worker prompt.")
+            issue_description = (
+                f"{issue_description}\n\n"
+                f"=== PREVIOUS EXECUTION FAILURE ===\n"
+                f"The previous attempt failed verification. Please analyze the following test/validation output and fix the issues:\n"
+                f"{feedback}"
+            )
+            
+        # 6. Call the ReAct worker agent
+        logger.info("Invoking worker agent...")
+        from orchestrator.worker import execute_worker
+        execute_worker(issue_description, plan, model_name)
+        logger.info("Worker agent execution completed successfully.")
+        
+    except Exception as e:
+        logger.error("Execute phase failed: %s", e)
+        state["status"] = "failed"
+        state["phase"] = "executing"
+        state_module.save(state)
+        raise e
+        
+    # Save the successful executing state
+    state_module.save(state)
+    return state
+
+
+def verify_node(state: AgentState) -> AgentState:
+    """Runs verification tests in a subprocess and manages the retry/feedback loop.
+    
+    Tracks retries in the state's 'attempts' dictionary under the 'verify' key (maximum 3 retries).
+    If verification fails, captures the truncated test output and transitions back to executing.
+    If retries are exhausted, transitions to failed.
+    """
+    issue_num = state.get("issue_number")
+    if issue_num is None:
+        raise ValueError("Cannot run Verify-Node: 'issue_number' is not set in the state.")
+        
+    logger.info("Starting Verify phase for issue #%d...", issue_num)
+    
+    # 1. Update state status, phase, and reset read_files per CONTEXT
+    state["status"] = "verifying"
+    state["phase"] = "verifying"
+    state["read_files"] = []
+    state_module.save(state)
+    
+    workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
+    workspace_path = Path(workspace_env).resolve()
+    
+    # Resolve verification command (default to "make verify")
+    verify_cmd = os.getenv("AGENT_VERIFY_COMMAND", "make verify").strip()
+    args = shlex.split(verify_cmd)
+    
+    # Resolve timeout (default to 300 seconds)
+    timeout = int(os.getenv("AGENT_VERIFY_TIMEOUT", "300"))
+    
+    try:
+        logger.info("Running verification command: %s", verify_cmd)
+        result = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=workspace_path,
+            timeout=timeout
+        )
+        output_bytes = result.stdout
+        exit_code = result.returncode
+        timed_out = False
+    except subprocess.TimeoutExpired as e:
+        output_bytes = e.stdout or b""
+        exit_code = -1
+        timed_out = True
+    except Exception as e:
+        logger.error("Failed to execute verification command '%s': %s", verify_cmd, e)
+        state["status"] = "failed"
+        state["phase"] = "verifying"
+        state_module.save(state)
+        raise e
+        
+    output = output_bytes.decode("utf-8", errors="replace")
+    
+    # Apply standard 150-line / 10 KB truncation logic under the hood
+    output_size_bytes = len(output_bytes)
+    lines = output.splitlines()
+    total_lines = len(lines)
+    
+    is_too_long = total_lines > 150
+    is_too_large = output_size_bytes > 10240
+    
+    if is_too_long or is_too_large:
+        if total_lines <= 130:
+            first_part = lines[:30]
+            last_part = lines[30:]
+            removed_lines = 0
+            truncation_note = f"\n\n... [Output truncated: {removed_lines} lines and {output_size_bytes} bytes processed (lines kept without duplication due to length <= 130)] ...\n\n"
+            output = "\n".join(first_part) + truncation_note + "\n".join(last_part)
+        else:
+            first_part = lines[:30]
+            last_part = lines[-100:]
+            removed_lines = total_lines - 130
+            removed_lines_content = "\n".join(lines[30:-100])
+            removed_bytes = len(removed_lines_content.encode("utf-8", errors="replace"))
+            truncation_note = f"\n\n... [Output truncated: {removed_lines} lines and {removed_bytes} bytes removed due to exceeding limits] ...\n\n"
+            output = "\n".join(first_part) + truncation_note + "\n".join(last_part)
+
+    if timed_out:
+        output = f"Error: Command '{verify_cmd}' timed out after {timeout} seconds.\nOutput captured before timeout:\n{output}"
+        
+    if exit_code == 0 and not timed_out:
+        logger.info("Verification succeeded. Resetting attempts and clearing feedback.")
+        if "verify" in state.get("attempts", {}):
+            # Avoid in-place mutation of a potentially shared DEFAULT_STATE dict
+            attempts = state["attempts"].copy()
+            attempts["verify"] = 0
+            state["attempts"] = attempts
+        state["feedback"] = None
+        # Keep status as 'verifying' on success, letting the graph router handle next transitions
+    else:
+        logger.warning("Verification failed (exit code: %d, timed out: %s).", exit_code, timed_out)
+        # Track retry attempts safely without mutating a shared DEFAULT_STATE dict
+        attempts = state.get("attempts", {}).copy()
+        attempts["verify"] = attempts.get("verify", 0) + 1
+        state["attempts"] = attempts
+        
+        if attempts["verify"] >= 3:
+            logger.error("Maximum verification attempts (3) reached. Transitioning to failed.")
+            state["status"] = "failed"
+            state["feedback"] = output
+        else:
+            logger.info("Verification failed. Attempt %d/3. Transitioning back to executing.", attempts["verify"])
+            state["feedback"] = output
+            # Transition back to executing to let the graph route back to execute_node
+            state["status"] = "executing"
+            
+    state_module.save(state)
+    return state
+
+

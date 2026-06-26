@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from orchestrator import state as state_module
 from orchestrator.state import AgentState, DEFAULT_STATE
-from orchestrator.nodes import claim_node, plan_node
+from orchestrator.nodes import claim_node, plan_node, execute_node, verify_node
 
 class TestClaimNode(unittest.TestCase):
     def setUp(self):
@@ -533,6 +533,265 @@ class TestPlanNode(unittest.TestCase):
 
 
 
+class TestExecuteNode(unittest.TestCase):
+    def setUp(self):
+        # Create temp directory for workspace
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        
+        # Create temp directory for state logs
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        
+        # Set environment variables for testing
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local"
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+            
+    def tearDown(self):
+        # Restore environment variables
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+                
+        # Clean up directories
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_execute_node_success(self, mock_github_api, mock_execute_worker):
+        """Test successful execution of Execute-Node: fetches issue details, resets read_files, and invokes worker."""
+        # Setup mock GitHub API response
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py."
+        }
+        
+        # Setup initial state
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state["read_files"] = ["old_file.py"]
+        state_module.save(state)
+        
+        # Run execute node
+        new_state = execute_node(state)
+        
+        # Verify status transitions, read_files reset
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "executing")
+        self.assertEqual(new_state["read_files"], [])
+        
+        # Verify execute_worker was called with correct parameters
+        mock_execute_worker.assert_called_once_with(
+            "Title: Fix a bug\n\nThere is a bug in main.py.",
+            '{"rationale": "...", "tasks": []}',
+            "google/gemini-2.5-pro"
+        )
+        
+        # Verify state file was saved
+        saved_state = state_module.load()
+        self.assertEqual(saved_state["status"], "executing")
+        self.assertEqual(saved_state["read_files"], [])
+
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_execute_node_with_feedback(self, mock_github_api, mock_execute_worker):
+        """Test that Execute-Node appends previous verification feedback to the worker prompt on retry."""
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py."
+        }
+        
+        # Setup initial state with feedback
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state["feedback"] = "AssertionError: 2 != 3 in test_main.py"
+        state_module.save(state)
+        
+        # Run execute node
+        new_state = execute_node(state)
+        
+        # Verify execute_worker was called with the feedback appended
+        expected_issue_description = (
+            "Title: Fix a bug\n\nThere is a bug in main.py.\n\n"
+            "=== PREVIOUS EXECUTION FAILURE ===\n"
+            "The previous attempt failed verification. Please analyze the following test/validation output and fix the issues:\n"
+            "AssertionError: 2 != 3 in test_main.py"
+        )
+        mock_execute_worker.assert_called_once_with(
+            expected_issue_description,
+            '{"rationale": "...", "tasks": []}',
+            "google/gemini-2.5-pro"
+        )
+
+    @patch("orchestrator.nodes._github_api_request")
+    def test_execute_node_failure(self, mock_github_api):
+        """Test that Execute-Node transitions status to failed and propagates exception on worker error."""
+        # Setup GitHub API to raise an exception
+        mock_github_api.side_effect = RuntimeError("API rate limit")
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+        
+        # Verify exception is propagated
+        with self.assertRaises(RuntimeError) as ctx:
+            execute_node(state)
+        self.assertEqual(str(ctx.exception), "API rate limit")
+        
+        # Verify state is updated to failed at executing phase
+        saved_state = state_module.load()
+        self.assertEqual(saved_state["status"], "failed")
+        self.assertEqual(saved_state["phase"], "executing")
+
+
+class TestVerifyNode(unittest.TestCase):
+    def setUp(self):
+        # Create temp directory for workspace
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        
+        # Create temp directory for state logs
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        
+        # Set environment variables for testing
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local"
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+            
+    def tearDown(self):
+        # Restore environment variables
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+                
+        # Clean up directories
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_verify_node_success(self, mock_subprocess_run):
+        """Test successful verification: exit code 0, clears feedback and resets attempts."""
+        # Mock subprocess run to return success
+        mock_res = unittest.mock.MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = b"All 10 tests passed."
+        mock_subprocess_run.return_value = mock_res
+        
+        # Setup initial state with existing attempts and feedback
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["attempts"] = {"verify": 2}
+        state["feedback"] = "some previous error"
+        state_module.save(state)
+        
+        # Run verify node
+        new_state = verify_node(state)
+        
+        # Verify state changes: status 'verifying', attempts reset to 0, feedback cleared
+        self.assertEqual(new_state["status"], "verifying")
+        self.assertEqual(new_state["phase"], "verifying")
+        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertIsNone(new_state["feedback"])
+        
+        # Verify subprocess was called correctly (default command: 'make verify')
+        mock_subprocess_run.assert_called_once_with(
+            ["make", "verify"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=self.workspace_dir,
+            timeout=300
+        )
+
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_verify_node_failure_retry(self, mock_subprocess_run):
+        """Test verification failure with retry: increments attempts, saves feedback, transitions to executing."""
+        mock_res = unittest.mock.MagicMock()
+        mock_res.returncode = 1
+        mock_res.stdout = b"AssertionError: 1 != 2"
+        mock_subprocess_run.return_value = mock_res
+        
+        # Setup initial state
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["attempts"] = {"verify": 1}
+        state_module.save(state)
+        
+        # Run verify node
+        new_state = verify_node(state)
+        
+        # Verify state: status becomes 'executing' for retry, attempts incremented to 2, feedback saved
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "verifying")
+        self.assertEqual(new_state["attempts"]["verify"], 2)
+        self.assertEqual(new_state["feedback"], "AssertionError: 1 != 2")
+
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_verify_node_failure_max_retries(self, mock_subprocess_run):
+        """Test verification failure exceeding max retries: status transitions to failed."""
+        mock_res = unittest.mock.MagicMock()
+        mock_res.returncode = 1
+        mock_res.stdout = b"AssertionError: 1 != 2"
+        mock_subprocess_run.return_value = mock_res
+        
+        # Setup initial state at 2 attempts
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["attempts"] = {"verify": 2}
+        state_module.save(state)
+        
+        # Run verify node (this is attempt 3)
+        new_state = verify_node(state)
+        
+        # Verify state: status becomes 'failed', attempts incremented to 3
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(new_state["phase"], "verifying")
+        self.assertEqual(new_state["attempts"]["verify"], 3)
+        self.assertEqual(new_state["feedback"], "AssertionError: 1 != 2")
+
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_verify_node_timeout(self, mock_subprocess_run):
+        """Test verification command timing out: captures timeout error, increments attempts."""
+        mock_subprocess_run.side_effect = subprocess.TimeoutExpired(cmd=["make", "verify"], timeout=300, output=b"Starting tests...\n")
+        
+        # Setup initial state
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state_module.save(state)
+        
+        # Run verify node
+        new_state = verify_node(state)
+        
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["attempts"]["verify"], 1)
+        self.assertIn("timed out after 300 seconds", new_state["feedback"])
+        self.assertIn("Starting tests...", new_state["feedback"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
