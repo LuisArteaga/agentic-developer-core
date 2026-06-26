@@ -1,0 +1,207 @@
+import copy
+import os
+import tempfile
+import unittest
+import unittest.mock
+from pathlib import Path
+
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.errors import GraphRecursionError
+
+from orchestrator import state, tools
+from orchestrator.worker import execute_worker, get_chat_model, get_worker_tools
+
+class TestWorkerAgent(unittest.TestCase):
+    def setUp(self):
+        # Create a temporary directory for each test
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir_path = Path(self.temp_dir.name).resolve()
+        
+        # Override project root for safety checks in tools
+        tools._PROJECT_ROOT = self.temp_dir_path
+        
+        # Point AGENT_LOG_PATH to this temporary directory so state is written there
+        self.original_env = os.environ.get("AGENT_LOG_PATH")
+        os.environ["AGENT_LOG_PATH"] = str(self.temp_dir_path / "logs")
+        
+        # Create a clean state file
+        self.state_file_path = state.get_state_filepath()
+        self.test_state = copy.deepcopy(state.DEFAULT_STATE)
+        state.save(self.test_state, self.state_file_path)
+
+        # Create a test file in the temp directory
+        self.test_file = self.temp_dir_path / "hello.txt"
+        self.test_file.write_text("hello world", encoding="utf-8")
+
+    def tearDown(self):
+        # Restore project root and environment, and clean up
+        tools._PROJECT_ROOT = None
+        if self.original_env is not None:
+            os.environ["AGENT_LOG_PATH"] = self.original_env
+        elif "AGENT_LOG_PATH" in os.environ:
+            del os.environ["AGENT_LOG_PATH"]
+            
+        self.temp_dir.cleanup()
+
+    def test_get_worker_tools(self):
+        """Test that get_worker_tools returns the 5 expected wrapped tools."""
+        wrapped_tools = get_worker_tools()
+        self.assertEqual(len(wrapped_tools), 5)
+        tool_names = {t.name for t in wrapped_tools}
+        self.assertEqual(tool_names, {"read_file", "list_directory", "grep_search", "patch_file", "run_command"})
+
+    def test_get_chat_model(self):
+        """Test that get_chat_model instantiates ChatOpenAI with the correct base url."""
+        model = get_chat_model("gpt-4o")
+        self.assertEqual(model.model_name, "gpt-4o")
+        self.assertEqual(model.openai_api_base, "https://openrouter.ai/api/v1")
+
+    @unittest.mock.patch("langchain_openai.ChatOpenAI.invoke")
+    def test_execute_worker_success(self, mock_invoke):
+        """Test a successful worker execution path where it reads and patches a file."""
+        
+        # We define a side_effect function to simulate the LLM's multi-turn tool calling
+        def llm_side_effect(input_messages, *args, **kwargs):
+            # Inspect the length of messages to determine the step in the conversation
+            if hasattr(input_messages, "messages"):
+                msg_list = input_messages.messages
+            else:
+                msg_list = input_messages
+
+            msg_count = len(msg_list)
+            
+            if msg_count == 2:
+                # Step 1: LLM decides to read the file (SystemMessage + HumanMessage)
+                return AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "read_file",
+                        "args": {"path": "hello.txt"},
+                        "id": "call_read_1"
+                    }]
+                )
+            elif msg_count == 4:
+                # Step 2: LLM sees the file contents and decides to patch the file
+                # [SystemMessage, HumanMessage, AIMessage, ToolMessage] -> ToolMessage is at index 3
+                self.assertIsInstance(msg_list[3], ToolMessage)
+                self.assertEqual(msg_list[3].content, "hello world")
+                
+                return AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "patch_file",
+                        "args": {
+                            "path": "hello.txt",
+                            "old_string": "hello",
+                            "new_string": "goodbye"
+                        },
+                        "id": "call_patch_1"
+                    }]
+                )
+            elif msg_count == 6:
+                # Step 3: LLM sees the successful patch and returns the final answer
+                self.assertIsInstance(msg_list[5], ToolMessage)
+                self.assertIn("patched successfully", msg_list[5].content)
+                
+                return AIMessage(
+                    content="I have successfully updated hello.txt from 'hello' to 'goodbye'.",
+                    tool_calls=[]
+                )
+            else:
+                self.fail(f"Unexpected message count in mock LLM: {msg_count}")
+
+        mock_invoke.side_effect = llm_side_effect
+
+        # Run the worker agent
+        final_answer = execute_worker(
+            issue_description="Please change 'hello' to 'goodbye' in hello.txt.",
+            plan="1. Read hello.txt\n2. Patch hello.txt replacing 'hello' with 'goodbye'",
+            model_name="gpt-4o"
+        )
+
+        # Assert final output and file changes
+        self.assertEqual(final_answer, "I have successfully updated hello.txt from 'hello' to 'goodbye'.")
+        self.assertEqual(self.test_file.read_text(encoding="utf-8"), "goodbye world")
+
+        # Verify that the path was registered in state.json
+        loaded_state = state.load(self.state_file_path)
+        self.assertIn("hello.txt", loaded_state["read_files"])
+
+    @unittest.mock.patch("langchain_openai.ChatOpenAI.invoke")
+    def test_execute_worker_read_before_edit_violation(self, mock_invoke):
+        """Test that the worker agent handles a Read-Before-Edit validation failure from the tool."""
+        
+        def llm_side_effect(input_messages, *args, **kwargs):
+            if hasattr(input_messages, "messages"):
+                msg_list = input_messages.messages
+            else:
+                msg_list = input_messages
+
+            msg_count = len(msg_list)
+            
+            if msg_count == 2:
+                # Step 1: LLM immediately tries to patch without reading first
+                return AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "patch_file",
+                        "args": {
+                            "path": "hello.txt",
+                            "old_string": "hello",
+                            "new_string": "goodbye"
+                        },
+                        "id": "call_patch_violating"
+                    }]
+                )
+            elif msg_count == 4:
+                # Step 2: LLM receives the validation error from the tool
+                self.assertIsInstance(msg_list[3], ToolMessage)
+                self.assertIn("Read-Before-Edit validation failed", msg_list[3].content)
+                
+                return AIMessage(
+                    content="I failed to edit the file because I violated the Read-Before-Edit rule.",
+                    tool_calls=[]
+                )
+            else:
+                self.fail(f"Unexpected message count: {msg_count}")
+
+        mock_invoke.side_effect = llm_side_effect
+
+        final_answer = execute_worker(
+            issue_description="Please change 'hello' to 'goodbye' in hello.txt.",
+            plan="1. Patch hello.txt",
+            model_name="gpt-4o"
+        )
+
+        self.assertEqual(final_answer, "I failed to edit the file because I violated the Read-Before-Edit rule.")
+        # Ensure the file was NOT modified
+        self.assertEqual(self.test_file.read_text(encoding="utf-8"), "hello world")
+
+    @unittest.mock.patch("langchain_openai.ChatOpenAI.invoke")
+    def test_execute_worker_recursion_limit(self, mock_invoke):
+        """Test that the worker agent aborts when the recursion limit is hit during an infinite loop."""
+        
+        call_count = 0
+        def mock_recursion_invoke(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "list_directory",
+                    "args": {"path": "."},
+                    "id": f"call_loop_{call_count}"
+                }]
+            )
+        
+        mock_invoke.side_effect = mock_recursion_invoke
+
+        # LangGraph's prebuilt create_react_agent handles recursion limit exhaustion
+        # by returning a fallback AIMessage instead of raising GraphRecursionError
+        final_answer = execute_worker(
+            issue_description="List the directory infinitely.",
+            plan="Loop forever.",
+            model_name="gpt-4o"
+        )
+        
+        self.assertEqual(final_answer, "Sorry, need more steps to process this request.")
