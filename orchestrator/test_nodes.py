@@ -344,24 +344,27 @@ class TestPlanNode(unittest.TestCase):
         )
         mock_structured_llm.invoke.return_value = mock_plan
         
-        # Setup initial state
+        # Setup initial state with some pre-existing read_files to verify it gets reset per ADR-0006
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["model"] = "gpt-4o"
+        state["read_files"] = ["some_old_file.py"]
         state_module.save(state)
         
         # Run plan node
         new_state = plan_node(state)
         
-        # Verify state transitions
+        # Verify state transitions and read_files reset
         self.assertEqual(new_state["status"], "planning")
         self.assertEqual(new_state["phase"], "planning")
+        self.assertEqual(new_state["read_files"], [])
         self.assertIsNotNone(new_state["plan"])
         self.assertEqual(new_state["model"], "gpt-4o")
         
         # Verify state file was saved
         saved_state = state_module.load()
         self.assertEqual(saved_state["status"], "planning")
+        self.assertEqual(saved_state["read_files"], [])
         
         # Verify serialized plan structure
         plan_data = json.loads(new_state["plan"])
@@ -413,6 +416,89 @@ class TestPlanNode(unittest.TestCase):
         self.assertEqual(saved_state["status"], "failed")
         self.assertEqual(saved_state["phase"], "planning")
 
+    def test_plan_node_security_path_validation(self):
+        """Test that the _is_safe_path helper correctly identifies safe and unsafe/forbidden paths."""
+        from orchestrator.nodes import _is_safe_path
+        
+        # Safe paths
+        self.assertTrue(_is_safe_path("src/main.py"))
+        self.assertTrue(_is_safe_path("README.md"))
+        self.assertTrue(_is_safe_path("orchestrator/nodes.py"))
+        self.assertTrue(_is_safe_path("tests/test_something.py"))
+        
+        # Unsafe paths: absolute paths
+        self.assertFalse(_is_safe_path("/etc/passwd"))
+        self.assertFalse(_is_safe_path("/absolute/path/file.txt"))
+        
+        # Unsafe paths: directory traversal
+        self.assertFalse(_is_safe_path("../outside.py"))
+        self.assertFalse(_is_safe_path("src/../../outside.py"))
+        
+        # Unsafe paths: forbidden directories
+        self.assertFalse(_is_safe_path(".git/config"))
+        self.assertFalse(_is_safe_path(".venv/lib/python3.12/site-packages/something.py"))
+        self.assertFalse(_is_safe_path("src/.agent_logs/state.json"))
+        self.assertFalse(_is_safe_path(".agents/AGENTS.md"))
+        
+        # Unsafe paths: forbidden filenames / credentials
+        self.assertFalse(_is_safe_path(".env"))
+        self.assertFalse(_is_safe_path("src/.env"))
+        self.assertFalse(_is_safe_path("ssh_keys/id_rsa"))
+        self.assertFalse(_is_safe_path("credentials.txt"))
+        self.assertFalse(_is_safe_path("config/id_ed25519"))
+        
+        # Unsafe paths: sensitive extensions
+        self.assertFalse(_is_safe_path("certs/private.key"))
+        self.assertFalse(_is_safe_path("auth/token.pem"))
+        self.assertFalse(_is_safe_path("cert.pfx"))
+
+    @patch("orchestrator.nodes.get_chat_model")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_plan_node_security_injection_blocking(self, mock_github_api, mock_get_chat_model):
+        """Test that Plan-Node catches prompt injection attempts in the generated plan and aborts with a security block."""
+        from orchestrator.nodes import DevelopmentPlan, PlanningTask
+        
+        # Setup mock GitHub API response
+        mock_github_api.return_value = {
+            "title": "Malicious Issue",
+            "body": "System prompt override attempt."
+        }
+        
+        # Setup mock LLM and structured output returning a malicious plan targeting .env
+        mock_llm = unittest.mock.MagicMock()
+        mock_structured_llm = unittest.mock.MagicMock()
+        mock_get_chat_model.return_value = mock_llm
+        mock_llm.with_structured_output.return_value = mock_structured_llm
+        
+        mock_malicious_plan = DevelopmentPlan(
+            rationale="Attacker steered reasoning.",
+            tasks=[
+                PlanningTask(
+                    step_number=1,
+                    action="read",
+                    description="Exfiltrate environment variables",
+                    target_files=[".env"]  # Unsafe file!
+                )
+            ]
+        )
+        mock_structured_llm.invoke.return_value = mock_malicious_plan
+        
+        # Setup initial state
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state_module.save(state)
+        
+        # Verify ValueError is raised with a security block message
+        with self.assertRaises(ValueError) as ctx:
+            plan_node(state)
+        self.assertIn("Security Block", str(ctx.exception))
+        self.assertIn("'.env'", str(ctx.exception))
+        
+        # Verify state is updated and saved as 'failed' at 'planning' phase
+        saved_state = state_module.load()
+        self.assertEqual(saved_state["status"], "failed")
+        self.assertEqual(saved_state["phase"], "planning")
+
     def test_directory_tree_generation(self):
         """Test that the directory tree generator outputs correct structure and honors ignored directories."""
         # Create a directory structure in the temp workspace
@@ -444,6 +530,7 @@ class TestPlanNode(unittest.TestCase):
         self.assertNotIn(".git", tree)
         self.assertNotIn(".venv", tree)
         self.assertNotIn("lib", tree)
+
 
 
 if __name__ == "__main__":
