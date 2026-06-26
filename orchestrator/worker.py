@@ -99,9 +99,8 @@ def get_chat_model(model_name: str) -> ChatOpenAI:
     """Instantiate the OpenAI-compatible chat model for OpenRouter."""
     load_dotenv()
     api_key = os.getenv("OPENROUTER_API_KEY")
-    # Default to 'mock-key' for tests if not set
     if not api_key:
-        api_key = "mock-key"
+        raise ValueError("OPENROUTER_API_KEY environment variable is not set.")
         
     return ChatOpenAI(
         model=model_name,

@@ -6,7 +6,6 @@ import unittest.mock
 from pathlib import Path
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langgraph.errors import GraphRecursionError
 
 from orchestrator import state, tools
 from orchestrator.worker import execute_worker, get_chat_model, get_worker_tools
@@ -24,6 +23,10 @@ class TestWorkerAgent(unittest.TestCase):
         self.original_env = os.environ.get("AGENT_LOG_PATH")
         os.environ["AGENT_LOG_PATH"] = str(self.temp_dir_path / "logs")
         
+        # Inject mock key to isolate tests and avoid production scaffolding
+        self.original_api_key = os.environ.get("OPENROUTER_API_KEY")
+        os.environ["OPENROUTER_API_KEY"] = "mock-key"
+        
         # Create a clean state file
         self.state_file_path = state.get_state_filepath()
         self.test_state = copy.deepcopy(state.DEFAULT_STATE)
@@ -40,6 +43,11 @@ class TestWorkerAgent(unittest.TestCase):
             os.environ["AGENT_LOG_PATH"] = self.original_env
         elif "AGENT_LOG_PATH" in os.environ:
             del os.environ["AGENT_LOG_PATH"]
+            
+        if self.original_api_key is not None:
+            os.environ["OPENROUTER_API_KEY"] = self.original_api_key
+        elif "OPENROUTER_API_KEY" in os.environ:
+            del os.environ["OPENROUTER_API_KEY"]
             
         self.temp_dir.cleanup()
 
