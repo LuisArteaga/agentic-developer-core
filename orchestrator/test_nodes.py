@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from orchestrator import state as state_module
 from orchestrator.state import AgentState, DEFAULT_STATE
-from orchestrator.nodes import claim_node
+from orchestrator.nodes import claim_node, plan_node
 
 class TestClaimNode(unittest.TestCase):
     def setUp(self):
@@ -271,5 +271,181 @@ class TestClaimNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "claimed")
         self.assertEqual(new_state["branch"], "feat/issue-11")
 
+
+class TestPlanNode(unittest.TestCase):
+    def setUp(self):
+        # Create temp directory for workspace
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        
+        # Create temp directory for state logs
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        
+        # Set environment variables for testing
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local"
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+            
+    def tearDown(self):
+        # Restore environment variables
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+                
+        # Clean up directories
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.nodes.get_chat_model")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_plan_node_success(self, mock_github_api, mock_get_chat_model):
+        """Test successful Plan-Node execution: fetches issue, calls LLM, and serializes Pydantic plan."""
+        from orchestrator.nodes import DevelopmentPlan, PlanningTask
+        
+        # Setup mock GitHub API response
+        mock_github_api.return_value = {
+            "title": "Add DB migration",
+            "body": "We need a migration script for user profiles."
+        }
+        
+        # Setup mock LLM and structured output
+        mock_llm = unittest.mock.MagicMock()
+        mock_structured_llm = unittest.mock.MagicMock()
+        
+        mock_get_chat_model.return_value = mock_llm
+        mock_llm.with_structured_output.return_value = mock_structured_llm
+        
+        mock_plan = DevelopmentPlan(
+            rationale="We need to add a migration script.",
+            tasks=[
+                PlanningTask(
+                    step_number=1,
+                    action="read",
+                    description="Read schema file",
+                    target_files=["schema.py"]
+                ),
+                PlanningTask(
+                    step_number=2,
+                    action="patch",
+                    description="Add migration",
+                    target_files=["migration.py"]
+                )
+            ]
+        )
+        mock_structured_llm.invoke.return_value = mock_plan
+        
+        # Setup initial state
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["model"] = "gpt-4o"
+        state_module.save(state)
+        
+        # Run plan node
+        new_state = plan_node(state)
+        
+        # Verify state transitions
+        self.assertEqual(new_state["status"], "planning")
+        self.assertEqual(new_state["phase"], "planning")
+        self.assertIsNotNone(new_state["plan"])
+        self.assertEqual(new_state["model"], "gpt-4o")
+        
+        # Verify state file was saved
+        saved_state = state_module.load()
+        self.assertEqual(saved_state["status"], "planning")
+        
+        # Verify serialized plan structure
+        plan_data = json.loads(new_state["plan"])
+        self.assertEqual(plan_data["rationale"], "We need to add a migration script.")
+        self.assertEqual(len(plan_data["tasks"]), 2)
+        self.assertEqual(plan_data["tasks"][0]["description"], "Read schema file")
+        self.assertEqual(plan_data["tasks"][0]["target_files"], ["schema.py"])
+
+    def test_plan_node_missing_issue(self):
+        """Test that Plan-Node raises ValueError if 'issue_number' is not set in the state."""
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = None
+        
+        with self.assertRaises(ValueError) as ctx:
+            plan_node(state)
+        self.assertIn("issue_number", str(ctx.exception))
+
+    @patch("orchestrator.nodes.get_chat_model")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_plan_node_llm_failure(self, mock_github_api, mock_get_chat_model):
+        """Test that Plan-Node handles LLM failures by updating status to 'failed' and propagating exception."""
+        # Setup mock GitHub API response
+        mock_github_api.return_value = {
+            "title": "Add DB migration",
+            "body": "We need a migration script for user profiles."
+        }
+        
+        # Setup mock LLM to raise an exception when invoked
+        mock_llm = unittest.mock.MagicMock()
+        mock_structured_llm = unittest.mock.MagicMock()
+        
+        mock_get_chat_model.return_value = mock_llm
+        mock_llm.with_structured_output.return_value = mock_structured_llm
+        
+        mock_structured_llm.invoke.side_effect = RuntimeError("OpenRouter API error")
+        
+        # Setup initial state
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state_module.save(state)
+        
+        # Verify exception is propagated
+        with self.assertRaises(RuntimeError) as ctx:
+            plan_node(state)
+        self.assertEqual(str(ctx.exception), "OpenRouter API error")
+        
+        # Verify state is updated and saved as 'failed' at 'planning' phase
+        saved_state = state_module.load()
+        self.assertEqual(saved_state["status"], "failed")
+        self.assertEqual(saved_state["phase"], "planning")
+
+    def test_directory_tree_generation(self):
+        """Test that the directory tree generator outputs correct structure and honors ignored directories."""
+        # Create a directory structure in the temp workspace
+        (self.workspace_dir / "src").mkdir()
+        (self.workspace_dir / "src" / "utils").mkdir()
+        (self.workspace_dir / "src" / "main.py").write_text("print('main')", encoding="utf-8")
+        (self.workspace_dir / "src" / "utils" / "helper.py").write_text("def help(): pass", encoding="utf-8")
+        (self.workspace_dir / "README.md").write_text("# Readme", encoding="utf-8")
+        
+        # Create ignored directories
+        (self.workspace_dir / ".git").mkdir()
+        (self.workspace_dir / ".venv").mkdir()
+        (self.workspace_dir / ".venv" / "bin").mkdir()
+        (self.workspace_dir / ".venv" / "lib").mkdir()
+        
+        from orchestrator.nodes import _get_directory_tree
+        
+        # Generate tree
+        tree = _get_directory_tree(self.workspace_dir)
+        
+        # Verify output contains files/folders and shows hierarchy
+        self.assertIn("README.md", tree)
+        self.assertIn("src/", tree)
+        self.assertIn("utils/", tree)
+        self.assertIn("helper.py", tree)
+        self.assertIn("main.py", tree)
+        
+        # Verify ignored folders are completely absent
+        self.assertNotIn(".git", tree)
+        self.assertNotIn(".venv", tree)
+        self.assertNotIn("lib", tree)
+
+
 if __name__ == "__main__":
     unittest.main()
+
