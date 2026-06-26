@@ -7,7 +7,7 @@ body:
       value: |
         ### Task-Spezifikation für den Agenten
         Bitte fülle diese Felder aus. Der Agent benötigt diese strukturierte Beschreibung, um den Task autonom bearbeiten zu können. 
-        **Hinweis:** Füge das Label `ready-for-agent` nach dem Erstellen manuell hinzu, um den Agenten zu starten.
+        **Hinweis:** Füge das Label `agent-ready` nach dem Erstellen manuell hinzu, um den Agenten zu starten.
   - type: textarea
     id: what-to-build
     attributes:

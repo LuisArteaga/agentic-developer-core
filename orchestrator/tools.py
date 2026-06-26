@@ -6,12 +6,26 @@ from orchestrator import state
 # Can be overridden for testing purposes
 _PROJECT_ROOT: Optional[Path] = None
 
+def get_workspace_root() -> Path:
+    """Resolve the active workspace root path, honoring GITHUB_WORKSPACE and _PROJECT_ROOT overrides."""
+    if _PROJECT_ROOT is not None:
+        return _PROJECT_ROOT
+    workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
+    p = Path(workspace_env)
+    if not p.is_absolute():
+        # Resolve relative to the orchestrator's project root (parent of orchestrator package)
+        orchestrator_root = Path(__file__).resolve().parent.parent
+        p = (orchestrator_root / p).resolve()
+    else:
+        p = p.resolve()
+    return p
+
 def _normalize_path(path_str: str) -> tuple[Path, str]:
     """Helper to resolve a path and return its absolute Path object and project-relative string path.
     
     Enforces path safety by raising ValueError if the resolved path is outside the project root.
     """
-    project_root = _PROJECT_ROOT or Path(__file__).resolve().parent.parent
+    project_root = get_workspace_root()
     p = Path(path_str)
     if not p.is_absolute():
         abs_path = (project_root / p).resolve()
@@ -252,7 +266,7 @@ def run_command(command: str) -> str:
     import shlex
     import subprocess
     
-    project_root = _PROJECT_ROOT or Path(__file__).resolve().parent.parent
+    project_root = get_workspace_root()
     
     try:
         args = shlex.split(command)

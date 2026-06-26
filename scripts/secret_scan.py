@@ -38,7 +38,7 @@ def scan_text(text: str, filename: str):
 
 
 def scan_file(path: Path) -> list:
-    if path.name == ".env.example":
+    if path.name in (".env.example", "uv.lock"):
         return []
     if is_binary(path):
         return []

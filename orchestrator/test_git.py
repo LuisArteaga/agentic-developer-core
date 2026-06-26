@@ -189,3 +189,67 @@ class TestGitSubprocessHelper(unittest.TestCase):
             with self.assertRaises(GitError) as ctx:
                 git._run_git(self.repo_path, ["status"])
             self.assertIn("Git executable not found", str(ctx.exception))
+
+    def test_get_remote_url(self):
+        """Test get_remote_url returns the correct remote URL."""
+        with tempfile.TemporaryDirectory() as remote_temp:
+            remote_path = Path(remote_temp).resolve()
+            # Add a mock remote
+            subprocess.run(
+                ["git", "remote", "add", "upstream", f"file://{remote_path}"],
+                cwd=str(self.repo_path),
+                check=True
+            )
+            url = git.get_remote_url(self.repo_path, "upstream")
+            self.assertEqual(url, f"file://{remote_path}")
+
+    def test_clone_secure_token(self):
+        """Test that clone works and stores the credential helper reference, NOT the plaintext token, on disk."""
+        with tempfile.TemporaryDirectory() as remote_temp:
+            remote_path = Path(remote_temp).resolve()
+            # Initialize bare remote repo
+            subprocess.run(["git", "init", "--bare", "-b", "main"], cwd=str(remote_path), check=True, capture_output=True)
+            
+            with tempfile.TemporaryDirectory() as clone_temp:
+                clone_path = Path(clone_temp).resolve() / "target_clone"
+                
+                # Mock repository string: e.g. owner/repo (we can use the local file path as a fake owner/repo by mocking the URL inside clone or just letting git resolve it relative to path)
+                # Actually, git clone supports local directory paths as URLs, but clone() in git.py appends f"https://github.com/{github_repo}.git".
+                # If we want to test clone() without hitting github.com, we can mock clean_url in clone() or mock the subprocess call,
+                # or just mock the remote URL.
+                # Let's patch clean_url inside git.clone to point to our local bare repo!
+                import unittest.mock as mock
+                original_run = subprocess.run
+                with mock.patch("subprocess.run") as mock_run:
+                    # Let's temporarily change clean_url inside clone to file://{remote_path}
+                    # We can do this by mocking clean_url, but since clean_url is local to clone(),
+                    # we can mock the clone URL by patching clean_url to point to the local file path.
+                    # Wait, how about we just mock the URL in the git clone args?
+                    # Let's patch subprocess.run to intercept the URL and replace it!
+                    def side_effect(*args, **kwargs):
+                        cmd = list(args[0])
+                        for i, arg in enumerate(cmd):
+                            if "github.com/" in arg:
+                                cmd[i] = str(remote_path)
+                        args = (cmd,) + args[1:]
+                        return original_run(*args, **kwargs)
+                        
+                    mock_run.side_effect = side_effect
+                    
+                    git.clone(clone_path, "fake-owner/fake-repo", token="my-super-secret-pat-token")
+                
+                # Verify repository cloned successfully (contains .git)
+                self.assertTrue(git.is_git_repository(clone_path))
+                
+                # Read .git/config and verify the token is NOT present in plaintext
+                config_path = clone_path / ".git" / "config"
+                config_content = config_path.read_text(encoding="utf-8")
+                
+                self.assertNotIn("my-super-secret-pat-token", config_content)
+                self.assertIn("credential", config_content)
+                self.assertIn("x-access-token", config_content)
+                self.assertIn("$GH_PAT", config_content)
+                
+                # Check that GH_PAT was injected into os.environ
+                self.assertEqual(os.environ.get("GH_PAT"), "my-super-secret-pat-token")
+
