@@ -132,8 +132,26 @@ def claim_node(state: AgentState) -> AgentState:
         if not workspace_path.exists() or not is_git_repository(workspace_path):
             logger.info("Workspace '%s' does not exist or is not a git repository. Cloning %s...", workspace_path, github_repo)
             workspace_path.mkdir(parents=True, exist_ok=True)
-            # Use gh repo clone which handles auth natively
-            _run_gh(["repo", "clone", github_repo, str(workspace_path)])
+            
+            # Formulate authenticated clone URL if token is present, otherwise use standard HTTPS
+            token = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+            if token:
+                clone_url = f"https://x-access-token:{token.strip()}@github.com/{github_repo}.git"
+            else:
+                clone_url = f"https://github.com/{github_repo}.git"
+                
+            # Run git clone directly via subprocess to comply with ADR-0007
+            result = subprocess.run(
+                ["git", "clone", clone_url, str(workspace_path)],
+                capture_output=True,
+                text=True,
+                shell=False
+            )
+            if result.returncode != 0:
+                # Sanitize error message to prevent token leaks in log outputs
+                err_msg = result.stderr.replace(token, "******") if token else result.stderr
+                raise RuntimeError(f"Git clone failed (code {result.returncode}): {err_msg.strip()}")
+                
             logger.info("Repository cloned successfully into %s.", workspace_path)
 
         if resume:

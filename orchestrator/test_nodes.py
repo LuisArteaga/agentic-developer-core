@@ -1,11 +1,10 @@
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from orchestrator import state as state_module
 from orchestrator.state import AgentState, DEFAULT_STATE
