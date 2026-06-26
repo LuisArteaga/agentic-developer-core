@@ -228,6 +228,9 @@ class TestWorkerAgent(unittest.TestCase):
         res = get_worker_tools()[4].invoke("pytest")
         self.assertNotIn("Security validation failed", res)
         
+        res = get_worker_tools()[4].invoke("uv pip list")
+        self.assertNotIn("Security validation failed", res)
+        
         # 2. Blocked executables
         res = get_worker_tools()[4].invoke("rm -rf /")
         self.assertIn("Security validation failed: Executable 'rm' is not in the permitted allowlist", res)
@@ -242,7 +245,7 @@ class TestWorkerAgent(unittest.TestCase):
         res = get_worker_tools()[4].invoke("python -c 'print(1)'")
         self.assertIn("Security validation failed: Executing arbitrary inline Python scripts via the '-c' flag is blocked", res)
 
-        # 4. Blocked shell-injection characters
+        # 4. Blocked shell-injection and control characters
         res = get_worker_tools()[4].invoke("make verify ; rm -rf /")
         self.assertIn("Security validation failed: Command contains blocked character ';'", res)
         
@@ -251,3 +254,16 @@ class TestWorkerAgent(unittest.TestCase):
         
         res = get_worker_tools()[4].invoke("make verify && pytest")
         self.assertIn("Security validation failed: Command contains blocked character '&'", res)
+        
+        res = get_worker_tools()[4].invoke("make verify\nrm -rf /")
+        self.assertIn("Security validation failed: Command contains blocked character '\\n'", res)
+
+        # 5. Blocked uv subcommands (preventing RCE proxying)
+        res = get_worker_tools()[4].invoke("uv run rm -rf /")
+        self.assertIn("Security validation failed: 'uv' subcommand 'run' is blocked", res)
+        
+        res = get_worker_tools()[4].invoke("uv tool run pytest")
+        self.assertIn("Security validation failed: 'uv' subcommand 'tool' is blocked", res)
+        
+        res = get_worker_tools()[4].invoke("uv")
+        self.assertIn("Security validation failed: 'uv' command requires a subcommand", res)

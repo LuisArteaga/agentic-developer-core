@@ -1,9 +1,7 @@
 import os
 import logging
 from typing import Optional
-from dotenv import load_dotenv
 
-from langchain_core.messages import SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
@@ -49,10 +47,13 @@ def _is_safe_command(command: str) -> tuple[bool, str]:
     For Python/uv, we explicitly block executing arbitrary inline scripts (the '-c' flag).
     We also block suspicious shell characters as a defense-in-depth measure.
     """
-    blocked_chars = [';', '|', '&', '$', '`', '>', '<']
+    # Defense-in-depth: block common shell-injection and control characters (including newlines)
+    blocked_chars = [';', '|', '&', '$', '`', '>', '<', '\n', '\r']
     for char in blocked_chars:
         if char in command:
-            return False, f"Security validation failed: Command contains blocked character '{char}'."
+            # Format control characters visibly in error logs
+            repr_char = repr(char).strip("'")
+            return False, f"Security validation failed: Command contains blocked character '{repr_char}'."
             
     import shlex
     try:
@@ -70,7 +71,16 @@ def _is_safe_command(command: str) -> tuple[bool, str]:
     if exec_basename not in permitted_executables:
         return False, f"Security validation failed: Executable '{exec_basename}' is not in the permitted allowlist ({', '.join(sorted(permitted_executables))})."
         
-    if exec_basename in {"python", "python3", "uv"}:
+    # Specific restrictions for uv to prevent RCE proxying (e.g., 'uv run', 'uv tool')
+    if exec_basename == "uv":
+        if len(args) < 2:
+            return False, "Security validation failed: 'uv' command requires a subcommand."
+        subcommand = args[1]
+        permitted_uv_subcommands = {"pip"}
+        if subcommand not in permitted_uv_subcommands:
+            return False, f"Security validation failed: 'uv' subcommand '{subcommand}' is blocked for security reasons (only 'uv pip' is permitted)."
+            
+    if exec_basename in {"python", "python3"}:
         for arg in args[1:]:
             if arg.strip() == "-c":
                 return False, "Security validation failed: Executing arbitrary inline Python scripts via the '-c' flag is blocked for security reasons."
@@ -97,7 +107,6 @@ def get_worker_tools() -> list:
 
 def get_chat_model(model_name: str) -> ChatOpenAI:
     """Instantiate the OpenAI-compatible chat model for OpenRouter."""
-    load_dotenv()
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise ValueError("OPENROUTER_API_KEY environment variable is not set.")
