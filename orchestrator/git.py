@@ -166,7 +166,6 @@ def clone(repo_dir: Path | str, github_repo: str, token: Optional[str] = None) -
     Utilizes Git's credential helper with an environment variable reference to prevent
     persisting the plaintext token in the local git config.
     """
-    Path(repo_dir).mkdir(parents=True, exist_ok=True)
     clean_url = f"https://github.com/{github_repo}.git"
     
     if token:
