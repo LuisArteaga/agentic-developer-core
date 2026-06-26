@@ -570,6 +570,24 @@ def execute_node(state: AgentState) -> AgentState:
     return state
 
 
+def _truncate_output(output: str) -> str:
+    """Truncates the output string to enforce a maximum of 150 lines and 10 KB (10240 bytes) limit."""
+    lines = output.splitlines()
+    if len(lines) > 150:
+        first_part = lines[:30]
+        last_part = lines[-100:]
+        output = "\n".join(first_part) + "\n\n... [Output truncated: exceeded 150 lines] ...\n\n" + "\n".join(last_part)
+        
+    output_bytes = output.encode("utf-8", errors="replace")
+    if len(output_bytes) > 10240:
+        # Keep the first 10000 bytes and append a note (safe against partial UTF-8 sequences)
+        truncated_bytes = output_bytes[:10000]
+        truncated_text = truncated_bytes.decode("utf-8", errors="replace")
+        output = truncated_text + "\n\n... [Output truncated: exceeded 10 KB limit] ..."
+        
+    return output
+
+
 def verify_node(state: AgentState) -> AgentState:
     """Runs verification tests in a subprocess and manages the retry/feedback loop.
     
@@ -622,31 +640,8 @@ def verify_node(state: AgentState) -> AgentState:
         state_module.save(state)
         raise e
         
-    output = output_bytes.decode("utf-8", errors="replace")
-    
-    # Apply standard 150-line / 10 KB truncation logic under the hood
-    output_size_bytes = len(output_bytes)
-    lines = output.splitlines()
-    total_lines = len(lines)
-    
-    is_too_long = total_lines > 150
-    is_too_large = output_size_bytes > 10240
-    
-    if is_too_long or is_too_large:
-        if total_lines <= 130:
-            first_part = lines[:30]
-            last_part = lines[30:]
-            removed_lines = 0
-            truncation_note = f"\n\n... [Output truncated: {removed_lines} lines and {output_size_bytes} bytes processed (lines kept without duplication due to length <= 130)] ...\n\n"
-            output = "\n".join(first_part) + truncation_note + "\n".join(last_part)
-        else:
-            first_part = lines[:30]
-            last_part = lines[-100:]
-            removed_lines = total_lines - 130
-            removed_lines_content = "\n".join(lines[30:-100])
-            removed_bytes = len(removed_lines_content.encode("utf-8", errors="replace"))
-            truncation_note = f"\n\n... [Output truncated: {removed_lines} lines and {removed_bytes} bytes removed due to exceeding limits] ...\n\n"
-            output = "\n".join(first_part) + truncation_note + "\n".join(last_part)
+    raw_output = output_bytes.decode("utf-8", errors="replace")
+    output = _truncate_output(raw_output)
 
     if timed_out:
         output = f"Error: Command '{verify_cmd}' timed out after {timeout} seconds.\nOutput captured before timeout:\n{output}"

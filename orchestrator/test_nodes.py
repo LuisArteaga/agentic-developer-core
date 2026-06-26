@@ -790,6 +790,27 @@ class TestVerifyNode(unittest.TestCase):
         self.assertIn("timed out after 300 seconds", new_state["feedback"])
         self.assertIn("Starting tests...", new_state["feedback"])
 
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_verify_node_large_output_under_line_limit(self, mock_subprocess_run):
+        """Test that verify_node correctly truncates output exceeding 10 KB even if it is under the line limit."""
+        # Create a single extremely long line of 12 KB
+        large_content = "A" * 12000
+        mock_res = unittest.mock.MagicMock()
+        mock_res.returncode = 1
+        mock_res.stdout = large_content.encode("utf-8")
+        mock_subprocess_run.return_value = mock_res
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state_module.save(state)
+        
+        new_state = verify_node(state)
+        
+        # Verify that the saved feedback is under 10 KB (10240 bytes)
+        feedback_bytes = new_state["feedback"].encode("utf-8")
+        self.assertTrue(len(feedback_bytes) <= 10240)
+        self.assertIn("exceeded 10 KB limit", new_state["feedback"])
+
 
 if __name__ == "__main__":
     unittest.main()
