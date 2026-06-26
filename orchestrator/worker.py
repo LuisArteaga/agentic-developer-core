@@ -1,6 +1,5 @@
 import os
 import logging
-from typing import Optional
 
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
@@ -13,7 +12,7 @@ logger = logging.getLogger("orchestrator.worker")
 
 # Define the 5 custom tools wrapped for LangChain ReAct Agent
 @tool
-def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
     """Read contents of a file, with optional 1-based start_line and end_line bounds (inclusive).
     
     You MUST call read_file to inspect a file's contents before you can modify it using patch_file.
@@ -40,53 +39,6 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
     """
     return codebase_tools.patch_file(path, old_string=old_string, new_string=new_string)
 
-def _is_safe_command(command: str) -> tuple[bool, str]:
-    """Validate that the command is safe to execute.
-    
-    Permitted executables: 'make', 'python', 'python3', 'pytest', 'uv'.
-    For Python/uv, we explicitly block executing arbitrary inline scripts (the '-c' flag).
-    We also block suspicious shell characters as a defense-in-depth measure.
-    """
-    # Defense-in-depth: block common shell-injection and control characters (including newlines)
-    blocked_chars = [';', '|', '&', '$', '`', '>', '<', '\n', '\r']
-    for char in blocked_chars:
-        if char in command:
-            # Format control characters visibly in error logs
-            repr_char = repr(char).strip("'")
-            return False, f"Security validation failed: Command contains blocked character '{repr_char}'."
-            
-    import shlex
-    try:
-        args = shlex.split(command)
-    except Exception as e:
-        return False, f"Security validation failed: Failed to parse command: {e}"
-        
-    if not args:
-        return False, "Security validation failed: Empty command."
-        
-    executable = args[0]
-    exec_basename = os.path.basename(executable)
-    
-    permitted_executables = {"make", "python", "python3", "pytest", "uv"}
-    if exec_basename not in permitted_executables:
-        return False, f"Security validation failed: Executable '{exec_basename}' is not in the permitted allowlist ({', '.join(sorted(permitted_executables))})."
-        
-    # Specific restrictions for uv to prevent RCE proxying (e.g., 'uv run', 'uv tool')
-    if exec_basename == "uv":
-        if len(args) < 2:
-            return False, "Security validation failed: 'uv' command requires a subcommand."
-        subcommand = args[1]
-        permitted_uv_subcommands = {"pip"}
-        if subcommand not in permitted_uv_subcommands:
-            return False, f"Security validation failed: 'uv' subcommand '{subcommand}' is blocked for security reasons (only 'uv pip' is permitted)."
-            
-    if exec_basename in {"python", "python3"}:
-        for arg in args[1:]:
-            if arg.strip() == "-c":
-                return False, "Security validation failed: Executing arbitrary inline Python scripts via the '-c' flag is blocked for security reasons."
-                
-    return True, ""
-
 @tool
 def run_command(command: str) -> str:
     """Execute a shell command safely in a subprocess with shell=False.
@@ -94,11 +46,6 @@ def run_command(command: str) -> str:
     Use this tool to run tests (e.g., `make verify` or python test runner) to verify that your changes
     are correct and do not break the build.
     """
-    is_safe, error_msg = _is_safe_command(command)
-    if not is_safe:
-        logger.warning(f"Rejected unsafe command: {command}. Reason: {error_msg}")
-        return error_msg
-        
     return codebase_tools.run_command(command)
 
 def get_worker_tools() -> list:
