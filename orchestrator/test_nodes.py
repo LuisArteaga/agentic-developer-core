@@ -723,7 +723,8 @@ class TestVerifyNode(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=self.workspace_dir,
-            timeout=300
+            timeout=300,
+            shell=False
         )
 
     @patch("orchestrator.nodes.subprocess.run")
@@ -811,6 +812,7 @@ class TestVerifyNode(unittest.TestCase):
         feedback_bytes = new_state["feedback"].encode("utf-8")
         self.assertTrue(len(feedback_bytes) <= 10240)
         self.assertIn("exceeded 10 KB limit", new_state["feedback"])
+
 
 
 class TestPRNode(unittest.TestCase):

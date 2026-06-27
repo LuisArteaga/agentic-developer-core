@@ -14,8 +14,21 @@ from orchestrator.git import (
     is_git_repository, checkout, clean, reset_hard, get_remote_url, clone,
     commit, push, get_commit_time, add
 )
+from scripts.telemetry import (
+    start_orchestrator_loop,
+    start_orchestrator_phase,
+    end_orchestrator_phase
+)
+
 
 logger = logging.getLogger("orchestrator.nodes")
+
+def _safe_telemetry(func, *args, **kwargs):
+    """Execute a telemetry function safely, logging errors at debug level to degrade gracefully."""
+    try:
+        func(*args, **kwargs)
+    except Exception as e:
+        logger.debug("Non-fatal telemetry error in %s: %s", func.__name__, e)
 
 def _github_api_request(method: str, path: str, body: Optional[dict] = None) -> Union[dict, list]:
     """Helper to make authenticated HTTP requests to the GitHub REST API using urllib."""
@@ -316,6 +329,8 @@ def claim_node(state: AgentState) -> AgentState:
             state["plan"] = None
             state["read_files"] = []
             
+            _safe_telemetry(start_orchestrator_loop, issue_number=issue_num)
+            
             try:
                 # Create and checkout the local feature branch
                 checkout(workspace_path, branch_name, create=True)
@@ -428,6 +443,8 @@ def plan_node(state: AgentState) -> AgentState:
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
     workspace_path = Path(workspace_env).resolve()
     
+    _safe_telemetry(start_orchestrator_phase, "plan")
+        
     try:
         # 2. Fetch target repository and issue details from GitHub API
         github_repo = _get_github_repository(workspace_path)
@@ -485,6 +502,7 @@ def plan_node(state: AgentState) -> AgentState:
         state["plan"] = plan_json
         
         logger.info("Successfully generated and saved structured plan.")
+        _safe_telemetry(end_orchestrator_phase, exit_code=0)
         
     except Exception as e:
         # Catch all transient or permanent errors, mark state as failed, save, and propagate
@@ -492,6 +510,7 @@ def plan_node(state: AgentState) -> AgentState:
         state["status"] = "failed"
         state["phase"] = "planning"
         state_module.save(state)
+        _safe_telemetry(end_orchestrator_phase, exit_code=1)
         raise e
         
     # Save the successful planning state
@@ -527,6 +546,8 @@ def execute_node(state: AgentState) -> AgentState:
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
     workspace_path = Path(workspace_env).resolve()
     
+    _safe_telemetry(start_orchestrator_phase, "execute")
+        
     try:
         # 2. Fetch target repository and issue details from GitHub API
         github_repo = _get_github_repository(workspace_path)
@@ -561,12 +582,14 @@ def execute_node(state: AgentState) -> AgentState:
         from orchestrator.worker import execute_worker
         execute_worker(issue_description, plan, model_name)
         logger.info("Worker agent execution completed successfully.")
+        _safe_telemetry(end_orchestrator_phase, exit_code=0)
         
     except Exception as e:
         logger.error("Execute phase failed: %s", e)
         state["status"] = "failed"
         state["phase"] = "executing"
         state_module.save(state)
+        _safe_telemetry(end_orchestrator_phase, exit_code=1)
         raise e
         
     # Save the successful executing state
@@ -620,7 +643,10 @@ def verify_node(state: AgentState) -> AgentState:
     
     # Resolve timeout (default to 300 seconds)
     timeout = int(os.getenv("AGENT_VERIFY_TIMEOUT", "300"))
+
     
+    _safe_telemetry(start_orchestrator_phase, "verify")
+        
     try:
         logger.info("Running verification command: %s", verify_cmd)
         result = subprocess.run(
@@ -628,7 +654,8 @@ def verify_node(state: AgentState) -> AgentState:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=workspace_path,
-            timeout=timeout
+            timeout=timeout,
+            shell=False
         )
         output_bytes = result.stdout
         exit_code = result.returncode
@@ -642,6 +669,7 @@ def verify_node(state: AgentState) -> AgentState:
         state["status"] = "failed"
         state["phase"] = "verifying"
         state_module.save(state)
+        _safe_telemetry(end_orchestrator_phase, exit_code=1)
         raise e
         
     raw_output = output_bytes.decode("utf-8", errors="replace")
@@ -658,6 +686,7 @@ def verify_node(state: AgentState) -> AgentState:
             state["attempts"] = attempts
         state["feedback"] = None
         # Keep status as 'verifying' on success, letting the graph router handle next transitions
+        _safe_telemetry(end_orchestrator_phase, exit_code=0)
     else:
         logger.warning("Verification failed (exit code: %d, timed out: %s).", exit_code, timed_out)
         # Track retry attempts safely without mutating a shared DEFAULT_STATE dict
@@ -674,6 +703,8 @@ def verify_node(state: AgentState) -> AgentState:
             state["feedback"] = output
             # Transition back to executing to let the graph route back to execute_node
             state["status"] = "executing"
+            
+        _safe_telemetry(end_orchestrator_phase, exit_code=exit_code)
             
     state_module.save(state)
     return state
@@ -992,6 +1023,8 @@ def test_writer_node(state: AgentState) -> AgentState:
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
     workspace_path = Path(workspace_env).resolve()
     
+    _safe_telemetry(start_orchestrator_phase, "test_writing")
+        
     try:
         github_repo = _get_github_repository(workspace_path)
         issue_data = _github_api_request("GET", f"/repos/{github_repo}/issues/{issue_num}")
@@ -1051,11 +1084,14 @@ def test_writer_node(state: AgentState) -> AgentState:
         else:
             raise RuntimeError("Test-Writer failed pre-verification check after maximum attempts.")
             
+        _safe_telemetry(end_orchestrator_phase, exit_code=0)
+            
     except Exception as e:
         logger.error("Test-Writer phase failed: %s", e)
         state["status"] = "failed"
         state["phase"] = "test_writing"
         state_module.save(state)
+        _safe_telemetry(end_orchestrator_phase, exit_code=1)
         raise e
         
     state_module.save(state)
