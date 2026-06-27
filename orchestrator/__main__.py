@@ -31,8 +31,8 @@ def main():
     
     try:
         init_telemetry(reset_state=not is_resume)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Non-fatal telemetry initialization error: %s", e)
         
     exit_code = 0
     try:
@@ -48,8 +48,8 @@ def main():
     finally:
         try:
             end_orchestrator_loop(exit_code=exit_code)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Non-fatal telemetry end loop error: %s", e)
             
     if exit_code != 0:
         sys.exit(exit_code)
