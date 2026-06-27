@@ -3,6 +3,7 @@ import sys
 import json
 import datetime
 import threading
+from pathlib import Path
 
 # Try importing opentelemetry, fallback to dummy classes if not installed
 try:
@@ -95,7 +96,17 @@ def get_tracer():
 
 def get_agent_logs_dir() -> str:
     """Resolve and return the path to the agent logs directory, ensuring it exists and is writable."""
-    # First check if /workspace/.agent_logs exists and is writable (inside container)
+    # First check if AGENT_LOG_PATH is configured in the environment
+    agent_log_path = os.getenv("AGENT_LOG_PATH")
+    if agent_log_path:
+        try:
+            os.makedirs(agent_log_path, exist_ok=True)
+            if os.access(agent_log_path, os.W_OK):
+                return str(Path(agent_log_path).resolve())
+        except Exception:
+            pass
+
+    # Fallback to checking /workspace/.agent_logs (inside container)
     if os.path.exists("/workspace/.agent_logs") and os.access("/workspace/.agent_logs", os.W_OK):
         return "/workspace/.agent_logs"
     # Otherwise check local .agent_logs relative to current working dir or project root
@@ -112,6 +123,7 @@ def get_agent_logs_dir() -> str:
     except Exception:
         pass
     return tmp_logs
+
 
 
 if HAS_OTEL:
@@ -335,9 +347,9 @@ def end_orchestrator_loop(exit_code=0):
 def start_orchestrator_phase(phase_name):
     """Start a nested span for one of the orchestrator phases.
 
-    phase_name must be one of "plan", "execute", "verify".
+    phase_name must be one of "plan", "test_writing", "execute", "verify".
     """
-    if phase_name not in ("plan", "execute", "verify"):
+    if phase_name not in ("plan", "test_writing", "execute", "verify"):
         return None
     _load_state()
     now = datetime.datetime.now(datetime.timezone.utc).timestamp()

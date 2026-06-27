@@ -22,5 +22,6 @@ This document serves as the canonical glossary of domain concepts for the autono
 - **Pull Request Creation**: The phase of the autonomous developer loop where a pull request is opened to propose the verified codebase modifications for review.
 - **Merge Polling**: The process of repeatedly checking the merge status of an open pull request until it is successfully merged or a timeout occurs.
 - **Failure Recovery**: The safety process triggered upon total execution failure or timeout, which cleans up local changes and restores the issue's GitHub label back to its ready state, allowing for future attempts.
-
+- **Telemetry**: The mechanism used to collect, record, and export OpenTelemetry-compliant trace spans (such as `orchestrator_loop` and `orchestrator_phase_...`) in-process during the autonomous developer loop execution, supporting crash-resistant JSONL logging and OTLP exporting.
+- **Test Writing**: The phase of the autonomous developer loop (implemented in the Test-Writer Node) where the orchestrator uses a language model to write unit/integration tests for the planned changes before implementing them, enforcing Test-Driven Development (TDD) principles.
 
