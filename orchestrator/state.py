@@ -31,6 +31,7 @@ class AgentState(TypedDict):
     plan: Optional[str]
     read_files: list[str]
     updated_at: str
+    feedback: Optional[str]
 
 DEFAULT_STATE: AgentState = {
     "issue_number": None,
@@ -42,6 +43,7 @@ DEFAULT_STATE: AgentState = {
     "plan": None,
     "read_files": [],
     "updated_at": "",
+    "feedback": None,
 }
 
 VALID_STATUSES = {
@@ -128,6 +130,10 @@ def load(filepath: Optional[Union[str, Path]] = None) -> AgentState:
         missing_keys = required_keys - data.keys()
         if missing_keys:
             raise ValueError(f"State is missing required keys: {missing_keys}")
+
+        # Ensure optional/new keys have defaults for backward compatibility
+        if "feedback" not in data:
+            data["feedback"] = None
 
         # Validate status value
         if data["status"] not in VALID_STATUSES:
