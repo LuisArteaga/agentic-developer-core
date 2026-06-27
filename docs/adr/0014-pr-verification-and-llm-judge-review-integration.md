@@ -35,5 +35,5 @@ To prevent merging invalid code structures, **Architecture Compliance failures a
   * **API Overhead**: Polling reviews requires periodic GitHub API queries (mitigated by a 10s poll interval).
 
 ## Inspiration & References
-* **GitHub Branch Protection Rules ([GitHub Docs](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches))**: Standard branch protection configurations allow dismissing stale PR approvals when new commits are pushed. Our timestamp check replicts this pattern in-process for automated agent feedback.
+* **GitHub Branch Protection Rules ([GitHub Docs](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches))**: Standard branch protection configurations allow dismissing stale PR approvals when new commits are pushed. Our timestamp check replicates this pattern in-process for automated agent feedback.
 * **Kubernetes Prow/Munch bot ([Prow Architecture](https://github.com/kubernetes/test-infra/tree/master/prow))**: Prow enforces fine-grained status checks and review requirements, matching current git references to check suites.

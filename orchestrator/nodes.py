@@ -952,7 +952,7 @@ def recovery_node(state: AgentState) -> AgentState:
     return state
 
 def test_writer_node(state: AgentState) -> AgentState:
-    """Invokes the worker agent with instructions to write unit tests and stub files first (Test-First/TDD)."""
+    """Invokes the worker agent to write unit tests and stub files, performing TDD pre-verification and retrying on syntax/import errors."""
     issue_num = state.get("issue_number")
     if issue_num is None:
         raise ValueError("Cannot run Test-Writer-Node: 'issue_number' is not set in the state.")
@@ -973,27 +973,59 @@ def test_writer_node(state: AgentState) -> AgentState:
         issue_title = issue_data.get("title", "")
         issue_body = issue_data.get("body", "")
         
-        # Guide the worker to act as a Test-Writer per ADR-0010
-        instructions = (
-            f"Title: {issue_title}\n\n{issue_body}\n\n"
-            f"=== ROLE: TEST-WRITER ===\n"
-            f"You must act as a Test-Writer agent. Your goal is to write comprehensive unit tests "
-            f"covering the success paths, failure paths, and edge cases described in the plan.\n"
-            f"Also, generate minimal stub/skeleton files for any new classes, functions, or modules "
-            f"so that the test suite can be imported and run without syntax errors or ModuleNotFoundErrors.\n"
-            f"DO NOT implement the actual business logic. Leave the stubs empty (e.g. raise NotImplementedError or pass).\n"
-            f"Run the tests using run_command to verify they can be successfully imported and run (they should fail on assertions, not import/syntax errors)."
-        )
-        
         model_name = state.get("model") or os.getenv("AGENT_MODEL") or "google/gemini-2.5-pro"
         plan = state.get("plan")
         if not plan:
             raise ValueError(f"No development plan found in state for issue #{issue_num}.")
             
-        from orchestrator.worker import execute_worker
-        execute_worker(instructions, plan, model_name)
-        logger.info("Test-Writer execution completed successfully.")
+        max_attempts = 3
+        attempt = 1
+        feedback = ""
         
+        while attempt <= max_attempts:
+            logger.info("Test-Writer attempt %d/%d...", attempt, max_attempts)
+            
+            # Guide the worker to act as a Test-Writer per ADR-0010
+            instructions = (
+                f"Title: {issue_title}\n\n{issue_body}\n\n"
+                f"=== ROLE: TEST-WRITER ===\n"
+                f"You must act as a Test-Writer agent. Your goal is to write comprehensive unit tests "
+                f"covering the success paths, failure paths, and edge cases described in the plan.\n"
+                f"Also, generate minimal stub/skeleton files for any new classes, functions, or modules "
+                f"so that the test suite can be imported and run without syntax errors or ModuleNotFoundErrors.\n"
+                f"DO NOT implement the actual business logic. Leave the stubs empty (e.g. raise NotImplementedError or pass).\n"
+            )
+            
+            if feedback:
+                instructions += f"\n=== PREVIOUS ATTEMPT FAILED PRE-VERIFICATION ===\n{feedback}\nPlease fix the syntax or import issues listed above."
+                
+            from orchestrator.worker import execute_worker
+            execute_worker(instructions, plan, model_name)
+            
+            # Run programmatic pre-verification check
+            logger.info("Running pre-verification check on generated tests...")
+            result = subprocess.run(
+                ["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"],
+                cwd=str(workspace_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            output = result.stdout + "\n" + result.stderr
+            bad_errors = ["SyntaxError:", "IndentationError:", "ModuleNotFoundError:", "ImportError:"]
+            has_bad_error = any(err in output for err in bad_errors)
+            
+            if has_bad_error:
+                logger.warning("Pre-verification failed due to syntax/import errors on attempt %d.", attempt)
+                feedback = f"Test run output contains syntax/import errors:\n{output}"
+                attempt += 1
+            else:
+                logger.info("Pre-verification succeeded (tests are importable and syntactically correct).")
+                break
+        else:
+            raise RuntimeError("Test-Writer failed pre-verification check after maximum attempts.")
+            
     except Exception as e:
         logger.error("Test-Writer phase failed: %s", e)
         state["status"] = "failed"

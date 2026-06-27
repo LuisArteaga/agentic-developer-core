@@ -1096,14 +1096,20 @@ class TestTestWriterNode(unittest.TestCase):
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
 
+    @patch("orchestrator.nodes.subprocess.run")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
-    def test_test_writer_node_success(self, mock_github_api, mock_execute_worker):
+    def test_test_writer_node_success(self, mock_github_api, mock_execute_worker, mock_run):
         # Setup mock GitHub API response
         mock_github_api.return_value = {
             "title": "Fix a bug",
             "body": "There is a bug in main.py."
         }
+        # Setup mock subprocess output (success, no bad errors)
+        mock_res = unittest.mock.MagicMock()
+        mock_res.stdout = "Ran 5 tests in 0.1s\nOK"
+        mock_res.stderr = ""
+        mock_run.return_value = mock_res
         
         # Setup initial state
         state = DEFAULT_STATE.copy()
@@ -1121,6 +1127,62 @@ class TestTestWriterNode(unittest.TestCase):
         
         # Verify execute_worker was called
         mock_execute_worker.assert_called_once()
+        mock_run.assert_called_once()
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_test_writer_node_retry_and_success(self, mock_github_api, mock_execute_worker, mock_run):
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py."
+        }
+        # First check fails with SyntaxError, second succeeds
+        res_fail = unittest.mock.MagicMock()
+        res_fail.stdout = ""
+        res_fail.stderr = "SyntaxError: invalid syntax"
+        
+        res_success = unittest.mock.MagicMock()
+        res_success.stdout = "Ran 5 tests\nOK"
+        res_success.stderr = ""
+        
+        mock_run.side_effect = [res_fail, res_success]
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+        
+        from orchestrator.nodes import test_writer_node
+        new_state = test_writer_node(state)
+        
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "test_writing")
+        self.assertEqual(mock_execute_worker.call_count, 2)
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_test_writer_node_all_attempts_fail(self, mock_github_api, mock_execute_worker, mock_run):
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug."
+        }
+        res_fail = unittest.mock.MagicMock()
+        res_fail.stdout = ""
+        res_fail.stderr = "ModuleNotFoundError: No module named foo"
+        mock_run.return_value = res_fail
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+        
+        from orchestrator.nodes import test_writer_node
+        with self.assertRaises(RuntimeError):
+            test_writer_node(state)
+            
+        self.assertEqual(mock_execute_worker.call_count, 3)
 
 
 class TestGraphCompilation(unittest.TestCase):
