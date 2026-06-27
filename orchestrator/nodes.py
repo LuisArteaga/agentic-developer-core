@@ -629,6 +629,31 @@ def _truncate_output(output: str) -> str:
     return output
 
 
+def _is_safe_verify_command(command: str) -> tuple[bool, str]:
+    """Validate that the verification command only uses permitted executables and blocks shell injection characters."""
+    blocked_chars = [';', '|', '&', '$', '`', '>', '<']
+    for char in blocked_chars:
+        if char in command:
+            return False, f"Command contains blocked character '{char}'."
+            
+    try:
+        args = shlex.split(command)
+    except Exception as e:
+        return False, f"Failed to parse command string: {e}"
+        
+    if not args:
+        return False, "Empty command."
+        
+    executable = args[0]
+    exec_basename = os.path.basename(executable)
+    
+    permitted_executables = {"make", "python", "python3", "pytest", "uv"}
+    if exec_basename not in permitted_executables:
+        return False, f"Executable '{exec_basename}' is not in the permitted allowlist ({', '.join(sorted(permitted_executables))})."
+        
+    return True, ""
+
+
 def verify_node(state: AgentState) -> AgentState:
     """Runs verification tests in a subprocess and manages the retry/feedback loop.
     
@@ -653,10 +678,20 @@ def verify_node(state: AgentState) -> AgentState:
     
     # Resolve verification command (default to "make verify")
     verify_cmd = os.getenv("AGENT_VERIFY_COMMAND", "make verify").strip()
+    is_safe, error_msg = _is_safe_verify_command(verify_cmd)
+    if not is_safe:
+        logger.error("Security Block: AGENT_VERIFY_COMMAND safety check failed: %s", error_msg)
+        state["status"] = "failed"
+        state["phase"] = "verifying"
+        state["feedback"] = f"Security validation failed: {error_msg}"
+        state_module.save(state)
+        return state
+        
     args = shlex.split(verify_cmd)
     
     # Resolve timeout (default to 300 seconds)
     timeout = int(os.getenv("AGENT_VERIFY_TIMEOUT", "300"))
+
     
     try:
         start_orchestrator_phase("verify")

@@ -812,6 +812,27 @@ class TestVerifyNode(unittest.TestCase):
         self.assertTrue(len(feedback_bytes) <= 10240)
         self.assertIn("exceeded 10 KB limit", new_state["feedback"])
 
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_verify_node_unsafe_command(self, mock_subprocess_run):
+        """Test verify_node rejects unsafe commands from environment variables."""
+        # Unsafe command: command contains blocked character or forbidden executable
+        os.environ["AGENT_VERIFY_COMMAND"] = "make verify; rm -rf /"
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state_module.save(state)
+        
+        new_state = verify_node(state)
+        
+        # Verify that state transitioned to failed
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(new_state["phase"], "verifying")
+        self.assertIn("Security validation failed", new_state["feedback"])
+        
+        # Subprocess run should not be called
+        mock_subprocess_run.assert_not_called()
+
+
 
 class TestPRNode(unittest.TestCase):
     def setUp(self):

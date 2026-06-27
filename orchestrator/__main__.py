@@ -31,8 +31,6 @@ def main():
     
     try:
         init_telemetry(reset_state=not is_resume)
-        if not is_resume:
-            start_orchestrator_loop(issue_number=state.get("issue_number"))
     except Exception as e:
         logger.warning("Failed to initialize telemetry: %s", e)
         
