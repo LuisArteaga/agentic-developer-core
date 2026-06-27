@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 import os
@@ -9,7 +10,10 @@ from typing import Optional, Union
 
 from orchestrator import state as state_module
 from orchestrator.state import AgentState
-from orchestrator.git import is_git_repository, checkout, clean, reset_hard, get_remote_url, clone
+from orchestrator.git import (
+    is_git_repository, checkout, clean, reset_hard, get_remote_url, clone,
+    commit, push, get_commit_time
+)
 
 logger = logging.getLogger("orchestrator.nodes")
 
@@ -673,5 +677,287 @@ def verify_node(state: AgentState) -> AgentState:
             
     state_module.save(state)
     return state
+
+
+# ==============================================================================
+# PR-Node, Merge-Node & Recovery-Node Implementation
+# ==============================================================================
+
+import time
+
+def _parse_iso_datetime(dt_str: str) -> datetime.datetime:
+    """Helper to parse ISO 8601 strings into datetime objects, compatible with UTC 'Z'."""
+    if dt_str.endswith("Z"):
+        dt_str = dt_str[:-1] + "+00:00"
+    return datetime.datetime.fromisoformat(dt_str)
+
+def pr_node(state: AgentState) -> AgentState:
+    """Stages, commits, and pushes local changes, then creates a Pull Request via gh CLI if not already present."""
+    issue_num = state.get("issue_number")
+    if issue_num is None:
+        raise ValueError("Cannot run PR-Node: 'issue_number' is not set in the state.")
+        
+    logger.info("Starting PR phase for issue #%d...", issue_num)
+    
+    state["status"] = "pr_open"
+    state["phase"] = "pr_open"
+    state["read_files"] = []
+    state_module.save(state)
+    
+    workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
+    workspace_path = Path(workspace_env).resolve()
+    
+    try:
+        # 1. Stage all modified and untracked files
+        logger.info("Staging all changes in workspace...")
+        subprocess.run(["git", "add", "."], cwd=str(workspace_path), check=True)
+        
+        # 2. Commit staged changes
+        commit_message = f"feat: resolve issue #{issue_num}"
+        logger.info("Committing changes with message: '%s'", commit_message)
+        commit(workspace_path, commit_message)
+        
+        # 3. Push branch to remote
+        branch_name = state["branch"]
+        if not branch_name:
+            branch_name = f"feat/issue-{issue_num}"
+            state["branch"] = branch_name
+            
+        logger.info("Pushing feature branch '%s' to remote...", branch_name)
+        push(workspace_path, branch_name)
+        
+        # 4. Resolve owner/repo and check if a PR already exists
+        github_repo = _get_github_repository(workspace_path)
+        parts = github_repo.split("/")
+        owner = parts[0]
+        
+        # Check if an open PR exists
+        logger.info("Checking if open PR already exists for branch '%s'...", branch_name)
+        pulls = _github_api_request(
+            "GET",
+            f"/repos/{github_repo}/pulls?head={owner}:{branch_name}&state=open"
+        )
+        
+        if pulls:
+            logger.info("PR already exists for branch '%s'. Skipping PR creation.", branch_name)
+        else:
+            # 5. Fetch issue details to use in PR description
+            issue_data = _github_api_request("GET", f"/repos/{github_repo}/issues/{issue_num}")
+            issue_title = issue_data.get("title", "")
+            
+            # Create a Pull Request via gh CLI
+            pr_title = f"feat: resolve issue #{issue_num} - {issue_title}"
+            pr_body = f"Closes #{issue_num}"
+            
+            logger.info("Creating Pull Request: '%s'...", pr_title)
+            cmd = ["gh", "pr", "create", "--title", pr_title, "--body", pr_body, "--head", branch_name]
+            
+            # Ensure GH_TOKEN / GITHUB_TOKEN / GH_PAT are set correctly in subprocess env
+            env = os.environ.copy()
+            token = env.get("GH_PAT") or env.get("GH_TOKEN") or env.get("GITHUB_TOKEN")
+            if token:
+                env["GH_TOKEN"] = token.strip()
+                env["GITHUB_TOKEN"] = token.strip()
+                
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(workspace_path),
+                text=True,
+                env=env
+            )
+            
+            if result.returncode != 0:
+                error_msg = result.stderr.strip()
+                logger.error("gh pr create failed: %s", error_msg)
+                raise RuntimeError(f"gh pr create failed: {error_msg}")
+                
+            logger.info("Pull Request created successfully.")
+            
+    except Exception as e:
+        logger.error("PR phase failed: %s", e)
+        state["status"] = "failed"
+        state["phase"] = "pr_open"
+        state_module.save(state)
+        raise e
+        
+    state_module.save(state)
+    return state
+
+def merge_node(state: AgentState) -> AgentState:
+    """Polls the PR merge status and LLM Judge review comments, transitioning to failed/recovery on failure or timeout."""
+    issue_num = state.get("issue_number")
+    if issue_num is None:
+        raise ValueError("Cannot run Merge-Node: 'issue_number' is not set in the state.")
+        
+    branch_name = state["branch"]
+    if not branch_name:
+        raise ValueError("Cannot run Merge-Node: 'branch' is not set in the state.")
+        
+    logger.info("Starting Merge phase for issue #%d...", issue_num)
+    
+    state["status"] = "merging"
+    state["phase"] = "merging"
+    state["read_files"] = []
+    state_module.save(state)
+    
+    workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
+    workspace_path = Path(workspace_env).resolve()
+    
+    try:
+        github_repo = _get_github_repository(workspace_path)
+        parts = github_repo.split("/")
+        owner = parts[0]
+        
+        # 1. Retrieve the PR number
+        pulls = _github_api_request(
+            "GET",
+            f"/repos/{github_repo}/pulls?head={owner}:{branch_name}&state=open"
+        )
+        if not pulls:
+            # Fallback to state=all in case it was already merged/closed quickly
+            pulls = _github_api_request(
+                "GET",
+                f"/repos/{github_repo}/pulls?head={owner}:{branch_name}&state=all"
+            )
+            
+        if not pulls:
+            raise ValueError(f"No Pull Request found for branch '{branch_name}'.")
+            
+        pr_num = pulls[0]["number"]
+        
+        # 2. Polling loop
+        poll_interval = int(os.getenv("AGENT_MERGE_POLL_INTERVAL", "10"))
+        poll_timeout = int(os.getenv("AGENT_MERGE_POLL_TIMEOUT", "300"))
+        block_on_arch = os.getenv("AGENT_BLOCK_ON_ARCH_FAILURE", "false").lower() in ("true", "1", "yes")
+        
+        start_time = time.time()
+        logger.info("Polling PR #%d status (timeout: %ds, interval: %ds)...", pr_num, poll_timeout, poll_interval)
+        
+        pr_merged = False
+        failure_reason = None
+        
+        while time.time() - start_time < poll_timeout:
+            # Fetch latest PR data
+            pr_data = _github_api_request("GET", f"/repos/{github_repo}/pulls/{pr_num}")
+            
+            # Check merge state
+            if pr_data.get("merged") is True:
+                logger.info("PR #%d was successfully merged.", pr_num)
+                pr_merged = True
+                break
+                
+            if pr_data.get("state") == "closed":
+                logger.warning("PR #%d was closed/rejected without merge.", pr_num)
+                failure_reason = f"PR #{pr_num} was closed without being merged."
+                break
+                
+            # Check review comments / LLM Judge verdicts relative to the latest commit
+            commit_time_str = get_commit_time(workspace_path, "HEAD")
+            commit_time = _parse_iso_datetime(commit_time_str)
+            
+            reviews = _github_api_request("GET", f"/repos/{github_repo}/pulls/{pr_num}/reviews")
+            
+            latest_sec_verdict = None
+            latest_arch_verdict = None
+            
+            for r in reviews:
+                submitted_at_str = r.get("submitted_at")
+                if not submitted_at_str:
+                    continue
+                submitted_dt = _parse_iso_datetime(submitted_at_str)
+                
+                # Only check reviews posted after the latest commit
+                if submitted_dt >= commit_time:
+                    body = r.get("body") or ""
+                    if "### LLM PR Review: PASS" in body:
+                        latest_sec_verdict = "PASS"
+                        latest_arch_verdict = "PASS"
+                    elif "### LLM PR Review - Security:" in body:
+                        if "FAIL" in body:
+                            latest_sec_verdict = "FAIL"
+                        elif "NEEDS REVIEW" in body:
+                            latest_sec_verdict = "NEEDS REVIEW"
+                        elif "PASS" in body:
+                            latest_sec_verdict = "PASS"
+                    elif "### LLM PR Review - Architecture Compliance:" in body:
+                        if "FAIL" in body:
+                            latest_arch_verdict = "FAIL"
+                        elif "NEEDS REVIEW" in body:
+                            latest_arch_verdict = "NEEDS REVIEW"
+                        elif "PASS" in body:
+                            latest_arch_verdict = "PASS"
+            
+            # Check Security Judge blocking
+            if latest_sec_verdict in ("FAIL", "NEEDS REVIEW"):
+                failure_reason = f"PR review block: Security check verdict is '{latest_sec_verdict}'."
+                break
+                
+            # Check Architecture Judge blocking
+            if block_on_arch and latest_arch_verdict in ("FAIL", "NEEDS REVIEW"):
+                failure_reason = f"PR review block: Architecture compliance check verdict is '{latest_arch_verdict}'."
+                break
+                
+            logger.info("PR #%d is still open. LLM Judge verdicts: Security='%s', Arch='%s'. Sleeping %ds...",
+                        pr_num, latest_sec_verdict, latest_arch_verdict, poll_interval)
+            time.sleep(poll_interval)
+            
+        if not pr_merged:
+            if not failure_reason:
+                failure_reason = f"Polling timed out after {poll_timeout} seconds."
+            logger.error("Merge phase failed: %s", failure_reason)
+            state["status"] = "failed"
+            state["feedback"] = failure_reason
+        else:
+            state["status"] = "done"
+            state["feedback"] = None
+            
+    except Exception as e:
+        logger.error("Merge phase failed with exception: %s", e)
+        state["status"] = "failed"
+        state["phase"] = "merging"
+        state["feedback"] = str(e)
+        state_module.save(state)
+        raise e
+        
+    state_module.save(state)
+    return state
+
+def recovery_node(state: AgentState) -> AgentState:
+    """Performs cleanup by resetting issue labels back to ready status in GitHub and marking status as failed."""
+    issue_num = state.get("issue_number")
+    if issue_num is None:
+        raise ValueError("Cannot run Recovery-Node: 'issue_number' is not set in the state.")
+        
+    logger.info("Starting Recovery phase for issue #%d...", issue_num)
+    
+    state["status"] = "failed"
+    state["phase"] = "recovery"
+    state["read_files"] = []
+    state_module.save(state)
+    
+    workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
+    workspace_path = Path(workspace_env).resolve()
+    
+    try:
+        github_repo = _get_github_repository(workspace_path)
+        
+        # Reset labels back to configured AGENT_LABEL_READY
+        label_ready = os.getenv("AGENT_LABEL_READY", "agent-ready").strip()
+        label_in_progress = os.getenv("AGENT_LABEL_IN_PROGRESS", "agent-in-progress").strip()
+        
+        logger.info("Resetting issue #%d label back to ready '%s'...", issue_num, label_ready)
+        _add_label(github_repo, issue_num, label_ready)
+        _remove_label(github_repo, issue_num, label_in_progress)
+        
+    except Exception as e:
+        logger.error("Recovery phase failed: %s", e)
+        state_module.save(state)
+        raise e
+        
+    state_module.save(state)
+    return state
+
 
 

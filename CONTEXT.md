@@ -18,4 +18,8 @@ This document serves as the canonical glossary of domain concepts for the autono
 - **Target Repository**: The remote GitHub repository containing the issues to resolve and the codebase to modify (specified via `GITHUB_REPOSITORY`).
 - **Workspace Isolation**: The sandboxing of all worker file edits and command executions inside the local directory specified by `GITHUB_WORKSPACE`, keeping it separate from the orchestrator's own codebase and state logs.
 - **Self-Healing Claim**: The two-step programmatic polling process in the Claim-Node that automatically unblocks issues when their dependencies close (transitioning them from `agent-blocked` to `agent-ready`), and claims eligible issues (transitioning them from `agent-ready` to `agent-in-progress`).
+- **Pull Request Creation**: The phase of the autonomous developer loop where a pull request is opened to propose the verified codebase modifications for review.
+- **Merge Polling**: The process of repeatedly checking the merge status of an open pull request until it is successfully merged or a timeout occurs.
+- **Failure Recovery**: The safety process triggered upon total execution failure or timeout, which cleans up local changes and restores the issue's GitHub label back to its ready state, allowing for future attempts.
+
 

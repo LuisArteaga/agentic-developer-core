@@ -190,3 +190,9 @@ def clone(repo_dir: Path | str, github_repo: str, token: Optional[str] = None) -
     parent_dir.mkdir(parents=True, exist_ok=True)
     _run_git(parent_dir, cmd)
 
+def get_commit_time(repo_dir: Path | str, commit_ref: str = "HEAD") -> str:
+    """Returns the committer date of the specified commit ref in ISO 8601 format."""
+    result = _run_git(repo_dir, ["show", "-s", "--format=%cI", commit_ref])
+    return result.stdout.strip()
+
+
