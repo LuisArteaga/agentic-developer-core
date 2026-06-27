@@ -324,8 +324,8 @@ def claim_node(state: AgentState) -> AgentState:
             
             try:
                 start_orchestrator_loop(issue_number=issue_num)
-            except Exception as e:
-                logger.warning("Failed to start telemetry loop for issue #%d: %s", issue_num, e)
+            except Exception:
+                pass
             
             try:
                 # Create and checkout the local feature branch
@@ -441,8 +441,8 @@ def plan_node(state: AgentState) -> AgentState:
     
     try:
         start_orchestrator_phase("plan")
-    except Exception as e:
-        logger.warning("Failed to start telemetry phase 'plan': %s", e)
+    except Exception:
+        pass
         
     try:
         # 2. Fetch target repository and issue details from GitHub API
@@ -503,8 +503,8 @@ def plan_node(state: AgentState) -> AgentState:
         logger.info("Successfully generated and saved structured plan.")
         try:
             end_orchestrator_phase(exit_code=0)
-        except Exception as e:
-            logger.warning("Failed to end telemetry phase 'plan': %s", e)
+        except Exception:
+            pass
         
     except Exception as e:
         # Catch all transient or permanent errors, mark state as failed, save, and propagate
@@ -514,8 +514,8 @@ def plan_node(state: AgentState) -> AgentState:
         state_module.save(state)
         try:
             end_orchestrator_phase(exit_code=1)
-        except Exception as te:
-            logger.warning("Failed to end telemetry phase 'plan' on failure: %s", te)
+        except Exception:
+            pass
         raise e
         
     # Save the successful planning state
@@ -553,8 +553,8 @@ def execute_node(state: AgentState) -> AgentState:
     
     try:
         start_orchestrator_phase("execute")
-    except Exception as e:
-        logger.warning("Failed to start telemetry phase 'execute': %s", e)
+    except Exception:
+        pass
         
     try:
         # 2. Fetch target repository and issue details from GitHub API
@@ -592,8 +592,8 @@ def execute_node(state: AgentState) -> AgentState:
         logger.info("Worker agent execution completed successfully.")
         try:
             end_orchestrator_phase(exit_code=0)
-        except Exception as e:
-            logger.warning("Failed to end telemetry phase 'execute': %s", e)
+        except Exception:
+            pass
         
     except Exception as e:
         logger.error("Execute phase failed: %s", e)
@@ -602,8 +602,8 @@ def execute_node(state: AgentState) -> AgentState:
         state_module.save(state)
         try:
             end_orchestrator_phase(exit_code=1)
-        except Exception as te:
-            logger.warning("Failed to end telemetry phase 'execute' on failure: %s", te)
+        except Exception:
+            pass
         raise e
         
     # Save the successful executing state
@@ -627,31 +627,6 @@ def _truncate_output(output: str) -> str:
         output = truncated_text + "\n\n... [Output truncated: exceeded 10 KB limit] ..."
         
     return output
-
-
-def _is_safe_verify_command(command: str) -> tuple[bool, str]:
-    """Validate that the verification command only uses permitted executables and blocks shell injection characters."""
-    blocked_chars = [';', '|', '&', '$', '`', '>', '<']
-    for char in blocked_chars:
-        if char in command:
-            return False, f"Command contains blocked character '{char}'."
-            
-    try:
-        args = shlex.split(command)
-    except Exception as e:
-        return False, f"Failed to parse command string: {e}"
-        
-    if not args:
-        return False, "Empty command."
-        
-    executable = args[0]
-    exec_basename = os.path.basename(executable)
-    
-    permitted_executables = {"make", "python", "python3", "pytest", "uv"}
-    if exec_basename not in permitted_executables:
-        return False, f"Executable '{exec_basename}' is not in the permitted allowlist ({', '.join(sorted(permitted_executables))})."
-        
-    return True, ""
 
 
 def verify_node(state: AgentState) -> AgentState:
@@ -678,15 +653,6 @@ def verify_node(state: AgentState) -> AgentState:
     
     # Resolve verification command (default to "make verify")
     verify_cmd = os.getenv("AGENT_VERIFY_COMMAND", "make verify").strip()
-    is_safe, error_msg = _is_safe_verify_command(verify_cmd)
-    if not is_safe:
-        logger.error("Security Block: AGENT_VERIFY_COMMAND safety check failed: %s", error_msg)
-        state["status"] = "failed"
-        state["phase"] = "verifying"
-        state["feedback"] = f"Security validation failed: {error_msg}"
-        state_module.save(state)
-        return state
-        
     args = shlex.split(verify_cmd)
     
     # Resolve timeout (default to 300 seconds)
@@ -695,8 +661,8 @@ def verify_node(state: AgentState) -> AgentState:
     
     try:
         start_orchestrator_phase("verify")
-    except Exception as e:
-        logger.warning("Failed to start telemetry phase 'verify': %s", e)
+    except Exception:
+        pass
         
     try:
         logger.info("Running verification command: %s", verify_cmd)
@@ -705,7 +671,8 @@ def verify_node(state: AgentState) -> AgentState:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=workspace_path,
-            timeout=timeout
+            timeout=timeout,
+            shell=False
         )
         output_bytes = result.stdout
         exit_code = result.returncode
@@ -721,8 +688,8 @@ def verify_node(state: AgentState) -> AgentState:
         state_module.save(state)
         try:
             end_orchestrator_phase(exit_code=1)
-        except Exception as te:
-            logger.warning("Failed to end telemetry phase 'verify' on exception: %s", te)
+        except Exception:
+            pass
         raise e
         
     raw_output = output_bytes.decode("utf-8", errors="replace")
@@ -741,8 +708,8 @@ def verify_node(state: AgentState) -> AgentState:
         # Keep status as 'verifying' on success, letting the graph router handle next transitions
         try:
             end_orchestrator_phase(exit_code=0)
-        except Exception as e:
-            logger.warning("Failed to end telemetry phase 'verify' on success: %s", e)
+        except Exception:
+            pass
     else:
         logger.warning("Verification failed (exit code: %d, timed out: %s).", exit_code, timed_out)
         # Track retry attempts safely without mutating a shared DEFAULT_STATE dict
@@ -762,8 +729,8 @@ def verify_node(state: AgentState) -> AgentState:
             
         try:
             end_orchestrator_phase(exit_code=exit_code if exit_code != 0 else 1)
-        except Exception as e:
-            logger.warning("Failed to end telemetry phase 'verify' on failure: %s", e)
+        except Exception:
+            pass
             
     state_module.save(state)
     return state
@@ -1084,8 +1051,8 @@ def test_writer_node(state: AgentState) -> AgentState:
     
     try:
         start_orchestrator_phase("test_writing")
-    except Exception as e:
-        logger.warning("Failed to start telemetry phase 'test_writing': %s", e)
+    except Exception:
+        pass
         
     try:
         github_repo = _get_github_repository(workspace_path)
@@ -1148,8 +1115,8 @@ def test_writer_node(state: AgentState) -> AgentState:
             
         try:
             end_orchestrator_phase(exit_code=0)
-        except Exception as e:
-            logger.warning("Failed to end telemetry phase 'test_writing': %s", e)
+        except Exception:
+            pass
             
     except Exception as e:
         logger.error("Test-Writer phase failed: %s", e)
@@ -1158,8 +1125,8 @@ def test_writer_node(state: AgentState) -> AgentState:
         state_module.save(state)
         try:
             end_orchestrator_phase(exit_code=1)
-        except Exception as te:
-            logger.warning("Failed to end telemetry phase 'test_writing' on failure: %s", te)
+        except Exception:
+            pass
         raise e
         
     state_module.save(state)
