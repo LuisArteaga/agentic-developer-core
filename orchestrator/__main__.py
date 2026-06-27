@@ -44,7 +44,6 @@ def main():
     except Exception as e:
         logger.exception("Orchestrator execution encountered a critical error: %s", e)
         exit_code = 1
-        sys.exit(1)
     finally:
         try:
             end_orchestrator_loop(exit_code=exit_code)
