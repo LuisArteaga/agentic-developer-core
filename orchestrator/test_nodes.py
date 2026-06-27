@@ -849,9 +849,10 @@ class TestPRNode(unittest.TestCase):
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
 
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.push")
+    @patch("orchestrator.nodes.commit")
     @patch("orchestrator.nodes._github_api_request")
-    def test_pr_node_creates_pr(self, mock_api, mock_run):
+    def test_pr_node_creates_pr(self, mock_api, mock_commit, mock_push):
         # Setup mocks
         def api_side_effect(method, path, body=None):
             if method == "GET":
@@ -859,13 +860,10 @@ class TestPRNode(unittest.TestCase):
                     return []
                 elif "/issues/10" in path:
                     return {"title": "Fix a bug"}
+            elif method == "POST" and "/pulls" in path:
+                return {"html_url": "https://github.com/test-owner/test-repo/pull/1"}
             raise ValueError(f"Unexpected API call: {method} {path}")
         mock_api.side_effect = api_side_effect
-        
-        mock_res = unittest.mock.MagicMock()
-        mock_res.returncode = 0
-        mock_res.stdout = b"https://github.com/test-owner/test-repo/pull/1"
-        mock_run.return_value = mock_res
         
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -878,9 +876,13 @@ class TestPRNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "pr_open")
         self.assertEqual(new_state["phase"], "pr_open")
         
-        # Verify gh pr create was called
-        gh_calls = [call for call in mock_run.mock_calls if "gh" in str(call) and "pr" in str(call) and "create" in str(call)]
-        self.assertTrue(len(gh_calls) > 0)
+        # Verify POST request was called
+        post_calls = [call for call in mock_api.mock_calls if call[1][0] == 'POST' and "/pulls" in call[1][1]]
+        self.assertTrue(len(post_calls) > 0)
+        
+        # Verify commit and push mock calls
+        mock_commit.assert_called_once()
+        mock_push.assert_called_once()
 
 
 class TestMergeNode(unittest.TestCase):
@@ -998,6 +1000,15 @@ class TestRecoveryNode(unittest.TestCase):
             self.original_env[k] = os.environ.get(k)
             os.environ[k] = v
 
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(self.workspace_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.workspace_dir), check=True)
+        
+        self.initial_file = self.workspace_dir / "README.md"
+        self.initial_file.write_text("# Test Repo", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(self.workspace_dir), check=True)
+
     def tearDown(self):
         for k, v in self.original_env.items():
             if v is None:
@@ -1024,6 +1035,60 @@ class TestRecoveryNode(unittest.TestCase):
         remove_label_call = [call for call in mock_api.mock_calls if "labels" in str(call) and "DELETE" in str(call) and "agent-in-progress" in str(call)]
         self.assertTrue(len(add_label_call) > 0)
         self.assertTrue(len(remove_label_call) > 0)
+
+
+class TestTestWriterNode(unittest.TestCase):
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local"
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_test_writer_node_success(self, mock_github_api, mock_execute_worker):
+        # Setup mock GitHub API response
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py."
+        }
+        
+        # Setup initial state
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+        
+        # Run test writer node
+        from orchestrator.nodes import test_writer_node
+        new_state = test_writer_node(state)
+        
+        # Verify status transitions, phase
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "test_writing")
+        
+        # Verify execute_worker was called
+        mock_execute_worker.assert_called_once()
 
 
 class TestGraphCompilation(unittest.TestCase):

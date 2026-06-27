@@ -512,10 +512,10 @@ def main():
                     log(f"[ERR] Failed to submit Architecture Compliance review: {e}")
                     sys.exit(1)
                     
-        # Exits non-zero only if Security failed (so CI checks fail and block PR merge)
-        if security_failed:
-            log("[ERR] LLM review found security or evidence issues")
-            main_span.set_status(trace.Status(trace.StatusCode.ERROR, "Security evaluation failed"))
+        # Exits non-zero if Security failed or Architecture Compliance failed (so CI checks fail and block PR merge)
+        if security_failed or arch_failed:
+            log("[ERR] LLM review found security, architecture compliance, or evidence issues")
+            main_span.set_status(trace.Status(trace.StatusCode.ERROR, "Review evaluation failed"))
             sys.exit(1)
         else:
             log("[INFO] LLM review completed successfully")

@@ -4,6 +4,7 @@ from orchestrator.state import AgentState
 from orchestrator.nodes import (
     claim_node,
     plan_node,
+    test_writer_node,
     execute_node,
     verify_node,
     pr_node,
@@ -16,12 +17,16 @@ logger = logging.getLogger("orchestrator.graph")
 def route_after_claim(state: AgentState) -> str:
     """Routes execution after the Claim-Node, supporting both fresh runs and resume paths."""
     status = state.get("status")
+    phase = state.get("phase")
+    
     if status == "idle":
         return "end"
     elif status == "claimed":
         return "plan"
     elif status == "planning":
         return "plan"
+    elif status == "executing" and phase == "test_writing":
+        return "test_writer"
     elif status == "executing":
         return "execute"
     elif status == "verifying":
@@ -39,7 +44,13 @@ def route_after_claim(state: AgentState) -> str:
         return "plan"
 
 def route_after_plan(state: AgentState) -> str:
-    """Routes execution after the Plan-Node."""
+    """Routes execution after the Plan-Node to Test-Writer Node (Test-First/TDD)."""
+    if state.get("status") == "failed":
+        return "recovery"
+    return "test_writer"
+
+def route_after_test_writer(state: AgentState) -> str:
+    """Routes execution after the Test-Writer Node to Execute-Node."""
     if state.get("status") == "failed":
         return "recovery"
     return "execute"
@@ -79,6 +90,7 @@ builder = StateGraph(AgentState)
 # Add all nodes
 builder.add_node("claim", claim_node)
 builder.add_node("plan", plan_node)
+builder.add_node("test_writer", test_writer_node)
 builder.add_node("execute", execute_node)
 builder.add_node("verify", verify_node)
 builder.add_node("pr", pr_node)
@@ -94,6 +106,7 @@ builder.add_conditional_edges(
     {
         "end": END,
         "plan": "plan",
+        "test_writer": "test_writer",
         "execute": "execute",
         "verify": "verify",
         "pr": "pr",
@@ -105,6 +118,15 @@ builder.add_conditional_edges(
 builder.add_conditional_edges(
     "plan",
     route_after_plan,
+    {
+        "test_writer": "test_writer",
+        "recovery": "recovery"
+    }
+)
+
+builder.add_conditional_edges(
+    "test_writer",
+    route_after_test_writer,
     {
         "execute": "execute",
         "recovery": "recovery"

@@ -195,4 +195,9 @@ def get_commit_time(repo_dir: Path | str, commit_ref: str = "HEAD") -> str:
     result = _run_git(repo_dir, ["show", "-s", "--format=%cI", commit_ref])
     return result.stdout.strip()
 
+def add(repo_dir: Path | str, path_spec: str = ".") -> None:
+    """Stages files matching path_spec (defaults to all files in work tree)."""
+    _run_git(repo_dir, ["add", path_spec])
+
+
 
