@@ -725,6 +725,7 @@ def pr_node(state: AgentState) -> AgentState:
             
         logger.info("Pushing feature branch '%s' to remote...", branch_name)
         push(workspace_path, branch_name)
+        state["pushed_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         
         # 4. Resolve owner/repo and check if a PR already exists
         github_repo = _get_github_repository(workspace_path)
@@ -811,7 +812,21 @@ def merge_node(state: AgentState) -> AgentState:
             
         pr_num = pulls[0]["number"]
         
-        # 2. Polling loop
+        # 2. Determine trusted judge username to prevent review spoofing
+        trusted_user = os.getenv("AGENT_TRUSTED_JUDGE_USER")
+        if not trusted_user:
+            try:
+                curr_user_data = _github_api_request("GET", "/user")
+                trusted_user = curr_user_data.get("login")
+            except Exception:
+                trusted_user = os.getenv("GITHUB_ACTOR")
+                
+        if trusted_user:
+            logger.info("Only trusting PR reviews authored by: '%s'", trusted_user)
+        else:
+            logger.warning("Could not determine trusted judge username. Review author verification skipped.")
+            
+        # 3. Polling loop
         poll_interval = int(os.getenv("AGENT_MERGE_POLL_INTERVAL", "10"))
         poll_timeout = int(os.getenv("AGENT_MERGE_POLL_TIMEOUT", "300"))
         
@@ -821,6 +836,14 @@ def merge_node(state: AgentState) -> AgentState:
         pr_merged = False
         failure_reason = None
         
+        # Determine reference time to anchor freshness (push time recorded by orchestrator)
+        pushed_at_str = state.get("pushed_at")
+        if pushed_at_str:
+            ref_time = _parse_iso_datetime(pushed_at_str)
+        else:
+            commit_time_str = get_commit_time(workspace_path, "HEAD")
+            ref_time = _parse_iso_datetime(commit_time_str)
+            
         while time.time() - start_time < poll_timeout:
             # Fetch latest PR data
             pr_data = _github_api_request("GET", f"/repos/{github_repo}/pulls/{pr_num}")
@@ -836,10 +859,6 @@ def merge_node(state: AgentState) -> AgentState:
                 failure_reason = f"PR #{pr_num} was closed without being merged."
                 break
                 
-            # Check review comments / LLM Judge verdicts relative to the latest commit
-            commit_time_str = get_commit_time(workspace_path, "HEAD")
-            commit_time = _parse_iso_datetime(commit_time_str)
-            
             reviews = _github_api_request("GET", f"/repos/{github_repo}/pulls/{pr_num}/reviews")
             
             latest_sec_verdict = None
@@ -851,8 +870,14 @@ def merge_node(state: AgentState) -> AgentState:
                     continue
                 submitted_dt = _parse_iso_datetime(submitted_at_str)
                 
-                # Only check reviews posted after the latest commit
-                if submitted_dt >= commit_time:
+                # Verify review author is the trusted judge user to prevent spoofing
+                reviewer = r.get("user", {}).get("login")
+                if trusted_user and reviewer != trusted_user:
+                    logger.debug("Ignoring review from untrusted user '%s'", reviewer)
+                    continue
+                    
+                # Only check reviews posted after the trusted reference/push time
+                if submitted_dt >= ref_time:
                     body = r.get("body") or ""
                     if "### LLM PR Review: PASS" in body:
                         latest_sec_verdict = "PASS"
