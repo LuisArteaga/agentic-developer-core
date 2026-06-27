@@ -11,7 +11,7 @@ Checking the raw GitHub merge status alone is insufficient because a PR could be
 
 ## Decision Drivers
 * **Security Assurance**: No PR with critical security issues should be merged.
-* **Architecture Compliance**: Optional or strict blocking based on conventions (ADRs).
+* **Architecture Compliance**: Unconditional blocking on architecture compliance failures to prevent merging invalid code/scaffolding ("kauderwelsch").
 * **Timeliness and Freshness**: Stale reviews (those completed before the latest push) must be ignored.
 
 ## Considered Options
@@ -23,13 +23,14 @@ Checking the raw GitHub merge status alone is insufficient because a PR could be
 ## Decision
 We chose **Option 2**.
 
-The `Merge-Node` polls the PR reviews via the GitHub REST API. By matching review timestamps with the HEAD commit time, we guarantee that only reviews validating the latest codebase state are evaluated. A verdict of `FAIL` or `NEEDS REVIEW` from the latest Security review triggers a transition to `Recovery`. If the `AGENT_BLOCK_ON_ARCH_FAILURE` parameter is enabled, Architecture Compliance failures will also trigger a merge block and transition to `Recovery`.
+The `Merge-Node` polls the PR reviews via the GitHub REST API. By matching review timestamps with the HEAD commit time, we guarantee that only reviews validating the latest codebase state are evaluated. 
+
+To prevent merging invalid code structures, **Architecture Compliance failures are treated as critical, first-class failures** (just like security vulnerabilities). A verdict of `FAIL` or `NEEDS REVIEW` from the latest Security OR Architecture Compliance review unconditionally blocks the merge and triggers a transition to `Recovery`. No environment variables or bypass flags are permitted.
 
 ### Consequences
 * **Pros**:
-  * **Strong Guarantees**: Security and architecture compliance failures are detected dynamically, preventing invalid merges.
+  * **Strong Guarantees**: Security and architecture compliance failures are detected dynamically, preventing invalid merges and keeping the main branch clean of formatting or convention drift.
   * **Resilient Resumption**: Pushing fixes automatically invalidates older review findings on the next cycle, since their timestamps precede the new commit time.
-  * **Configurability**: Architecture compliance blocking can be toggled via `AGENT_BLOCK_ON_ARCH_FAILURE`.
 * **Cons**:
   * **API Overhead**: Polling reviews requires periodic GitHub API queries (mitigated by a 10s poll interval).
 

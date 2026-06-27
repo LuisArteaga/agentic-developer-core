@@ -814,7 +814,6 @@ def merge_node(state: AgentState) -> AgentState:
         # 2. Polling loop
         poll_interval = int(os.getenv("AGENT_MERGE_POLL_INTERVAL", "10"))
         poll_timeout = int(os.getenv("AGENT_MERGE_POLL_TIMEOUT", "300"))
-        block_on_arch = os.getenv("AGENT_BLOCK_ON_ARCH_FAILURE", "false").lower() in ("true", "1", "yes")
         
         start_time = time.time()
         logger.info("Polling PR #%d status (timeout: %ds, interval: %ds)...", pr_num, poll_timeout, poll_interval)
@@ -879,7 +878,7 @@ def merge_node(state: AgentState) -> AgentState:
                 break
                 
             # Check Architecture Judge blocking
-            if block_on_arch and latest_arch_verdict in ("FAIL", "NEEDS REVIEW"):
+            if latest_arch_verdict in ("FAIL", "NEEDS REVIEW"):
                 failure_reason = f"PR review block: Architecture compliance check verdict is '{latest_arch_verdict}'."
                 break
                 

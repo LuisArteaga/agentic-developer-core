@@ -512,9 +512,8 @@ def main():
                     log(f"[ERR] Failed to submit Architecture Compliance review: {e}")
                     sys.exit(1)
                     
-        # Exits non-zero if Security failed, or if Architecture Compliance failed and AGENT_BLOCK_ON_ARCH_FAILURE is enabled
-        block_on_arch = os.getenv("AGENT_BLOCK_ON_ARCH_FAILURE", "false").lower() in ("true", "1", "yes")
-        if security_failed or (arch_failed and block_on_arch):
+        # Exits non-zero if Security failed or Architecture Compliance failed (so CI checks fail and block PR merge)
+        if security_failed or arch_failed:
             log("[ERR] LLM review found security or architecture compliance issues")
             main_span.set_status(trace.Status(trace.StatusCode.ERROR, "Review evaluation failed"))
             sys.exit(1)

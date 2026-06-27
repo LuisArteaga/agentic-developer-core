@@ -979,6 +979,38 @@ class TestMergeNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "failed")
         self.assertIn("Security check", new_state["feedback"])
 
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_blocked_by_architecture(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": "### LLM PR Review - Architecture Compliance: FAIL\nConvention violations."
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("Architecture compliance check", new_state["feedback"])
+
 
 class TestRecoveryNode(unittest.TestCase):
     def setUp(self):
