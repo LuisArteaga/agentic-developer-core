@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 import os
@@ -9,7 +10,10 @@ from typing import Optional, Union
 
 from orchestrator import state as state_module
 from orchestrator.state import AgentState
-from orchestrator.git import is_git_repository, checkout, clean, reset_hard, get_remote_url, clone
+from orchestrator.git import (
+    is_git_repository, checkout, clean, reset_hard, get_remote_url, clone,
+    commit, push, get_commit_time, add
+)
 
 logger = logging.getLogger("orchestrator.nodes")
 
@@ -673,5 +677,389 @@ def verify_node(state: AgentState) -> AgentState:
             
     state_module.save(state)
     return state
+
+
+# ==============================================================================
+# PR-Node, Merge-Node & Recovery-Node Implementation
+# ==============================================================================
+
+import time
+
+def _parse_iso_datetime(dt_str: str) -> datetime.datetime:
+    """Helper to parse ISO 8601 strings into datetime objects, compatible with UTC 'Z'."""
+    if dt_str.endswith("Z"):
+        dt_str = dt_str[:-1] + "+00:00"
+    return datetime.datetime.fromisoformat(dt_str)
+
+def pr_node(state: AgentState) -> AgentState:
+    """Stages, commits, and pushes local changes, then creates a Pull Request via GitHub REST API if not already present."""
+    issue_num = state.get("issue_number")
+    if issue_num is None:
+        raise ValueError("Cannot run PR-Node: 'issue_number' is not set in the state.")
+        
+    logger.info("Starting PR phase for issue #%d...", issue_num)
+    
+    state["status"] = "pr_open"
+    state["phase"] = "pr_open"
+    state["read_files"] = []
+    state_module.save(state)
+    
+    workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
+    workspace_path = Path(workspace_env).resolve()
+    
+    try:
+        # 1. Stage all modified and untracked files using the git helper
+        logger.info("Staging all changes in workspace...")
+        add(workspace_path, ".")
+        
+        # 2. Commit staged changes
+        commit_message = f"feat: resolve issue #{issue_num}"
+        logger.info("Committing changes with message: '%s'", commit_message)
+        commit(workspace_path, commit_message)
+        
+        # 3. Push branch to remote
+        branch_name = state["branch"]
+        if not branch_name:
+            branch_name = f"feat/issue-{issue_num}"
+            state["branch"] = branch_name
+            
+        logger.info("Pushing feature branch '%s' to remote...", branch_name)
+        push(workspace_path, branch_name)
+        state["pushed_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        
+        # 4. Resolve owner/repo and check if a PR already exists
+        github_repo = _get_github_repository(workspace_path)
+        parts = github_repo.split("/")
+        owner = parts[0]
+        
+        # Check if an open PR exists
+        logger.info("Checking if open PR already exists for branch '%s'...", branch_name)
+        pulls = _github_api_request(
+            "GET",
+            f"/repos/{github_repo}/pulls?head={owner}:{branch_name}&state=open"
+        )
+        
+        if pulls:
+            logger.info("PR already exists for branch '%s'. Skipping PR creation.", branch_name)
+        else:
+            # 5. Fetch issue details to use in PR description
+            issue_data = _github_api_request("GET", f"/repos/{github_repo}/issues/{issue_num}")
+            issue_title = issue_data.get("title", "")
+            
+            # Create a Pull Request via the GitHub REST API (no gh CLI harness)
+            pr_title = f"feat: resolve issue #{issue_num} - {issue_title}"
+            pr_body = f"Closes #{issue_num}"
+            
+            logger.info("Creating Pull Request via API: '%s'...", pr_title)
+            payload = {
+                "title": pr_title,
+                "body": pr_body,
+                "head": f"{owner}:{branch_name}",
+                "base": "main"
+            }
+            _github_api_request("POST", f"/repos/{github_repo}/pulls", payload)
+            logger.info("Pull Request created successfully.")
+            
+    except Exception as e:
+        logger.error("PR phase failed: %s", e)
+        state["status"] = "failed"
+        state["phase"] = "pr_open"
+        state_module.save(state)
+        raise e
+        
+    state_module.save(state)
+    return state
+
+def merge_node(state: AgentState) -> AgentState:
+    """Polls the PR merge status and LLM Judge review comments, transitioning to failed/recovery on failure or timeout."""
+    issue_num = state.get("issue_number")
+    if issue_num is None:
+        raise ValueError("Cannot run Merge-Node: 'issue_number' is not set in the state.")
+        
+    branch_name = state["branch"]
+    if not branch_name:
+        raise ValueError("Cannot run Merge-Node: 'branch' is not set in the state.")
+        
+    logger.info("Starting Merge phase for issue #%d...", issue_num)
+    
+    state["status"] = "merging"
+    state["phase"] = "merging"
+    state["read_files"] = []
+    state_module.save(state)
+    
+    workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
+    workspace_path = Path(workspace_env).resolve()
+    
+    try:
+        github_repo = _get_github_repository(workspace_path)
+        parts = github_repo.split("/")
+        owner = parts[0]
+        
+        # 1. Retrieve the PR number
+        pulls = _github_api_request(
+            "GET",
+            f"/repos/{github_repo}/pulls?head={owner}:{branch_name}&state=open"
+        )
+        if not pulls:
+            # Fallback to state=all in case it was already merged/closed quickly
+            pulls = _github_api_request(
+                "GET",
+                f"/repos/{github_repo}/pulls?head={owner}:{branch_name}&state=all"
+            )
+            
+        if not pulls:
+            raise ValueError(f"No Pull Request found for branch '{branch_name}'.")
+            
+        pr_num = pulls[0]["number"]
+        
+        # 2. Determine trusted judge username to prevent review spoofing
+        trusted_user = os.getenv("AGENT_TRUSTED_JUDGE_USER")
+        if not trusted_user:
+            try:
+                curr_user_data = _github_api_request("GET", "/user")
+                trusted_user = curr_user_data.get("login")
+            except Exception:
+                trusted_user = os.getenv("GITHUB_ACTOR")
+                
+        if trusted_user:
+            logger.info("Only trusting PR reviews authored by: '%s'", trusted_user)
+        else:
+            logger.warning("Could not determine trusted judge username. Review author verification skipped.")
+            
+        # 3. Polling loop
+        poll_interval = int(os.getenv("AGENT_MERGE_POLL_INTERVAL", "10"))
+        poll_timeout = int(os.getenv("AGENT_MERGE_POLL_TIMEOUT", "300"))
+        
+        start_time = time.time()
+        logger.info("Polling PR #%d status (timeout: %ds, interval: %ds)...", pr_num, poll_timeout, poll_interval)
+        
+        pr_merged = False
+        failure_reason = None
+        
+        # Determine reference time to anchor freshness (push time recorded by orchestrator)
+        pushed_at_str = state.get("pushed_at")
+        if pushed_at_str:
+            ref_time = _parse_iso_datetime(pushed_at_str)
+        else:
+            commit_time_str = get_commit_time(workspace_path, "HEAD")
+            ref_time = _parse_iso_datetime(commit_time_str)
+            
+        while time.time() - start_time < poll_timeout:
+            # Fetch latest PR data
+            pr_data = _github_api_request("GET", f"/repos/{github_repo}/pulls/{pr_num}")
+            
+            # Check merge state
+            if pr_data.get("merged") is True:
+                logger.info("PR #%d was successfully merged.", pr_num)
+                pr_merged = True
+                break
+                
+            if pr_data.get("state") == "closed":
+                logger.warning("PR #%d was closed/rejected without merge.", pr_num)
+                failure_reason = f"PR #{pr_num} was closed without being merged."
+                break
+                
+            reviews = _github_api_request("GET", f"/repos/{github_repo}/pulls/{pr_num}/reviews")
+            
+            latest_sec_verdict = None
+            latest_arch_verdict = None
+            
+            for r in reviews:
+                submitted_at_str = r.get("submitted_at")
+                if not submitted_at_str:
+                    continue
+                submitted_dt = _parse_iso_datetime(submitted_at_str)
+                
+                # Verify review author is the trusted judge user to prevent spoofing
+                reviewer = r.get("user", {}).get("login")
+                if trusted_user and reviewer != trusted_user:
+                    logger.debug("Ignoring review from untrusted user '%s'", reviewer)
+                    continue
+                    
+                # Only check reviews posted after the trusted reference/push time
+                if submitted_dt >= ref_time:
+                    body = r.get("body") or ""
+                    if "### LLM PR Review: PASS" in body:
+                        latest_sec_verdict = "PASS"
+                        latest_arch_verdict = "PASS"
+                    elif "### LLM PR Review - Security:" in body:
+                        if "FAIL" in body:
+                            latest_sec_verdict = "FAIL"
+                        elif "NEEDS REVIEW" in body:
+                            latest_sec_verdict = "NEEDS REVIEW"
+                        elif "PASS" in body:
+                            latest_sec_verdict = "PASS"
+                    elif "### LLM PR Review - Architecture Compliance:" in body:
+                        if "FAIL" in body:
+                            latest_arch_verdict = "FAIL"
+                        elif "NEEDS REVIEW" in body:
+                            latest_arch_verdict = "NEEDS REVIEW"
+                        elif "PASS" in body:
+                            latest_arch_verdict = "PASS"
+            
+            # Check Security Judge blocking
+            if latest_sec_verdict in ("FAIL", "NEEDS REVIEW"):
+                failure_reason = f"PR review block: Security check verdict is '{latest_sec_verdict}'."
+                break
+                
+            # Check Architecture Judge blocking
+            if latest_arch_verdict in ("FAIL", "NEEDS REVIEW"):
+                failure_reason = f"PR review block: Architecture compliance check verdict is '{latest_arch_verdict}'."
+                break
+                
+            logger.info("PR #%d is still open. LLM Judge verdicts: Security='%s', Arch='%s'. Sleeping %ds...",
+                        pr_num, latest_sec_verdict, latest_arch_verdict, poll_interval)
+            time.sleep(poll_interval)
+            
+        if not pr_merged:
+            if not failure_reason:
+                failure_reason = f"Polling timed out after {poll_timeout} seconds."
+            logger.error("Merge phase failed: %s", failure_reason)
+            state["status"] = "failed"
+            state["feedback"] = failure_reason
+        else:
+            state["status"] = "done"
+            state["feedback"] = None
+            
+    except Exception as e:
+        logger.error("Merge phase failed with exception: %s", e)
+        state["status"] = "failed"
+        state["phase"] = "merging"
+        state["feedback"] = str(e)
+        state_module.save(state)
+        raise e
+        
+    state_module.save(state)
+    return state
+
+def recovery_node(state: AgentState) -> AgentState:
+    """Performs cleanup by resetting issue labels back to ready status in GitHub and marking status as failed.
+    
+    Also performs workspace hygiene by checking out default branch and cleaning up untracked/modified files.
+    """
+    issue_num = state.get("issue_number")
+    if issue_num is None:
+        raise ValueError("Cannot run Recovery-Node: 'issue_number' is not set in the state.")
+        
+    logger.info("Starting Recovery phase for issue #%d...", issue_num)
+    
+    state["status"] = "failed"
+    state["phase"] = "recovery"
+    state["read_files"] = []
+    state_module.save(state)
+    
+    workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
+    workspace_path = Path(workspace_env).resolve()
+    
+    try:
+        # 1. Clean up local workspace changes to maintain hygiene
+        logger.info("Performing workspace cleanup in Recovery...")
+        _checkout_default_branch(workspace_path)
+        reset_hard(workspace_path, "HEAD")
+        clean(workspace_path)
+        logger.info("Workspace hygiene completed in Recovery.")
+        
+        # 2. Reset GitHub labels
+        github_repo = _get_github_repository(workspace_path)
+        label_ready = os.getenv("AGENT_LABEL_READY", "agent-ready").strip()
+        label_in_progress = os.getenv("AGENT_LABEL_IN_PROGRESS", "agent-in-progress").strip()
+        
+        logger.info("Resetting issue #%d label back to ready '%s'...", issue_num, label_ready)
+        _add_label(github_repo, issue_num, label_ready)
+        _remove_label(github_repo, issue_num, label_in_progress)
+        
+    except Exception as e:
+        logger.error("Recovery phase failed: %s", e)
+        state_module.save(state)
+        raise e
+        
+    state_module.save(state)
+    return state
+
+def test_writer_node(state: AgentState) -> AgentState:
+    """Invokes the worker agent to write unit tests and stub files, performing TDD pre-verification and retrying on syntax/import errors."""
+    issue_num = state.get("issue_number")
+    if issue_num is None:
+        raise ValueError("Cannot run Test-Writer-Node: 'issue_number' is not set in the state.")
+        
+    logger.info("Starting Test-Writer phase for issue #%d...", issue_num)
+    
+    state["status"] = "executing"
+    state["phase"] = "test_writing"
+    state["read_files"] = []
+    state_module.save(state)
+    
+    workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
+    workspace_path = Path(workspace_env).resolve()
+    
+    try:
+        github_repo = _get_github_repository(workspace_path)
+        issue_data = _github_api_request("GET", f"/repos/{github_repo}/issues/{issue_num}")
+        issue_title = issue_data.get("title", "")
+        issue_body = issue_data.get("body", "")
+        
+        model_name = state.get("model") or os.getenv("AGENT_MODEL") or "google/gemini-2.5-pro"
+        plan = state.get("plan")
+        if not plan:
+            raise ValueError(f"No development plan found in state for issue #{issue_num}.")
+            
+        max_attempts = 3
+        attempt = 1
+        feedback = ""
+        
+        while attempt <= max_attempts:
+            logger.info("Test-Writer attempt %d/%d...", attempt, max_attempts)
+            
+            # Guide the worker to act as a Test-Writer per ADR-0010
+            instructions = (
+                f"Title: {issue_title}\n\n{issue_body}\n\n"
+                f"=== ROLE: TEST-WRITER ===\n"
+                f"You must act as a Test-Writer agent. Your goal is to write comprehensive unit tests "
+                f"covering the success paths, failure paths, and edge cases described in the plan.\n"
+                f"Also, generate minimal stub/skeleton files for any new classes, functions, or modules "
+                f"so that the test suite can be imported and run without syntax errors or ModuleNotFoundErrors.\n"
+                f"DO NOT implement the actual business logic. Leave the stubs empty (e.g. raise NotImplementedError or pass).\n"
+            )
+            
+            if feedback:
+                instructions += f"\n=== PREVIOUS ATTEMPT FAILED PRE-VERIFICATION ===\n{feedback}\nPlease fix the syntax or import issues listed above."
+                
+            from orchestrator.worker import execute_worker
+            execute_worker(instructions, plan, model_name)
+            
+            # Run programmatic pre-verification check
+            logger.info("Running pre-verification check on generated tests...")
+            result = subprocess.run(
+                ["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"],
+                cwd=str(workspace_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            output = result.stdout + "\n" + result.stderr
+            bad_errors = ["SyntaxError:", "IndentationError:", "ModuleNotFoundError:", "ImportError:"]
+            has_bad_error = any(err in output for err in bad_errors)
+            
+            if has_bad_error:
+                logger.warning("Pre-verification failed due to syntax/import errors on attempt %d.", attempt)
+                feedback = f"Test run output contains syntax/import errors:\n{output}"
+                attempt += 1
+            else:
+                logger.info("Pre-verification succeeded (tests are importable and syntactically correct).")
+                break
+        else:
+            raise RuntimeError("Test-Writer failed pre-verification check after maximum attempts.")
+            
+    except Exception as e:
+        logger.error("Test-Writer phase failed: %s", e)
+        state["status"] = "failed"
+        state["phase"] = "test_writing"
+        state_module.save(state)
+        raise e
+        
+    state_module.save(state)
+    return state
+
 
 

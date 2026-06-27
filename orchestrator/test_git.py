@@ -253,3 +253,14 @@ class TestGitSubprocessHelper(unittest.TestCase):
                 # Check that GH_PAT was injected into os.environ
                 self.assertEqual(os.environ.get("GH_PAT"), "my-super-secret-pat-token")
 
+    def test_get_commit_time(self):
+        """Test get_commit_time returns a valid ISO 8601 formatted datetime string."""
+        commit_time = git.get_commit_time(self.repo_path, "HEAD")
+        self.assertIsNotNone(commit_time)
+        # Should be in ISO 8601 format (e.g. contains T and offset or Z)
+        self.assertIn("T", commit_time)
+        import datetime
+        dt = datetime.datetime.fromisoformat(commit_time)
+        self.assertIsNotNone(dt)
+
+

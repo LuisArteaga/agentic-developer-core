@@ -813,7 +813,432 @@ class TestVerifyNode(unittest.TestCase):
         self.assertIn("exceeded 10 KB limit", new_state["feedback"])
 
 
+class TestPRNode(unittest.TestCase):
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local"
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+            
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(self.workspace_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.workspace_dir), check=True)
+        
+        self.initial_file = self.workspace_dir / "README.md"
+        self.initial_file.write_text("# Test Repo", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(self.workspace_dir), check=True)
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.nodes.push")
+    @patch("orchestrator.nodes.commit")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_pr_node_creates_pr(self, mock_api, mock_commit, mock_push):
+        # Setup mocks
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if "/pulls" in path:
+                    return []
+                elif "/issues/10" in path:
+                    return {"title": "Fix a bug"}
+            elif method == "POST" and "/pulls" in path:
+                return {"html_url": "https://github.com/test-owner/test-repo/pull/1"}
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import pr_node
+        new_state = pr_node(state)
+        
+        self.assertEqual(new_state["status"], "pr_open")
+        self.assertEqual(new_state["phase"], "pr_open")
+        
+        # Verify POST request was called
+        post_calls = [call for call in mock_api.mock_calls if call[1][0] == 'POST' and "/pulls" in call[1][1]]
+        self.assertTrue(len(post_calls) > 0)
+        
+        # Verify commit and push mock calls
+        mock_commit.assert_called_once()
+        mock_push.assert_called_once()
+
+
+class TestMergeNode(unittest.TestCase):
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+            "AGENT_MERGE_POLL_INTERVAL": "1",
+            "AGENT_MERGE_POLL_TIMEOUT": "2"
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+            
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(self.workspace_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.workspace_dir), check=True)
+        
+        self.initial_file = self.workspace_dir / "README.md"
+        self.initial_file.write_text("# Test Repo", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(self.workspace_dir), check=True)
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_success(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": True, "state": "closed"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return []
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        self.assertEqual(new_state["status"], "done")
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_blocked_by_security(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": "### LLM PR Review - Security: FAIL\nSecurity vulnerability found.",
+                            "user": {"login": "test-judge-user"}
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("Security check", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_blocked_by_architecture(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": "### LLM PR Review - Architecture Compliance: FAIL\nConvention violations.",
+                            "user": {"login": "test-judge-user"}
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("Architecture compliance check", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_ignores_untrusted_review(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    # Untrusted user tries to approve, but it is ignored
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": "### LLM PR Review: PASS",
+                            "user": {"login": "malicious-user"}
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("Polling timed out", new_state["feedback"])
+
+
+class TestRecoveryNode(unittest.TestCase):
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+            "AGENT_LABEL_READY": "agent-ready",
+            "AGENT_LABEL_IN_PROGRESS": "agent-in-progress"
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(self.workspace_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.workspace_dir), check=True)
+        
+        self.initial_file = self.workspace_dir / "README.md"
+        self.initial_file.write_text("# Test Repo", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(self.workspace_dir), check=True)
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.nodes._github_api_request")
+    def test_recovery_node(self, mock_api):
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state_module.save(state)
+        
+        from orchestrator.nodes import recovery_node
+        new_state = recovery_node(state)
+        
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(new_state["phase"], "recovery")
+        
+        # Verify labels reset was called via GitHub API
+        add_label_call = [call for call in mock_api.mock_calls if "labels" in str(call) and "POST" in str(call) and "agent-ready" in str(call)]
+        remove_label_call = [call for call in mock_api.mock_calls if "labels" in str(call) and "DELETE" in str(call) and "agent-in-progress" in str(call)]
+        self.assertTrue(len(add_label_call) > 0)
+        self.assertTrue(len(remove_label_call) > 0)
+
+
+class TestTestWriterNode(unittest.TestCase):
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local"
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_test_writer_node_success(self, mock_github_api, mock_execute_worker, mock_run):
+        # Setup mock GitHub API response
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py."
+        }
+        # Setup mock subprocess output (success, no bad errors)
+        mock_res = unittest.mock.MagicMock()
+        mock_res.stdout = "Ran 5 tests in 0.1s\nOK"
+        mock_res.stderr = ""
+        mock_run.return_value = mock_res
+        
+        # Setup initial state
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+        
+        # Run test writer node
+        from orchestrator.nodes import test_writer_node
+        new_state = test_writer_node(state)
+        
+        # Verify status transitions, phase
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "test_writing")
+        
+        # Verify execute_worker was called
+        mock_execute_worker.assert_called_once()
+        mock_run.assert_called_once()
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_test_writer_node_retry_and_success(self, mock_github_api, mock_execute_worker, mock_run):
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py."
+        }
+        # First check fails with SyntaxError, second succeeds
+        res_fail = unittest.mock.MagicMock()
+        res_fail.stdout = ""
+        res_fail.stderr = "SyntaxError: invalid syntax"
+        
+        res_success = unittest.mock.MagicMock()
+        res_success.stdout = "Ran 5 tests\nOK"
+        res_success.stderr = ""
+        
+        mock_run.side_effect = [res_fail, res_success]
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+        
+        from orchestrator.nodes import test_writer_node
+        new_state = test_writer_node(state)
+        
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "test_writing")
+        self.assertEqual(mock_execute_worker.call_count, 2)
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_test_writer_node_all_attempts_fail(self, mock_github_api, mock_execute_worker, mock_run):
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug."
+        }
+        res_fail = unittest.mock.MagicMock()
+        res_fail.stdout = ""
+        res_fail.stderr = "ModuleNotFoundError: No module named foo"
+        mock_run.return_value = res_fail
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+        
+        from orchestrator.nodes import test_writer_node
+        with self.assertRaises(RuntimeError):
+            test_writer_node(state)
+            
+        self.assertEqual(mock_execute_worker.call_count, 3)
+
+
+class TestGraphCompilation(unittest.TestCase):
+    def test_graph_compiles_successfully(self):
+        from orchestrator.graph import graph
+        self.assertIsNotNone(graph)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
