@@ -54,11 +54,13 @@ We rejected generating free-text Markdown plans.
 * **Why**: Unstructured markdown cannot be programmatically validated for path safety or syntactical correctness, leaving the system highly vulnerable to indirect prompt injection payloads that bypass instructions and direct the Worker to target sensitive files.
 
 ### 2. External Compiled AST Tools (Tree-sitter)
-We rejected compiling or installing external binary-bound AST parsers for the planning phase.
-* **Why**: To maintain the **Radical Simplicity** and pure Python execution goals of ADR-0009, we avoid introducing C-compilation, platform-specific binaries, or heavy setup dependencies (like Node.js/npm) that could fail during CI/CD or containerized deployments. High-level structure is sufficiently represented by our lightweight, stdlib-only recursive directory tree.
+We originally rejected compiling or installing external binary-bound AST parsers for the planning phase.
+* **Why**: To maintain the **Radical Simplicity** and pure Python execution goals of ADR-0009, we avoided introducing C-compilation, platform-specific binaries, or heavy setup dependencies (like Node.js/npm) that could fail during CI/CD or containerized deployments. At the time, high-level structure was sufficiently represented by our lightweight, stdlib-only recursive directory tree.
+
+> **Superseded by [ADR-0017](./0017-tree-sitter-language-pack-for-structural-outlines.md).** The need for Structural Outlines across Python and TypeScript — and the absence of any maintained pure-Python TypeScript parser — made tree-sitter the pragmatic choice. ADR-0012's other decisions (structured output, prompt injection hardening, path safety validation) remain in force; only the tree-sitter rejection is superseded.
 
 ---
 
 ## Inspiration & References
 * **Routine: A Structural Planning Framework (2025)**: Demonstrated that structured planning scripts as intermediate representations increase LLM tool-calling success rates from **41.1% to 96.3%**.
-* **GitHub Issue #27**: Documented a future refactoring path for multi-language regex-based AST outlines along with the formal benchmark suite to measure trajectory length and success rate improvements.
+* **GitHub Issue #27**: Documents the refactoring path for Structural Outlines in the Plan-Node. The original issue proposed regex-based AST outlines and a benchmark suite; both were revised during the design session — tree-sitter replaces regex (ADR-0017), and Run Observability replaces the one-time benchmark (see CONTEXT.md, Loop Metrics).
