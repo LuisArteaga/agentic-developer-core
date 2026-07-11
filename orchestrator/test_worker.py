@@ -3,7 +3,7 @@ import unittest
 import unittest.mock
 
 from langchain_core.messages import AIMessage
-from orchestrator.worker import execute_worker, get_chat_model, get_worker_tools
+from orchestrator.worker import execute_worker, get_worker_tools
 
 class TestWorkerAgent(unittest.TestCase):
     def setUp(self):
@@ -24,12 +24,6 @@ class TestWorkerAgent(unittest.TestCase):
         tool_names = {t.name for t in wrapped_tools}
         self.assertEqual(tool_names, {"read_file", "list_directory", "grep_search", "patch_file", "run_command"})
 
-    def test_get_chat_model(self):
-        """Test that get_chat_model instantiates ChatOpenAI with the correct base url."""
-        model = get_chat_model("gpt-4o")
-        self.assertEqual(model.model_name, "gpt-4o")
-        self.assertEqual(model.openai_api_base, "https://openrouter.ai/api/v1")
-
     @unittest.mock.patch("langchain_openai.ChatOpenAI.invoke")
     def test_execute_worker_success(self, mock_invoke):
         """Test that execute_worker correctly invokes the agent and returns the final response."""
@@ -38,7 +32,7 @@ class TestWorkerAgent(unittest.TestCase):
         final_answer = execute_worker(
             issue_description="Verify codebase",
             plan="1. Run verify",
-            model_name="gpt-4o"
+            node_name="execute"
         )
 
         self.assertEqual(final_answer, "Successfully completed the task.")

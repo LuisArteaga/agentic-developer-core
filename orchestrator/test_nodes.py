@@ -306,7 +306,7 @@ class TestPlanNode(unittest.TestCase):
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
 
-    @patch("orchestrator.nodes.get_chat_model")
+    @patch("orchestrator.nodes.get_chat_model_from_config")
     @patch("orchestrator.nodes._github_api_request")
     def test_plan_node_success(self, mock_github_api, mock_get_chat_model):
         """Test successful Plan-Node execution: fetches issue, calls LLM, and serializes Pydantic plan."""
@@ -382,7 +382,7 @@ class TestPlanNode(unittest.TestCase):
             plan_node(state)
         self.assertIn("issue_number", str(ctx.exception))
 
-    @patch("orchestrator.nodes.get_chat_model")
+    @patch("orchestrator.nodes.get_chat_model_from_config")
     @patch("orchestrator.nodes._github_api_request")
     def test_plan_node_llm_failure(self, mock_github_api, mock_get_chat_model):
         """Test that Plan-Node handles LLM failures by updating status to 'failed' and propagating exception."""
@@ -452,7 +452,7 @@ class TestPlanNode(unittest.TestCase):
         self.assertFalse(_is_safe_path("auth/token.pem"))
         self.assertFalse(_is_safe_path("cert.pfx"))
 
-    @patch("orchestrator.nodes.get_chat_model")
+    @patch("orchestrator.nodes.get_chat_model_from_config")
     @patch("orchestrator.nodes._github_api_request")
     def test_plan_node_security_injection_blocking(self, mock_github_api, mock_get_chat_model):
         """Test that Plan-Node catches prompt injection attempts in the generated plan and aborts with a security block."""
@@ -595,8 +595,7 @@ class TestExecuteNode(unittest.TestCase):
         # Verify execute_worker was called with correct parameters
         mock_execute_worker.assert_called_once_with(
             "Title: Fix a bug\n\nThere is a bug in main.py.",
-            '{"rationale": "...", "tasks": []}',
-            "google/gemini-2.5-pro"
+            '{"rationale": "...", "tasks": []}'
         )
         
         # Verify state file was saved
@@ -632,8 +631,7 @@ class TestExecuteNode(unittest.TestCase):
         )
         mock_execute_worker.assert_called_once_with(
             expected_issue_description,
-            '{"rationale": "...", "tasks": []}',
-            "google/gemini-2.5-pro"
+            '{"rationale": "...", "tasks": []}'
         )
 
     @patch("orchestrator.nodes._github_api_request")

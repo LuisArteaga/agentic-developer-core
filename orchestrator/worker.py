@@ -52,19 +52,6 @@ def get_worker_tools() -> list:
     """Return the list of wrapped LangChain tools for the worker agent."""
     return [read_file, list_directory, grep_search, patch_file, run_command]
 
-def get_chat_model(model_name: str) -> ChatOpenAI:
-    """Instantiate the OpenAI-compatible chat model for OpenRouter."""
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise ValueError("OPENROUTER_API_KEY environment variable is not set.")
-        
-    return ChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        base_url="https://openrouter.ai/api/v1",
-        temperature=0.0,
-    )
-
 # System Prompt incorporating all behavior guardrails
 SYSTEM_PROMPT = (
     "You are a professional autonomous software engineer worker agent. "
@@ -90,20 +77,25 @@ SYSTEM_PROMPT = (
     "Work carefully, keep your changes minimal, and ensure the test suite passes before concluding your work."
 )
 
-def execute_worker(issue_description: str, plan: str, model_name: str) -> str:
+def execute_worker(issue_description: str, plan: str, node_name: str = "execute") -> str:
     """Execute the worker agent using LangGraph's prebuilt ReAct agent.
     
     Args:
         issue_description: The description of the issue to solve.
         plan: The step-by-step development plan.
-        model_name: The name of the LLM model to use (e.g. via OpenRouter).
+        node_name: The orchestrator node name whose model config to resolve
+            via resolve_model_config() (default "execute"). Test-Writer callers
+            pass "test_writer" to use the test-writer model.
         
     Returns:
         The final response text from the agent.
     """
-    logger.info(f"Initializing worker agent with model: {model_name}")
+    from orchestrator.config import resolve_model_config, get_chat_model_from_config
+
+    cfg = resolve_model_config(node_name)
+    logger.info(f"Initializing worker agent (node=%s) with model: %s", node_name, cfg["model"])
     
-    llm = get_chat_model(model_name)
+    llm = get_chat_model_from_config(cfg)
     tools = get_worker_tools()
     
     # Compile the prebuilt ReAct agent

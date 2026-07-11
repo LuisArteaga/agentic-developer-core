@@ -1,0 +1,17 @@
+{
+  "plan": {
+    "model": "deepseek/deepseek-v4-flash",
+    "routing": ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
+    "temperature": 0.0
+  },
+  "test_writer": {
+    "model": "moonshotai/kimi-k2.7-code",
+    "routing": ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"],
+    "temperature": 0.0
+  },
+  "execute": {
+    "model": "moonshotai/kimi-k2.7-code",
+    "routing": ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"],
+    "temperature": 0.0
+  }
+}
