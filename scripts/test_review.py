@@ -164,17 +164,15 @@ class TruncateDiffTests(unittest.TestCase):
         self.assertEqual(review.truncate_diff(diff), diff)
 
     def test_truncate_diff_over_cap(self):
-        """AC: diff > 100000 chars truncated with NOTE appended."""
+        """AC: diff > MAX_DIFF_CHARS chars truncated with NOTE appended."""
         diff = "x" * (review.MAX_DIFF_CHARS + 500)
         result = review.truncate_diff(diff)
-        self.assertEqual(
-            len(result),
-            review.MAX_DIFF_CHARS
-            + len(
-                "\n\n[NOTE: diff truncated to 100000 chars due to context limits. Evaluate the visible portion; return NEEDS REVIEW if you cannot fully evaluate.]"
-            ),
+        expected_note = (
+            f"\n\n[NOTE: diff truncated to {review.MAX_DIFF_CHARS} chars due to context limits."
+            " Evaluate the visible portion; return NEEDS REVIEW if you cannot fully evaluate.]"
         )
-        self.assertIn("[NOTE: diff truncated to 100000 chars", result)
+        self.assertEqual(len(result), review.MAX_DIFF_CHARS + len(expected_note))
+        self.assertIn(f"[NOTE: diff truncated to {review.MAX_DIFF_CHARS} chars", result)
 
     def test_truncate_diff_env_override(self):
         """AC: REVIEW_MAX_DIFF_CHARS=50 truncates at 50."""

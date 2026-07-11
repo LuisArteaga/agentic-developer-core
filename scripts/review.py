@@ -202,7 +202,7 @@ SYSTEM_PROMPT_SECURITY = (
     "</findings>"
 )
 
-MAX_DIFF_CHARS = 100000
+MAX_DIFF_CHARS = 250000
 
 
 def run_command(cmd, env=None):
