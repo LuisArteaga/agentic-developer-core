@@ -159,7 +159,7 @@ class BuildReviewBodyTests(unittest.TestCase):
         self.assertIn("test_coverage: FAIL\n", body)
         self.assertIn("architecture: PASS\n", body)
         self.assertIn("security: NEEDS REVIEW\n", body)
-        self.assertIn("1 violations found.", body)
+        self.assertIn("1 violation found.", body)
         self.assertIn("Check failed to run: boom", body)
 
     def test_build_review_body_empty_diff(self):

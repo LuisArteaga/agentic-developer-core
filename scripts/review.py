@@ -92,7 +92,7 @@ SYSTEM_PROMPT_SYNTAX_LINT = (
     "=== 3. SCORING RULE ===\n"
     "- PASS: If there are no violations. Output an empty findings block: <findings></findings>.\n"
     "- FAIL: If one or more criteria fail. Report each violation as a JSON object on a single line inside the findings block: "
-    '{"severity": "error", "message": "[QX] Details of the failure"}.\n'
+    '{"severity": "error", "message": "[QX] Details of the failure"}\n'
     'Example: If Q3 fails: {"severity": "error", "message": "[Q3] Class FooBar does not use PascalCase"}\n\n'
     "=== 4. EDGE-CASE HANDLING ===\n"
     "- If the diff is empty, return PASS with empty findings.\n\n"
@@ -119,7 +119,7 @@ SYSTEM_PROMPT_TEST_COVERAGE = (
     "=== 3. SCORING RULE ===\n"
     "- PASS: If there are no violations. Output an empty findings block: <findings></findings>.\n"
     "- FAIL: If one or more criteria fail. Report each violation as a JSON object on a single line inside the findings block: "
-    '{"severity": "error", "message": "[QX] Details of the failure"}.\n'
+    '{"severity": "error", "message": "[QX] Details of the failure"}\n'
     'Example: If Q1 fails: {"severity": "error", "message": "[Q1] No tests added for new function compute_hash"}\n\n'
     "=== 4. EDGE-CASE HANDLING ===\n"
     "- If the diff is empty, return PASS with empty findings.\n\n"
@@ -530,7 +530,8 @@ def build_review_body(judges_data: dict) -> str:
         if status == "PASS":
             details = "All criteria passed."
         elif status == "FAIL":
-            details = f"{len(info['findings'])} violations found."
+            count = len(info['findings'])
+            details = f"{count} violation{'s' if count != 1 else ''} found."
         else:
             if info.get("error"):
                 details = f"Check failed to run: {info['error']}"

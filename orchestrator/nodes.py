@@ -939,6 +939,8 @@ def merge_node(state: AgentState) -> AgentState:
                     if verdicts[k] in ("FAIL", "NEEDS REVIEW"):
                         failure_reason = f"PR review block: {k} check verdict is '{verdicts[k]}'."
                         break
+                if failure_reason:
+                    break
             
             if failure_reason is None:
                 logger.info(
