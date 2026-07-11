@@ -252,9 +252,7 @@ def call_openrouter_api(
         },
         method="POST",
     )
-    with urllib.request.urlopen(
-        req, timeout=300
-    ) as response:  # nosemgrep: dynamic-urllib-use-detected
+    with urllib.request.urlopen(req, timeout=300) as response:  # nosemgrep  # fmt: skip
         return response.status, response.read().decode("utf-8")
 
 
