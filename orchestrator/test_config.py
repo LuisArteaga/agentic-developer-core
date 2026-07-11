@@ -303,6 +303,21 @@ class TestGetChatModelFromConfig(unittest.TestCase):
         llm = get_chat_model_from_config(cfg)
         self.assertEqual(llm.model_name, "test-model")
 
+    def test_api_key_wrapped_in_secret_str(self):
+        """The API key is wrapped in pydantic SecretStr to prevent accidental exposure."""
+        cfg = {
+            "model": "test-model",
+            "routing": None,
+            "temperature": 0.0,
+            "options": None,
+        }
+        llm = get_chat_model_from_config(cfg)
+        from pydantic import SecretStr
+
+        api_key = llm.openai_api_key
+        assert isinstance(api_key, SecretStr)
+        self.assertEqual(api_key.get_secret_value(), "mock-key")
+
     def test_routing_passed_via_extra_body(self):
         """The routing list is lowercased and passed to OpenRouter via extra_body provider."""
         cfg = {
