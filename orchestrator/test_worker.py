@@ -38,7 +38,7 @@ class TestWorkerAgent(unittest.TestCase):
         final_answer = execute_worker(
             issue_description="Verify codebase",
             plan="1. Run verify",
-            model_name="gpt-4o"
+            node_name="execute"
         )
 
         self.assertEqual(final_answer, "Successfully completed the task.")

@@ -10,6 +10,7 @@ from typing import Optional, Union
 
 from orchestrator import state as state_module
 from orchestrator.state import AgentState
+from orchestrator.config import resolve_model_config, get_chat_model_from_config
 from orchestrator.git import (
     is_git_repository, checkout, clean, reset_hard, get_remote_url, clone,
     commit, push, get_commit_time, add
@@ -354,7 +355,6 @@ def claim_node(state: AgentState) -> AgentState:
 
 from pydantic import BaseModel, Field
 from typing import List, Literal
-from orchestrator.worker import get_chat_model
 
 class PlanningTask(BaseModel):
     step_number: int = Field(description="The sequential step number, starting at 1.")
@@ -455,14 +455,12 @@ def plan_node(state: AgentState) -> AgentState:
         # 3. Get codebase structure
         codebase_structure = _get_directory_tree(workspace_path)
         
-        # 4. Resolve LLM model name
-        model_name = state.get("model") or os.getenv("AGENT_MODEL") or "google/gemini-2.5-pro"
-        if not state.get("model"):
-            state["model"] = model_name
-            
-        # 5. Initialize the model with structured output and retries
-        llm = get_chat_model(model_name)
-        llm.max_retries = 3
+        # 4. Resolve LLM model config (per-node routing per ADR-0018)
+        cfg = resolve_model_config("plan")
+
+        # 5. Initialize the model with structured output
+        # (max_retries and timeout are set in get_chat_model_from_config)
+        llm = get_chat_model_from_config(cfg)
         
         structured_llm = llm.with_structured_output(DevelopmentPlan)
         
@@ -556,10 +554,12 @@ def execute_node(state: AgentState) -> AgentState:
         issue_body = issue_data.get("body", "")
         issue_description = f"Title: {issue_title}\n\n{issue_body}"
         
-        # 3. Resolve LLM model name
-        model_name = state.get("model") or os.getenv("AGENT_MODEL") or "google/gemini-2.5-pro"
-        if not state.get("model"):
-            state["model"] = model_name
+        # 3. Resolve LLM model config (per-node routing per ADR-0018).
+        # Execute is the sole writer of state["model"] — other nodes re-resolve
+        # from config on each run. This preserves backward compatibility with
+        # existing state.json files from prior runs.
+        cfg = resolve_model_config("execute")
+        state["model"] = cfg["model"]
             
         # 4. Retrieve the generated plan
         plan = state.get("plan")
@@ -577,10 +577,10 @@ def execute_node(state: AgentState) -> AgentState:
                 f"{feedback}"
             )
             
-        # 6. Call the ReAct worker agent
+        # 6. Call the ReAct worker agent (resolves "execute" config internally)
         logger.info("Invoking worker agent...")
         from orchestrator.worker import execute_worker
-        execute_worker(issue_description, plan, model_name)
+        execute_worker(issue_description, plan)
         logger.info("Worker agent execution completed successfully.")
         _safe_telemetry(end_orchestrator_phase, exit_code=0)
         
@@ -1031,7 +1031,8 @@ def test_writer_node(state: AgentState) -> AgentState:
         issue_title = issue_data.get("title", "")
         issue_body = issue_data.get("body", "")
         
-        model_name = state.get("model") or os.getenv("AGENT_MODEL") or "google/gemini-2.5-pro"
+        # Test-Writer resolves its own model from config; it does not read or
+        # write state["model"] (only execute_node owns that field per ADR-0018).
         plan = state.get("plan")
         if not plan:
             raise ValueError(f"No development plan found in state for issue #{issue_num}.")
@@ -1058,7 +1059,7 @@ def test_writer_node(state: AgentState) -> AgentState:
                 instructions += f"\n=== PREVIOUS ATTEMPT FAILED PRE-VERIFICATION ===\n{feedback}\nPlease fix the syntax or import issues listed above."
                 
             from orchestrator.worker import execute_worker
-            execute_worker(instructions, plan, model_name)
+            execute_worker(instructions, plan, node_name="test_writer")
             
             # Run programmatic pre-verification check
             logger.info("Running pre-verification check on generated tests...")
