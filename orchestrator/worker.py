@@ -52,19 +52,6 @@ def get_worker_tools() -> list:
     """Return the list of wrapped LangChain tools for the worker agent."""
     return [read_file, list_directory, grep_search, patch_file, run_command]
 
-def get_chat_model(model_name: str) -> ChatOpenAI:
-    """Instantiate the OpenAI-compatible chat model for OpenRouter."""
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise ValueError("OPENROUTER_API_KEY environment variable is not set.")
-        
-    return ChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        base_url="https://openrouter.ai/api/v1",
-        temperature=0.0,
-    )
-
 # System Prompt incorporating all behavior guardrails
 SYSTEM_PROMPT = (
     "You are a professional autonomous software engineer worker agent. "

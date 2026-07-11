@@ -159,11 +159,9 @@ def resolve_model_config(node_name: str) -> Dict[str, Any]:
 def get_chat_model_from_config(cfg: Dict[str, Any]) -> ChatOpenAI:
     """Construct a ChatOpenAI client from a resolved Model Config dict.
 
-    This is the config-aware sibling of worker.get_chat_model(model_name: str).
-    It honors the routing and options fields that the legacy string-only
-    constructor cannot accept. The routing list is passed to OpenRouter via
-    the extra_body 'provider' parameter; options (e.g. thinking-effort) are
-    merged into extra_body and passed through verbatim.
+    Honors the routing and options fields: the routing list is passed to
+    OpenRouter via the extra_body 'provider' parameter; options (e.g.
+    thinking-effort) are merged into extra_body and passed through verbatim.
     """
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
