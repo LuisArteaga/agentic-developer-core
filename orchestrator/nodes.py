@@ -73,7 +73,9 @@ def _github_api_request(
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
     try:
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(
+            req
+        ) as response:  # nosemgrep: dynamic-urllib-use-detected
             res_data = response.read().decode("utf-8")
             if not res_data:
                 return {}

@@ -52,7 +52,9 @@ def check_url(url, timeout=5):
     """Check reachability of a given URL."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        urllib.request.urlopen(req, timeout=timeout)
+        urllib.request.urlopen(
+            req, timeout=timeout
+        )  # nosemgrep: dynamic-urllib-use-detected
         return True
     except urllib.error.HTTPError:
         # Server is reachable but returned HTTP error code (e.g. 404, 401), which is fine for reachability

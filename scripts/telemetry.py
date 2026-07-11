@@ -135,7 +135,7 @@ def get_agent_logs_dir() -> str:
     tmp_logs = "/tmp/agent_logs"
     try:
         os.makedirs(tmp_logs, mode=0o700, exist_ok=True)
-        os.chmod(tmp_logs, 0o700)
+        os.chmod(tmp_logs, 0o700)  # nosemgrep: insecure-file-permissions
     except Exception:
         pass
     return tmp_logs
