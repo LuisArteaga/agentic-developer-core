@@ -53,7 +53,7 @@ body:
       value: |
         - [ ] Kriterium 1
         - [ ] All new code paths have test coverage
-        - [ ] Local checks pass
+        - [ ] `make verify` passes (lint + test)
     validations:
       required: true
   - type: input
