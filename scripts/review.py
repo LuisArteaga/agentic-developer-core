@@ -7,9 +7,19 @@ import urllib.error
 import subprocess
 import tempfile
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
-from telemetry import (
+# Add project root and scripts dir to sys.path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+scripts_dir = os.path.dirname(os.path.abspath(__file__))
+if scripts_dir not in sys.path:
+    sys.path.insert(0, scripts_dir)
+
+from orchestrator.config import resolve_model_config  # noqa: E402
+
+from telemetry import (  # noqa: E402
     init_telemetry,
     get_tracer,
     trace,
@@ -69,29 +79,54 @@ def log(message):
             pass
 
 # Prompt definitions for LLM-as-a-Judge evaluations
-SYSTEM_PROMPT_SECURITY = (
-    "You are a code reviewer specialized in security. Review the PR diff for critical security issues.\n\n"
+SYSTEM_PROMPT_SYNTAX_LINT = (
+    "You are a code reviewer specialized in syntax validation, JSON schemas, and naming conventions.\n"
+    "Review the PR diff against these specific criteria:\n"
     "=== 1. CRITERIA DEFINITION ===\n"
-    "Check the diff for the following critical security vulnerabilities:\n"
-    "- Hardcoded credentials, secrets, passwords, or API keys.\n"
-    "- Injection vulnerabilities (e.g., shell command execution without escaping, SQL injection).\n"
-    "- Insecure authentication/authorization bypasses.\n"
-    "- Insecure data storage or transmission of sensitive data.\n\n"
+    "- Q1 (Syntax Validation): Check if the modified code is free of syntax errors, obvious compilation issues, or typos. (Note: Due to system-level egress sanitization, the '@' symbol used for decorators, e.g. @pytest.fixture or @functools.lru_cache, might be received as '[EMAIL]'. Do NOT count '[EMAIL]' as a syntax error or typo; treat it as a valid '@' decorator symbol).\n"
+    "- Q2 (JSON Schema Verification): Check if any modified JSON files adhere to standard or expected JSON formats and schemas.\n"
+    "- Q3 (Naming Conventions): Check if class names, functions, and variables follow sensible naming conventions (functions and variables in snake_case, classes in PascalCase).\n\n"
     "=== 2. ARGUMENTATION STRUCTURE ===\n"
-    "For each potential issue, explain the exact attack vector and business impact.\n"
-    "Structure your response by outputting your thought process inside <reasoning>...</reasoning> tags.\n"
-    "Then, output any found vulnerabilities inside <findings>...</findings> tags.\n\n"
+    "Output your thought process inside <reasoning>...</reasoning> tags.\n"
+    "Output any violations inside <findings>...</findings> tags.\n\n"
     "=== 3. SCORING RULE ===\n"
-    "- PASS: If there are no security vulnerabilities. Output an empty findings block: <findings></findings>.\n"
-    "- FAIL: If one or more verified security vulnerabilities are found. Report each as a JSON object on a single line inside the findings block: {\"severity\": \"security\", \"message\": \"...\"}.\n"
-    "- NEEDS REVIEW: If there is insufficient context to verify, explain why in reasoning and output an empty findings block.\n\n"
+    "- PASS: If there are no violations. Output an empty findings block: <findings></findings>.\n"
+    "- FAIL: If one or more criteria fail. Report each violation as a JSON object on a single line inside the findings block: "
+    '{"severity": "error", "message": "[QX] Details of the failure"}\n'
+    'Example: If Q3 fails: {"severity": "error", "message": "[Q3] Class FooBar does not use PascalCase"}\n\n'
     "=== 4. EDGE-CASE HANDLING ===\n"
-    "- Do NOT flag placeholder values in test files, configuration templates, or mock setups as vulnerabilities.\n"
-    "- Do NOT flag intentional, safe usages of low-level commands that are thoroughly sanitised.\n\n"
+    "- If the diff is empty, return PASS with empty findings.\n\n"
     "=== OUTPUT FORMAT ===\n"
     "First, output your reasoning block:\n"
     "<reasoning>\n"
-    "[Your reasoning/thinking about the security aspects of the code changes]\n"
+    "[Your reasoning/thinking about the syntax and naming aspects]\n"
+    "</reasoning>\n\n"
+    "Second, output your findings block:\n"
+    "<findings>\n"
+    "[Line-delimited JSON objects if FAIL, otherwise empty]\n"
+    "</findings>"
+)
+
+SYSTEM_PROMPT_TEST_COVERAGE = (
+    "You are a code reviewer specialized in test validation and coverage.\n"
+    "Review the PR diff against these specific criteria:\n"
+    "=== 1. CRITERIA DEFINITION ===\n"
+    "- Q1 (Test Presence): Check if any modified logic or new code is accompanied by new tests or updates to existing tests in the test folders.\n"
+    "- Q2 (Test Quality/Assertions): Check if the tests contain meaningful assertions validating the actual behavior/logic changes, rather than trivial or empty test cases.\n\n"
+    "=== 2. ARGUMENTATION STRUCTURE ===\n"
+    "Output your thought process inside <reasoning>...</reasoning> tags.\n"
+    "Output any violations inside <findings>...</findings> tags.\n\n"
+    "=== 3. SCORING RULE ===\n"
+    "- PASS: If there are no violations. Output an empty findings block: <findings></findings>.\n"
+    "- FAIL: If one or more criteria fail. Report each violation as a JSON object on a single line inside the findings block: "
+    '{"severity": "error", "message": "[QX] Details of the failure"}\n'
+    'Example: If Q1 fails: {"severity": "error", "message": "[Q1] No tests added for new function compute_hash"}\n\n'
+    "=== 4. EDGE-CASE HANDLING ===\n"
+    "- If the diff is empty, return PASS with empty findings.\n\n"
+    "=== OUTPUT FORMAT ===\n"
+    "First, output your reasoning block:\n"
+    "<reasoning>\n"
+    "[Your reasoning/thinking about the tests]\n"
     "</reasoning>\n\n"
     "Second, output your findings block:\n"
     "<findings>\n"
@@ -117,7 +152,8 @@ SYSTEM_PROMPT_ARCH = (
     "- NEEDS REVIEW: If key context documents are missing and you cannot confirm compliance, log reasoning and output empty findings.\n\n"
     "=== 4. EDGE-CASE HANDLING ===\n"
     "- If the prompt indicates that context files are missing, evaluate compliance purely against the general simplicity/lazy coding rules and conventional commits.\n"
-    "- Do NOT flag intentional scaffolding that is explicitly requested in the issue requirements.\n\n"
+    "- Do NOT flag intentional scaffolding that is explicitly requested in the issue requirements.\n"
+    "- If the diff is empty, return PASS with empty findings.\n\n"
     "=== OUTPUT FORMAT ===\n"
     "First, output your reasoning block:\n"
     "<reasoning>\n"
@@ -129,6 +165,38 @@ SYSTEM_PROMPT_ARCH = (
     "</findings>"
 )
 
+SYSTEM_PROMPT_SECURITY = (
+    "You are a code reviewer specialized in security. Review the PR diff for critical security issues.\n\n"
+    "=== 1. CRITERIA DEFINITION ===\n"
+    "Check the diff for the following critical security vulnerabilities:\n"
+    "- Hardcoded credentials, secrets, passwords, or API keys.\n"
+    "- Injection vulnerabilities (e.g., shell command execution without escaping, SQL injection).\n"
+    "- Insecure authentication/authorization bypasses.\n"
+    "- Insecure data storage or transmission of sensitive data.\n\n"
+    "=== 2. ARGUMENTATION STRUCTURE ===\n"
+    "For each potential issue, explain the exact attack vector and business impact.\n"
+    "Structure your response by outputting your thought process inside <reasoning>...</reasoning> tags.\n"
+    "Then, output any found vulnerabilities inside <findings>...</findings> tags.\n\n"
+    "=== 3. SCORING RULE ===\n"
+    "- PASS: If there are no security vulnerabilities. Output an empty findings block: <findings></findings>.\n"
+    "- FAIL: If one or more verified security vulnerabilities are found. Report each as a JSON object on a single line inside the findings block: {\"severity\": \"security\", \"message\": \"...\"}.\n"
+    "- NEEDS REVIEW: If there is insufficient context to verify, explain why in reasoning and output an empty findings block.\n\n"
+    "=== 4. EDGE-CASE HANDLING ===\n"
+    "- Do NOT flag placeholder values in test files, configuration templates, or mock setups as vulnerabilities.\n"
+    "- Do NOT flag intentional, safe usages of low-level commands that are thoroughly sanitised.\n"
+    "- If the diff is empty, return PASS with empty findings.\n\n"
+    "=== OUTPUT FORMAT ===\n"
+    "First, output your reasoning block:\n"
+    "<reasoning>\n"
+    "[Your reasoning/thinking about the security aspects of the code changes]\n"
+    "</reasoning>\n\n"
+    "Second, output your findings block:\n"
+    "<findings>\n"
+    "[Line-delimited JSON objects if FAIL, otherwise empty]\n"
+    "</findings>"
+)
+
+MAX_DIFF_CHARS = 100000
 
 
 def run_command(cmd, env=None):
@@ -136,32 +204,31 @@ def run_command(cmd, env=None):
     res = subprocess.run(cmd, capture_output=True, text=True, env=env)
     return res.returncode, res.stdout, res.stderr
 
-ROUTING_PREFERENCES = {
-    "moonshotai/kimi-k2.7-code": {
-        "only": ["together", "moonshotai"],
-        "allow_fallbacks": True,
-        "sort": "latency"
-    },
-    "deepseek/deepseek-v4-pro": {
-        "only": ["baidu", "novita", "deepinfra"],
-        "allow_fallbacks": True,
-        "sort": "latency"
-    },
-    "deepseek/deepseek-v4-flash": {
-        "only": ["deepinfra", "baidu", "novita"],
-        "allow_fallbacks": True,
-        "sort": "latency"
-    }
-}
+def build_openrouter_provider(routing):
+    """Build the OpenRouter provider payload from a routing list, unified with orchestrator/config.py."""
+    if routing:
+        return {"order": [r.lower() for r in routing], "allow_fallbacks": False}
+    return None
 
-def call_openrouter_api(model, messages, api_key):
+def build_payload(model, messages, routing, temperature, options):
+    """Build the OpenRouter chat completions request payload dict."""
+    payload_dict: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature if temperature is not None else 0.0,
+    }
+    provider = build_openrouter_provider(routing)
+    if provider:
+        payload_dict["provider"] = provider
+    if options:
+        payload_dict.update(options)
+    return payload_dict
+
+def call_openrouter_api(model, messages, api_key, routing=None, temperature=0.0, options=None):
     """Performs HTTP request to OpenRouter chat completions API."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     
-    payload_dict = {"model": model, "messages": messages}
-    if model in ROUTING_PREFERENCES:
-        payload_dict["provider"] = ROUTING_PREFERENCES[model]
-        
+    payload_dict = build_payload(model, messages, routing, temperature, options)
     payload = json.dumps(payload_dict)
     data = payload.encode("utf-8")
     req = urllib.request.Request(
@@ -177,8 +244,14 @@ def call_openrouter_api(model, messages, api_key):
     with urllib.request.urlopen(req, timeout=300) as response:
         return response.status, response.read().decode("utf-8")
 
-def call_llm_for_review(model, system_prompt, diff, api_key):
-    """Wraps OpenRouter API call in a trace span and executes it with retry logic."""
+def call_llm_for_review(judge_key, system_prompt, diff, api_key):
+    """Resolves config for judge_key, wraps OpenRouter API call in a trace span and executes it with retry logic."""
+    cfg = resolve_model_config(judge_key)
+    model = cfg["model"]
+    routing = cfg["routing"]
+    temperature = cfg["temperature"]
+    options = cfg["options"]
+    
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": diff}
@@ -189,13 +262,14 @@ def call_llm_for_review(model, system_prompt, diff, api_key):
         span.set_attribute(OPENINFERENCE_SPAN_KIND, "LLM")
         span.set_attribute(LLM_MODEL_NAME, model)
         span.set_attribute(INPUT_VALUE, json.dumps(messages))
+        log(f"[INFO] Running judge {judge_key} using model: {model}")
         
         response_body = ""
         last_error = ""
         
         for attempt in range(2):
             try:
-                status, body = call_openrouter_api(model, messages, api_key)
+                status, body = call_openrouter_api(model, messages, api_key, routing=routing, temperature=temperature, options=options)
                 
                 # Pre-validate structure before considering it OK
                 parsed_body = json.loads(body, strict=False)
@@ -368,6 +442,146 @@ def load_architecture_context(workspace_dir: str) -> str:
         
     return "\n".join(context_lines)
 
+def truncate_diff(diff: str) -> str:
+    """Truncates the diff to REVIEW_MAX_DIFF_CHARS chars, appending a note when truncated."""
+    max_chars = int(os.getenv("REVIEW_MAX_DIFF_CHARS", str(MAX_DIFF_CHARS)))
+    if len(diff) > max_chars:
+        return diff[:max_chars] + f"\n\n[NOTE: diff truncated to {max_chars} chars due to context limits. Evaluate the visible portion; return NEEDS REVIEW if you cannot fully evaluate.]"
+    return diff
+
+JUDGE_KEYS = ["syntax_lint", "test_coverage", "architecture", "security"]
+
+JUDGE_DISPLAY_NAMES = {
+    "syntax_lint": "Syntax/Lint",
+    "test_coverage": "Test Coverage",
+    "architecture": "Architecture Compliance",
+    "security": "Security",
+}
+
+JUDGE_PROMPTS = {
+    "syntax_lint": SYSTEM_PROMPT_SYNTAX_LINT,
+    "test_coverage": SYSTEM_PROMPT_TEST_COVERAGE,
+    "architecture": SYSTEM_PROMPT_ARCH,
+    "security": SYSTEM_PROMPT_SECURITY,
+}
+
+def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
+    """Runs a single judge evaluation, returning (status, reasoning, findings, error).
+
+    status is normalized to uppercase ('PASS', 'FAIL', 'NEEDS REVIEW').
+    On an exception the judge returns 'NEEDS REVIEW' with the error captured.
+    """
+    tracer = get_tracer()
+    with tracer.start_as_current_span(f"{judge_key}_evaluation") as span:
+        span.set_attribute(OPENINFERENCE_SPAN_KIND, "LLM")
+        cfg = resolve_model_config(judge_key)
+        span.set_attribute(LLM_MODEL_NAME, cfg["model"])
+        span.set_attribute("eval.dimension", judge_key)
+
+        reasoning = ""
+        findings = []
+        error = None
+        status = "NEEDS REVIEW"
+
+        try:
+            raw_resp = llm_caller(judge_key, prompt, diff, api_key)
+            verdict, reasoning, findings = evaluate_response(raw_resp)
+            if verdict == "Pass":
+                status = "PASS"
+            elif verdict == "Fail":
+                status = "FAIL"
+            else:
+                status = "NEEDS REVIEW"
+        except Exception as e:
+            log(f"[ERR] Judge {judge_key} failed: {e}")
+            status = "NEEDS REVIEW"
+            error = str(e)
+            reasoning = f"Exception encountered: {e}"
+            span.record_exception(e)
+
+        span.set_attribute("eval.verdict", status)
+        span.set_attribute("eval.findings_count", len(findings))
+        status_code = trace.StatusCode.OK if status == "PASS" else trace.StatusCode.ERROR
+        span.set_status(trace.Status(status_code, f"Verdict: {status}" if status_code == trace.StatusCode.ERROR else None))
+
+        return status, reasoning, findings, error
+
+def build_review_body(judges_data: dict) -> str:
+    """Builds the combined GitHub review body (pure helper, no I/O).
+
+    Renders a human-readable summary table, per-judge detail sections, and a
+    hidden machine-parseable verdict block (HTML comment) at the very end.
+    """
+    report_lines = []
+    report_lines.append("### 🤖 Automated LLM PR Judges Summary\n")
+    report_lines.append("| Judge | Status | Details |")
+    report_lines.append("| :--- | :---: | :--- |")
+
+    for key in JUDGE_KEYS:
+        info = judges_data[key]
+        status = info["status"]
+        if status == "PASS":
+            status_emoji = "✅ PASS"
+        elif status == "FAIL":
+            status_emoji = "❌ FAIL"
+        else:
+            status_emoji = "⚠️ NEEDS REVIEW"
+
+        if status == "PASS":
+            details = "All criteria passed."
+        elif status == "FAIL":
+            count = len(info['findings'])
+            details = f"{count} violation{'s' if count != 1 else ''} found."
+        else:
+            if info.get("error"):
+                details = f"Check failed to run: {info['error']}"
+            else:
+                details = "Insufficient context."
+
+        report_lines.append(f"| **{info['name']} (`{key}`)** | {status_emoji} | {details} |")
+
+    report_lines.append("\n---\n")
+
+    for key in JUDGE_KEYS:
+        info = judges_data[key]
+        report_lines.append(f"### ➡️ {info['name']} (`{key}`)")
+        if info["status"] == "PASS":
+            status_emoji = "✅ PASS"
+        elif info["status"] == "FAIL":
+            status_emoji = "❌ FAIL"
+        else:
+            status_emoji = "⚠️ NEEDS REVIEW"
+        report_lines.append(f"* **Status**: {status_emoji}")
+
+        if info["findings"]:
+            report_lines.append("\n#### 📝 Detailed Findings:")
+            for f in info["findings"]:
+                sev, msg = f.split("|", 1) if "|" in f else ("bug", f)
+                report_lines.append(f"- `[{sev.upper()}]` {msg}")
+
+        if info.get("error"):
+            report_lines.append(f"\n⚠️ **Execution Error**: {info['error']}")
+
+        if info["reasoning"]:
+            report_lines.append("\n#### 🧠 Reasoning:")
+            report_lines.append("<details>")
+            report_lines.append("<summary>Reasoning Details</summary>\n")
+            report_lines.append(info["reasoning"])
+            report_lines.append("\n</details>")
+
+        report_lines.append("\n---\n")
+
+    combined_report = "\n".join(report_lines)
+
+    # Hidden machine-parseable verdict block (invisible in GitHub rendering).
+    hidden_lines = ["<!-- llm-pr-review-verdicts"]
+    for key in JUDGE_KEYS:
+        hidden_lines.append(f"{key}: {judges_data[key]['status']}")
+    hidden_lines.append("-->")
+    combined_report += "\n" + "\n".join(hidden_lines)
+
+    return combined_report
+
 def main():
     # Initialize telemetry
     init_telemetry()
@@ -386,14 +600,10 @@ def main():
         
     os.environ["GH_TOKEN"] = token
     
-    review_model = os.getenv("REVIEW_MODEL", "moonshotai/kimi-k2.7-code")
-    log(f"[INFO] Review model: {review_model}")
-    
     diff = sys.stdin.read()
-    if not diff.strip():
-        log("[WARN] No diff to review")
-        sys.exit(0)
-        
+    diff = truncate_diff(diff)
+    log(f"[INFO] Diff length: {len(diff)}")
+    
     tracer = get_tracer()
     with tracer.start_as_current_span("pr_review") as main_span:
         main_span.set_attribute(OPENINFERENCE_SPAN_KIND, "CHAIN")
@@ -404,117 +614,48 @@ def main():
             sys.stderr.write("[ERR] OPENROUTER_API_KEY not configured.\n")
             sys.exit(1)
             
-        # 1. RUN SECURITY EVALUATION
-        sec_verdict = "Needs Review"
-        sec_reasoning = "Evaluation failed to run"
-        sec_findings = []
+        judges_data: Dict[str, Any] = {}
+        for judge_key in JUDGE_KEYS:
+            judges_data[judge_key] = {
+                "name": JUDGE_DISPLAY_NAMES[judge_key],
+                "prompt": JUDGE_PROMPTS[judge_key],
+                "status": None,
+                "reasoning": "",
+                "findings": [],
+                "error": None,
+            }
         
-        with tracer.start_as_current_span("security_evaluation") as sec_span:
-            sec_span.set_attribute(OPENINFERENCE_SPAN_KIND, "LLM")
-            sec_span.set_attribute(LLM_MODEL_NAME, review_model)
-            sec_span.set_attribute("eval.dimension", "security")
-            
-            try:
-                raw_sec_resp = call_llm_for_review(review_model, SYSTEM_PROMPT_SECURITY, diff, openrouter_api_key)
-                sec_verdict, sec_reasoning, sec_findings = evaluate_response(raw_sec_resp)
-            except Exception as e:
-                log(f"[ERR] Security LLM call failed: {e}")
-                sec_reasoning = f"Exception encountered: {e}"
-                sec_span.record_exception(e)
-                
-            sec_span.set_attribute("eval.verdict", sec_verdict)
-            sec_span.set_attribute("eval.reasoning", sec_reasoning)
-            sec_span.set_attribute("eval.findings_count", len(sec_findings))
-            
-            status_code = trace.StatusCode.OK if sec_verdict == "Pass" else trace.StatusCode.ERROR
-            sec_span.set_status(trace.Status(status_code, f"Verdict: {sec_verdict}" if status_code == trace.StatusCode.ERROR else None))
-            
-        # 2. RUN ARCHITECTURE COMPLIANCE EVALUATION
-        arch_verdict = "Needs Review"
-        arch_reasoning = "Evaluation failed to run"
-        arch_findings = []
-        
-        with tracer.start_as_current_span("architecture_evaluation") as arch_span:
-            arch_span.set_attribute(OPENINFERENCE_SPAN_KIND, "LLM")
-            arch_span.set_attribute(LLM_MODEL_NAME, review_model)
-            arch_span.set_attribute("eval.dimension", "architecture_compliance")
-            
-            workspace_dir = os.getenv("GITHUB_WORKSPACE", ".")
-            arch_context = load_architecture_context(workspace_dir)
-            
-            if arch_context:
-                arch_prompt = SYSTEM_PROMPT_ARCH + "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\n" + arch_context
-            else:
-                arch_prompt = SYSTEM_PROMPT_ARCH + "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\nNo specific architecture documentation found. Falling back to default rules."
-                
-            try:
-                raw_arch_resp = call_llm_for_review(review_model, arch_prompt, diff, openrouter_api_key)
-                arch_verdict, arch_reasoning, arch_findings = evaluate_response(raw_arch_resp)
-            except Exception as e:
-                log(f"[ERR] Architecture Compliance LLM call failed: {e}")
-                arch_reasoning = f"Exception encountered: {e}"
-                arch_span.record_exception(e)
-                
-            arch_span.set_attribute("eval.verdict", arch_verdict)
-            arch_span.set_attribute("eval.reasoning", arch_reasoning)
-            arch_span.set_attribute("eval.findings_count", len(arch_findings))
-            
-            status_code = trace.StatusCode.OK if arch_verdict == "Pass" else trace.StatusCode.ERROR
-            arch_span.set_status(trace.Status(status_code, f"Verdict: {arch_verdict}" if status_code == trace.StatusCode.ERROR else None))
-            
-        # 3. POST DISCRETE REVIEWS AND COMPUTE EXIT CODE
-        security_failed = (sec_verdict in ["Fail", "Needs Review"])
-        arch_failed = (arch_verdict in ["Fail", "Needs Review"])
-        
-        if not security_failed and not arch_failed:
-            # Both passed! Submit single approval review
-            body = "### LLM PR Review: PASS\n\nAll automated checks passed.\n\n"
-            body += f"#### Security reasoning:\n{sec_reasoning}\n\n"
-            body += f"#### Architecture Compliance reasoning:\n{arch_reasoning}\n"
-            try:
-                submit_github_review(pr_number, "approve", body)
-            except Exception as e:
-                log(f"[ERR] Failed to submit approval review: {e}")
-                sys.exit(1)
-        else:
-            # At least one failed
-            if security_failed:
-                action = "request-changes"
-                body = f"### LLM PR Review - Security: {sec_verdict.upper()}\n\n"
-                body += f"#### Reasoning:\n{sec_reasoning}\n\n"
-                if sec_findings:
-                    body += "#### Findings:\n"
-                    for f in sec_findings:
-                        sev, msg = f.split("|", 1)
-                        body += f"- [{sev}] {msg}\n"
+        for judge_key in JUDGE_KEYS:
+            judge_info = judges_data[judge_key]
+            prompt = judge_info["prompt"]
+            if judge_key == "architecture":
+                workspace_dir = os.getenv("GITHUB_WORKSPACE", ".")
+                arch_context = load_architecture_context(workspace_dir)
+                if arch_context:
+                    prompt += "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\n" + arch_context
                 else:
-                    body += "No findings listed (e.g. LLM refused or had missing evidence).\n"
-                try:
-                    submit_github_review(pr_number, action, body)
-                except Exception as e:
-                    log(f"[ERR] Failed to submit Security review: {e}")
-                    sys.exit(1)
-                    
-            if arch_failed:
-                action = "comment"
-                body = f"### LLM PR Review - Architecture Compliance: {arch_verdict.upper()}\n\n"
-                body += f"#### Reasoning:\n{arch_reasoning}\n\n"
-                if arch_findings:
-                    body += "#### Findings:\n"
-                    for f in arch_findings:
-                        sev, msg = f.split("|", 1)
-                        body += f"- [{sev}] {msg}\n"
-                else:
-                    body += "No findings listed (e.g. LLM refused or context was missing).\n"
-                try:
-                    submit_github_review(pr_number, action, body)
-                except Exception as e:
-                    log(f"[ERR] Failed to submit Architecture Compliance review: {e}")
-                    sys.exit(1)
-                    
-        # Exits non-zero if Security failed or Architecture Compliance failed (so CI checks fail and block PR merge)
-        if security_failed or arch_failed:
-            log("[ERR] LLM review found security or architecture compliance issues")
+                    prompt += "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\nNo specific architecture documentation found. Falling back to default rules."
+            
+            log(f"[INFO] Running judge: {judge_key}")
+            status, reasoning, findings, error = run_judge(
+                judge_key, prompt, diff, openrouter_api_key
+            )
+            judge_info["status"] = status
+            judge_info["reasoning"] = reasoning
+            judge_info["findings"] = findings
+            judge_info["error"] = error
+        
+        body = build_review_body(judges_data)
+        review_action = "approve" if all(judges_data[k]["status"] == "PASS" for k in JUDGE_KEYS) else "request-changes"
+        try:
+            submit_github_review(pr_number, review_action, body)
+        except Exception as e:
+            log(f"[ERR] Failed to submit GitHub review: {e}")
+            sys.exit(1)
+        
+        any_failed = any(judges_data[k]["status"] in ("FAIL", "NEEDS REVIEW") for k in JUDGE_KEYS)
+        if any_failed:
+            log("[ERR] LLM review found issues in one or more judges")
             main_span.set_status(trace.Status(trace.StatusCode.ERROR, "Review evaluation failed"))
             sys.exit(1)
         else:

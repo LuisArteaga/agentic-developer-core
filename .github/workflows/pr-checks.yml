@@ -6,7 +6,6 @@ on:
 
 env:
   AGENT_MODE: ci
-  REVIEW_MODEL: ${{ vars.REVIEW_MODEL || 'moonshotai/kimi-k2.7-code' }}
   OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
   GH_PAT: ${{ secrets.GH_PAT }}
   PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -33,7 +32,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp openinference-semantic-conventions
+        run: |
+          pip install --upgrade pip
+          pip install -e .
+          pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp openinference-semantic-conventions
 
       - name: Run LLM review
         if: always()

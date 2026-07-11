@@ -892,8 +892,11 @@ def merge_node(state: AgentState) -> AgentState:
                 
             reviews = _github_api_request("GET", f"/repos/{github_repo}/pulls/{pr_num}/reviews")
             
-            latest_sec_verdict = None
-            latest_arch_verdict = None
+            judge_keys = ["syntax_lint", "test_coverage", "architecture", "security"]
+            verdicts = {k: None for k in judge_keys}
+            block_found = False
+            verdict_block_re = re.compile(r"<!--\s*llm-pr-review-verdicts\s*\n(.*?)-->", re.DOTALL)
+            verdict_line_re = re.compile(r"^(\w+):\s*(PASS|FAIL|NEEDS REVIEW)\s*$")
             
             for r in reviews:
                 submitted_at_str = r.get("submitted_at")
@@ -910,37 +913,42 @@ def merge_node(state: AgentState) -> AgentState:
                 # Only check reviews posted after the trusted reference/push time
                 if submitted_dt >= ref_time:
                     body = r.get("body") or ""
-                    if "### LLM PR Review: PASS" in body:
-                        latest_sec_verdict = "PASS"
-                        latest_arch_verdict = "PASS"
-                    elif "### LLM PR Review - Security:" in body:
-                        if "FAIL" in body:
-                            latest_sec_verdict = "FAIL"
-                        elif "NEEDS REVIEW" in body:
-                            latest_sec_verdict = "NEEDS REVIEW"
-                        elif "PASS" in body:
-                            latest_sec_verdict = "PASS"
-                    elif "### LLM PR Review - Architecture Compliance:" in body:
-                        if "FAIL" in body:
-                            latest_arch_verdict = "FAIL"
-                        elif "NEEDS REVIEW" in body:
-                            latest_arch_verdict = "NEEDS REVIEW"
-                        elif "PASS" in body:
-                            latest_arch_verdict = "PASS"
+                    block_match = verdict_block_re.search(body)
+                    if not block_match:
+                        continue
+                    block_found = True
+                    inner = block_match.group(1)
+                    parsed = {}
+                    for line in inner.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        line_match = verdict_line_re.match(line)
+                        if line_match:
+                            parsed[line_match.group(1)] = line_match.group(2)
+                    # Later qualifying reviews overwrite earlier ones (newest wins).
+                    for k in judge_keys:
+                        if k in parsed:
+                            verdicts[k] = parsed[k]
+                        else:
+                            verdicts[k] = "NEEDS REVIEW"
             
-            # Check Security Judge blocking
-            if latest_sec_verdict in ("FAIL", "NEEDS REVIEW"):
-                failure_reason = f"PR review block: Security check verdict is '{latest_sec_verdict}'."
-                break
-                
-            # Check Architecture Judge blocking
-            if latest_arch_verdict in ("FAIL", "NEEDS REVIEW"):
-                failure_reason = f"PR review block: Architecture compliance check verdict is '{latest_arch_verdict}'."
-                break
-                
-            logger.info("PR #%d is still open. LLM Judge verdicts: Security='%s', Arch='%s'. Sleeping %ds...",
-                        pr_num, latest_sec_verdict, latest_arch_verdict, poll_interval)
-            time.sleep(poll_interval)
+            # Only block when we have actually parsed a hidden verdict block.
+            if block_found:
+                for k in judge_keys:
+                    if verdicts[k] in ("FAIL", "NEEDS REVIEW"):
+                        failure_reason = f"PR review block: {k} check verdict is '{verdicts[k]}'."
+                        break
+                if failure_reason:
+                    break
+            
+            if failure_reason is None:
+                logger.info(
+                    "PR #%d is still open. LLM Judge verdicts: syntax_lint='%s', test_coverage='%s', architecture='%s', security='%s'. Sleeping %ds...",
+                    pr_num, verdicts["syntax_lint"], verdicts["test_coverage"],
+                    verdicts["architecture"], verdicts["security"], poll_interval,
+                )
+                time.sleep(poll_interval)
             
         if not pr_merged:
             if not failure_reason:
