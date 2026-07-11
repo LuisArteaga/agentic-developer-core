@@ -2,9 +2,10 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
 
 logger = logging.getLogger("orchestrator.config")
 
@@ -104,17 +105,14 @@ def resolve_model_config(node_name: str) -> Dict[str, Any]:
 
     if factory_cfg is not None and not isinstance(factory_cfg, dict):
         logger.debug(
-            "Factory entry for node '%s' is not an object; treating as "
-            "absent.",
+            "Factory entry for node '%s' is not an object; treating as absent.",
             node_name,
         )
         factory_cfg = None
 
     # 1 & 2. Environment overrides
     node_env_var = f"{node_name.upper()}_MODEL"
-    overridden_model = (
-        os.getenv(node_env_var) or os.getenv("AGENT_MODEL") or None
-    )
+    overridden_model = os.getenv(node_env_var) or os.getenv("AGENT_MODEL") or None
 
     if overridden_model:
         # Env override active => disable specific provider routing.
@@ -184,7 +182,7 @@ def get_chat_model_from_config(cfg: Dict[str, Any]) -> ChatOpenAI:
 
     return ChatOpenAI(
         model=model_name,
-        api_key=api_key,
+        api_key=SecretStr(api_key),
         base_url="https://openrouter.ai/api/v1",
         temperature=temperature,
         extra_body=extra_body or None,

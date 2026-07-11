@@ -14,7 +14,7 @@ class TestStatePersistence(unittest.TestCase):
         self.test_dir = tempfile.TemporaryDirectory()
         self.test_dir_path = Path(self.test_dir.name)
         self.state_file = self.test_dir_path / "state.json"
-        
+
         # Suppress logging warnings during tests to keep stdout clean
         logging.getLogger("orchestrator.state").setLevel(logging.CRITICAL)
 
@@ -60,7 +60,9 @@ class TestStatePersistence(unittest.TestCase):
         self.assertEqual(loaded_state["branch"], "feat/issue-42-test")
         self.assertEqual(loaded_state["model"], "gemini-2.5-pro")
         self.assertEqual(loaded_state["plan"], "1. test\n2. verify")
-        self.assertEqual(loaded_state["read_files"], ["orchestrator/state.py", "main.py"])
+        self.assertEqual(
+            loaded_state["read_files"], ["orchestrator/state.py", "main.py"]
+        )
         # updated_at should have been populated
         self.assertTrue(loaded_state["updated_at"])
 

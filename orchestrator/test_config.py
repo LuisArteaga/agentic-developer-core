@@ -120,7 +120,11 @@ class TestResolveModelConfig(unittest.TestCase):
     def test_node_specific_env_override(self, mock_load):
         """PLAN_MODEL takes precedence over factory.json default."""
         mock_load.return_value = {
-            "plan": {"model": "factory-plan-model", "routing": ["X"], "temperature": 0.5}
+            "plan": {
+                "model": "factory-plan-model",
+                "routing": ["X"],
+                "temperature": 0.5,
+            }
         }
         os.environ["PLAN_MODEL"] = "env-plan-model"
         cfg = resolve_model_config("plan")
@@ -210,9 +214,7 @@ class TestResolveModelConfig(unittest.TestCase):
     @unittest.mock.patch("orchestrator.config._load_factory_config")
     def test_factory_entry_without_temperature_defaults_to_zero(self, mock_load):
         """A factory entry missing 'temperature' defaults to 0.0."""
-        mock_load.return_value = {
-            "plan": {"model": "x", "routing": ["Y"]}
-        }
+        mock_load.return_value = {"plan": {"model": "x", "routing": ["Y"]}}
         cfg = resolve_model_config("plan")
         self.assertEqual(cfg["temperature"], 0.0)
 
@@ -243,7 +245,9 @@ class TestResolveJudgeConfigs(unittest.TestCase):
         """Each judge resolves its model/routing/temperature from factory.json; security has options."""
         syntax = resolve_model_config("syntax_lint")
         self.assertEqual(syntax["model"], "moonshotai/kimi-k2.7-code")
-        self.assertEqual(syntax["routing"], ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"])
+        self.assertEqual(
+            syntax["routing"], ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"]
+        )
         self.assertEqual(syntax["temperature"], 0.0)
         self.assertIsNone(syntax["options"])
 
@@ -253,11 +257,17 @@ class TestResolveJudgeConfigs(unittest.TestCase):
 
         arch = resolve_model_config("architecture")
         self.assertEqual(arch["model"], "z-ai/glm-5.2")
-        self.assertEqual(arch["routing"], ["Together", "DeepInfra", "Fireworks", "Parasail", "Inceptron"])
+        self.assertEqual(
+            arch["routing"],
+            ["Together", "DeepInfra", "Fireworks", "Parasail", "Inceptron"],
+        )
 
         sec = resolve_model_config("security")
         self.assertEqual(sec["model"], "deepseek/deepseek-v4-pro")
-        self.assertEqual(sec["routing"], ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"])
+        self.assertEqual(
+            sec["routing"],
+            ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
+        )
         self.assertEqual(sec["options"], {"thinking": "max"})
 
     def test_judge_env_override_disables_routing(self):
@@ -284,9 +294,29 @@ class TestGetChatModelFromConfig(unittest.TestCase):
 
     def test_constructs_chat_openai_with_model(self):
         """get_chat_model_from_config returns a ChatOpenAI with the given model."""
-        cfg = {"model": "test-model", "routing": None, "temperature": 0.0, "options": None}
+        cfg = {
+            "model": "test-model",
+            "routing": None,
+            "temperature": 0.0,
+            "options": None,
+        }
         llm = get_chat_model_from_config(cfg)
         self.assertEqual(llm.model_name, "test-model")
+
+    def test_api_key_wrapped_in_secret_str(self):
+        """The API key is wrapped in pydantic SecretStr to prevent accidental exposure."""
+        cfg = {
+            "model": "test-model",
+            "routing": None,
+            "temperature": 0.0,
+            "options": None,
+        }
+        llm = get_chat_model_from_config(cfg)
+        from pydantic import SecretStr
+
+        api_key = llm.openai_api_key
+        assert isinstance(api_key, SecretStr)
+        self.assertEqual(api_key.get_secret_value(), "mock-key")
 
     def test_routing_passed_via_extra_body(self):
         """The routing list is lowercased and passed to OpenRouter via extra_body provider."""
@@ -304,7 +334,12 @@ class TestGetChatModelFromConfig(unittest.TestCase):
 
     def test_no_routing_means_no_provider_in_extra_body(self):
         """When routing is None (env override), no provider key appears in extra_body."""
-        cfg = {"model": "test-model", "routing": None, "temperature": 0.0, "options": None}
+        cfg = {
+            "model": "test-model",
+            "routing": None,
+            "temperature": 0.0,
+            "options": None,
+        }
         llm = get_chat_model_from_config(cfg)
         extra_body = llm.extra_body or {}
         self.assertNotIn("provider", extra_body)
@@ -324,7 +359,12 @@ class TestGetChatModelFromConfig(unittest.TestCase):
 
     def test_temperature_passed_through(self):
         """The temperature from the config reaches the ChatOpenAI instance."""
-        cfg = {"model": "test-model", "routing": None, "temperature": 0.5, "options": None}
+        cfg = {
+            "model": "test-model",
+            "routing": None,
+            "temperature": 0.5,
+            "options": None,
+        }
         llm = get_chat_model_from_config(cfg)
         self.assertEqual(llm.temperature, 0.5)
 
@@ -332,7 +372,12 @@ class TestGetChatModelFromConfig(unittest.TestCase):
         """The LLM client has max_retries set for transient API error resilience."""
         from orchestrator.config import LLM_MAX_RETRIES
 
-        cfg = {"model": "test-model", "routing": None, "temperature": 0.0, "options": None}
+        cfg = {
+            "model": "test-model",
+            "routing": None,
+            "temperature": 0.0,
+            "options": None,
+        }
         llm = get_chat_model_from_config(cfg)
         self.assertEqual(llm.max_retries, LLM_MAX_RETRIES)
 
@@ -340,14 +385,24 @@ class TestGetChatModelFromConfig(unittest.TestCase):
         """The LLM client has a request_timeout to prevent indefinite hangs on OpenRouter."""
         from orchestrator.config import LLM_TIMEOUT
 
-        cfg = {"model": "test-model", "routing": None, "temperature": 0.0, "options": None}
+        cfg = {
+            "model": "test-model",
+            "routing": None,
+            "temperature": 0.0,
+            "options": None,
+        }
         llm = get_chat_model_from_config(cfg)
         self.assertEqual(llm.request_timeout, LLM_TIMEOUT)
 
     def test_missing_api_key_raises(self):
         """A missing OPENROUTER_API_KEY raises ValueError before construction."""
         del os.environ["OPENROUTER_API_KEY"]
-        cfg = {"model": "test-model", "routing": None, "temperature": 0.0, "options": None}
+        cfg = {
+            "model": "test-model",
+            "routing": None,
+            "temperature": 0.0,
+            "options": None,
+        }
         with self.assertRaises(ValueError) as ctx:
             get_chat_model_from_config(cfg)
         self.assertIn("OPENROUTER_API_KEY", str(ctx.exception))
@@ -393,7 +448,9 @@ class TestRealFactoryJson(unittest.TestCase):
         for node in ["plan", "test_writer", "execute"]:
             cfg = resolve_model_config(node)
             self.assertIsNotNone(cfg["routing"], f"{node} should have routing")
-            self.assertGreater(len(cfg["routing"]), 0, f"{node} routing should be non-empty")
+            self.assertGreater(
+                len(cfg["routing"]), 0, f"{node} routing should be non-empty"
+            )
 
     def test_default_routing_covers_all_nodes(self):
         """The DEFAULT_ROUTING fallback map covers every known node name."""

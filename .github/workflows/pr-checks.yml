@@ -34,9 +34,29 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e .
+          pip install -e .[dev]
           pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp openinference-semantic-conventions
+
+      - name: Run secret scan
+        run: python3 scripts/secret_scan.py
+
+      - name: Run Ruff Lint & Format Checks
+        run: |
+          ruff check orchestrator scripts
+          ruff format --check orchestrator scripts
+
+      - name: Run Mypy Typecheck
+        run: mypy orchestrator scripts
+
+      - name: Run Pytest Coverage Check
+        run: pytest --cov=orchestrator --cov-fail-under=89
+
+      - name: Run Semgrep Security Scan
+        run: semgrep scan orchestrator scripts --config=auto --error
+
+      - name: Run Pip-Audit Dependency Check
+        run: pip-audit .
 
       - name: Run LLM review
         if: always()
-        run: git diff origin/main...HEAD | scripts/review.sh
+        run: git diff -w origin/main...HEAD | scripts/review.sh

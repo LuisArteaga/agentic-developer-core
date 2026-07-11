@@ -7,19 +7,20 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator import state as state_module
-from orchestrator.state import AgentState, DEFAULT_STATE
+from orchestrator.state import DEFAULT_STATE
 from orchestrator.nodes import claim_node, plan_node, execute_node, verify_node
+
 
 class TestClaimNode(unittest.TestCase):
     def setUp(self):
         # Create temp directory for workspace
         self.workspace_temp = tempfile.TemporaryDirectory()
         self.workspace_dir = Path(self.workspace_temp.name).resolve()
-        
+
         # Create temp directory for state logs
         self.logs_temp = tempfile.TemporaryDirectory()
         self.logs_dir = Path(self.logs_temp.name).resolve()
-        
+
         # Set environment variables for testing
         self.original_env = {}
         vars_to_set = {
@@ -29,22 +30,41 @@ class TestClaimNode(unittest.TestCase):
             "AGENT_LABEL_READY": "agent-ready",
             "AGENT_LABEL_IN_PROGRESS": "agent-in-progress",
             "AGENT_LABEL_BLOCKED": "agent-blocked",
-            "AGENT_MODE": "local"
+            "AGENT_MODE": "local",
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
             os.environ[k] = v
-            
+
         # Initialize a real Git repository in the temp workspace
-        subprocess.run(["git", "init", "-b", "main"], cwd=str(self.workspace_dir), check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(self.workspace_dir), check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.workspace_dir), check=True)
-        
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+
         # Add an initial commit so HEAD exists
         self.initial_file = self.workspace_dir / "README.md"
         self.initial_file.write_text("# Test Repo", encoding="utf-8")
-        subprocess.run(["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True)
-        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
 
     def tearDown(self):
         # Restore environment variables
@@ -53,7 +73,7 @@ class TestClaimNode(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-                
+
         # Clean up directories
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
@@ -61,6 +81,7 @@ class TestClaimNode(unittest.TestCase):
     @patch("orchestrator.nodes._github_api_request")
     def test_normal_claim_flow(self, mock_api):
         """Test a normal claim flow: polls, finds one ready, claims it, resets workspace, and creates branch."""
+
         # Setup mock behavior for GitHub API requests
         def api_side_effect(method, path, body=None):
             if method == "GET":
@@ -73,7 +94,7 @@ class TestClaimNode(unittest.TestCase):
                         {
                             "number": 10,
                             "title": "Add database migration",
-                            "body": "We need to add a migration script."
+                            "body": "We need to add a migration script.",
                         }
                     ]
                 elif path.endswith("/issues/10"):
@@ -109,22 +130,38 @@ class TestClaimNode(unittest.TestCase):
 
         # Verify workspace hygiene: dirty file is cleaned and we are on the new feature branch
         self.assertFalse(dirty_file.exists())
-        
+
         # Check current git branch
-        branch_res = subprocess.run(["git", "branch", "--show-current"], cwd=str(self.workspace_dir), capture_output=True, text=True, check=True)
+        branch_res = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=str(self.workspace_dir),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         self.assertEqual(branch_res.stdout.strip(), "feat/issue-10")
 
     @patch("orchestrator.nodes._github_api_request")
     def test_resume_flow(self, mock_api):
         """Test resume flow: detects resume, skips clean/reset, checks out branch, preserves dirty files."""
         # Create the feature branch and a dirty file in it
-        subprocess.run(["git", "checkout", "-b", "feat/issue-10"], cwd=str(self.workspace_dir), check=True, capture_output=True)
-        
+        subprocess.run(
+            ["git", "checkout", "-b", "feat/issue-10"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+
         dirty_file = self.workspace_dir / "in_flight.py"
         dirty_file.write_text("print('in flight')", encoding="utf-8")
-        
+
         # Switch back to main to simulate entering from elsewhere
-        subprocess.run(["git", "checkout", "main"], cwd=str(self.workspace_dir), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "checkout", "main"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
 
         # Setup state to simulate resume
         resume_state = DEFAULT_STATE.copy()
@@ -144,16 +181,23 @@ class TestClaimNode(unittest.TestCase):
         # Verify we checked out the branch and the dirty file was PRESERVED
         self.assertTrue(dirty_file.exists())
         self.assertEqual(dirty_file.read_text(encoding="utf-8"), "print('in flight')")
-        
-        branch_res = subprocess.run(["git", "branch", "--show-current"], cwd=str(self.workspace_dir), capture_output=True, text=True, check=True)
+
+        branch_res = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=str(self.workspace_dir),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         self.assertEqual(branch_res.stdout.strip(), "feat/issue-10")
-        
+
         # GitHub API should not have been called since we skip polling on resume
         mock_api.assert_not_called()
 
     @patch("orchestrator.nodes._github_api_request")
     def test_blocked_issue_detection(self, mock_api):
         """Test that a ready issue with an open dependency gets transitioned to agent-blocked."""
+
         # Setup mock behavior
         def api_side_effect(method, path, body=None):
             if method == "GET":
@@ -165,7 +209,7 @@ class TestClaimNode(unittest.TestCase):
                         {
                             "number": 11,
                             "title": "Add user dashboard",
-                            "body": "Depends on ## Blocked by\n- #5"
+                            "body": "Depends on ## Blocked by\n- #5",
                         }
                     ]
                 elif path.endswith("/issues/5"):
@@ -184,25 +228,25 @@ class TestClaimNode(unittest.TestCase):
         # State should remain idle since the only ready issue was blocked
         self.assertEqual(new_state["status"], "idle")
         self.assertIsNone(new_state["issue_number"])
-        
+
         # Verify the transition edit was called on issue 11 (adding agent-blocked)
-        edit_calls = [call for call in mock_api.mock_calls if "11" in str(call) and "agent-blocked" in str(call)]
+        edit_calls = [
+            call
+            for call in mock_api.mock_calls
+            if "11" in str(call) and "agent-blocked" in str(call)
+        ]
         self.assertTrue(len(edit_calls) > 0)
 
     @patch("orchestrator.nodes._github_api_request")
     def test_self_healing_unblock(self, mock_api):
         """Test that a blocked issue with all closed dependencies gets transitioned to agent-ready."""
+
         # Setup mock behavior
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if "/issues" in path and "labels=agent-blocked" in path:
                     # Issue 12 is blocked by 5 and 6
-                    return [
-                        {
-                            "number": 12,
-                            "body": "## Blocked by\n- #5\n- #6"
-                        }
-                    ]
+                    return [{"number": 12, "body": "## Blocked by\n- #5\n- #6"}]
                 elif path.endswith("/issues/5"):
                     # Dependency 5 is closed
                     return {"state": "closed"}
@@ -223,9 +267,13 @@ class TestClaimNode(unittest.TestCase):
         new_state = claim_node(DEFAULT_STATE.copy())
 
         self.assertEqual(new_state["status"], "idle")
-        
+
         # Verify unblock call was made (adding agent-ready to issue 12)
-        unblock_calls = [call for call in mock_api.mock_calls if "12" in str(call) and "agent-ready" in str(call)]
+        unblock_calls = [
+            call
+            for call in mock_api.mock_calls
+            if "12" in str(call) and "agent-ready" in str(call)
+        ]
         self.assertTrue(len(unblock_calls) > 0)
 
     @patch("orchestrator.nodes._github_api_request")
@@ -240,6 +288,7 @@ class TestClaimNode(unittest.TestCase):
     @patch("orchestrator.nodes._github_api_request")
     def test_race_condition(self, mock_api):
         """Test race condition: issue 10 missing ready label in view check, so it claims issue 11 instead."""
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if "/issues" in path and "labels=agent-blocked" in path:
@@ -248,7 +297,7 @@ class TestClaimNode(unittest.TestCase):
                     # Return two issues
                     return [
                         {"number": 10, "title": "Task 1", "body": ""},
-                        {"number": 11, "title": "Task 2", "body": ""}
+                        {"number": 11, "title": "Task 2", "body": ""},
                     ]
                 elif path.endswith("/issues/10"):
                     # Issue 10 was already claimed by someone else (does not have agent-ready)
@@ -277,23 +326,23 @@ class TestPlanNode(unittest.TestCase):
         # Create temp directory for workspace
         self.workspace_temp = tempfile.TemporaryDirectory()
         self.workspace_dir = Path(self.workspace_temp.name).resolve()
-        
+
         # Create temp directory for state logs
         self.logs_temp = tempfile.TemporaryDirectory()
         self.logs_dir = Path(self.logs_temp.name).resolve()
-        
+
         # Set environment variables for testing
         self.original_env = {}
         vars_to_set = {
             "GITHUB_WORKSPACE": str(self.workspace_dir),
             "AGENT_LOG_PATH": str(self.logs_dir),
             "GITHUB_REPOSITORY": "test-owner/test-repo",
-            "AGENT_MODE": "local"
+            "AGENT_MODE": "local",
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
             os.environ[k] = v
-            
+
     def tearDown(self):
         # Restore environment variables
         for k, v in self.original_env.items():
@@ -301,7 +350,7 @@ class TestPlanNode(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-                
+
         # Clean up directories
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
@@ -311,20 +360,20 @@ class TestPlanNode(unittest.TestCase):
     def test_plan_node_success(self, mock_github_api, mock_get_chat_model):
         """Test successful Plan-Node execution: fetches issue, calls LLM, and serializes Pydantic plan."""
         from orchestrator.nodes import DevelopmentPlan, PlanningTask
-        
+
         # Setup mock GitHub API response
         mock_github_api.return_value = {
             "title": "Add DB migration",
-            "body": "We need a migration script for user profiles."
+            "body": "We need a migration script for user profiles.",
         }
-        
+
         # Setup mock LLM and structured output
         mock_llm = unittest.mock.MagicMock()
         mock_structured_llm = unittest.mock.MagicMock()
-        
+
         mock_get_chat_model.return_value = mock_llm
         mock_llm.with_structured_output.return_value = mock_structured_llm
-        
+
         mock_plan = DevelopmentPlan(
             rationale="We need to add a migration script.",
             tasks=[
@@ -332,41 +381,42 @@ class TestPlanNode(unittest.TestCase):
                     step_number=1,
                     action="read",
                     description="Read schema file",
-                    target_files=["schema.py"]
+                    target_files=["schema.py"],
                 ),
                 PlanningTask(
                     step_number=2,
                     action="patch",
                     description="Add migration",
-                    target_files=["migration.py"]
-                )
-            ]
+                    target_files=["migration.py"],
+                ),
+            ],
         )
         mock_structured_llm.invoke.return_value = mock_plan
-        
+
         # Setup initial state with some pre-existing read_files to verify it gets reset per ADR-0006
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["model"] = "gpt-4o"
         state["read_files"] = ["some_old_file.py"]
         state_module.save(state)
-        
+
         # Run plan node
         new_state = plan_node(state)
-        
+
         # Verify state transitions and read_files reset
         self.assertEqual(new_state["status"], "planning")
         self.assertEqual(new_state["phase"], "planning")
         self.assertEqual(new_state["read_files"], [])
         self.assertIsNotNone(new_state["plan"])
         self.assertEqual(new_state["model"], "gpt-4o")
-        
+
         # Verify state file was saved
         saved_state = state_module.load()
         self.assertEqual(saved_state["status"], "planning")
         self.assertEqual(saved_state["read_files"], [])
-        
+
         # Verify serialized plan structure
+        assert new_state["plan"] is not None
         plan_data = json.loads(new_state["plan"])
         self.assertEqual(plan_data["rationale"], "We need to add a migration script.")
         self.assertEqual(len(plan_data["tasks"]), 2)
@@ -377,7 +427,7 @@ class TestPlanNode(unittest.TestCase):
         """Test that Plan-Node raises ValueError if 'issue_number' is not set in the state."""
         state = DEFAULT_STATE.copy()
         state["issue_number"] = None
-        
+
         with self.assertRaises(ValueError) as ctx:
             plan_node(state)
         self.assertIn("issue_number", str(ctx.exception))
@@ -389,28 +439,28 @@ class TestPlanNode(unittest.TestCase):
         # Setup mock GitHub API response
         mock_github_api.return_value = {
             "title": "Add DB migration",
-            "body": "We need a migration script for user profiles."
+            "body": "We need a migration script for user profiles.",
         }
-        
+
         # Setup mock LLM to raise an exception when invoked
         mock_llm = unittest.mock.MagicMock()
         mock_structured_llm = unittest.mock.MagicMock()
-        
+
         mock_get_chat_model.return_value = mock_llm
         mock_llm.with_structured_output.return_value = mock_structured_llm
-        
+
         mock_structured_llm.invoke.side_effect = RuntimeError("OpenRouter API error")
-        
+
         # Setup initial state
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state_module.save(state)
-        
+
         # Verify exception is propagated
         with self.assertRaises(RuntimeError) as ctx:
             plan_node(state)
         self.assertEqual(str(ctx.exception), "OpenRouter API error")
-        
+
         # Verify state is updated and saved as 'failed' at 'planning' phase
         saved_state = state_module.load()
         self.assertEqual(saved_state["status"], "failed")
@@ -419,34 +469,36 @@ class TestPlanNode(unittest.TestCase):
     def test_plan_node_security_path_validation(self):
         """Test that the _is_safe_path helper correctly identifies safe and unsafe/forbidden paths."""
         from orchestrator.nodes import _is_safe_path
-        
+
         # Safe paths
         self.assertTrue(_is_safe_path("src/main.py"))
         self.assertTrue(_is_safe_path("README.md"))
         self.assertTrue(_is_safe_path("orchestrator/nodes.py"))
         self.assertTrue(_is_safe_path("tests/test_something.py"))
-        
+
         # Unsafe paths: absolute paths
         self.assertFalse(_is_safe_path("/etc/passwd"))
         self.assertFalse(_is_safe_path("/absolute/path/file.txt"))
-        
+
         # Unsafe paths: directory traversal
         self.assertFalse(_is_safe_path("../outside.py"))
         self.assertFalse(_is_safe_path("src/../../outside.py"))
-        
+
         # Unsafe paths: forbidden directories
         self.assertFalse(_is_safe_path(".git/config"))
-        self.assertFalse(_is_safe_path(".venv/lib/python3.12/site-packages/something.py"))
+        self.assertFalse(
+            _is_safe_path(".venv/lib/python3.12/site-packages/something.py")
+        )
         self.assertFalse(_is_safe_path("src/.agent_logs/state.json"))
         self.assertFalse(_is_safe_path(".agents/AGENTS.md"))
-        
+
         # Unsafe paths: forbidden filenames / credentials
         self.assertFalse(_is_safe_path(".env"))
         self.assertFalse(_is_safe_path("src/.env"))
         self.assertFalse(_is_safe_path("ssh_keys/id_rsa"))
         self.assertFalse(_is_safe_path("credentials.txt"))
         self.assertFalse(_is_safe_path("config/id_ed25519"))
-        
+
         # Unsafe paths: sensitive extensions
         self.assertFalse(_is_safe_path("certs/private.key"))
         self.assertFalse(_is_safe_path("auth/token.pem"))
@@ -454,22 +506,24 @@ class TestPlanNode(unittest.TestCase):
 
     @patch("orchestrator.nodes.get_chat_model_from_config")
     @patch("orchestrator.nodes._github_api_request")
-    def test_plan_node_security_injection_blocking(self, mock_github_api, mock_get_chat_model):
+    def test_plan_node_security_injection_blocking(
+        self, mock_github_api, mock_get_chat_model
+    ):
         """Test that Plan-Node catches prompt injection attempts in the generated plan and aborts with a security block."""
         from orchestrator.nodes import DevelopmentPlan, PlanningTask
-        
+
         # Setup mock GitHub API response
         mock_github_api.return_value = {
             "title": "Malicious Issue",
-            "body": "System prompt override attempt."
+            "body": "System prompt override attempt.",
         }
-        
+
         # Setup mock LLM and structured output returning a malicious plan targeting .env
         mock_llm = unittest.mock.MagicMock()
         mock_structured_llm = unittest.mock.MagicMock()
         mock_get_chat_model.return_value = mock_llm
         mock_llm.with_structured_output.return_value = mock_structured_llm
-        
+
         mock_malicious_plan = DevelopmentPlan(
             rationale="Attacker steered reasoning.",
             tasks=[
@@ -477,23 +531,23 @@ class TestPlanNode(unittest.TestCase):
                     step_number=1,
                     action="read",
                     description="Exfiltrate environment variables",
-                    target_files=[".env"]  # Unsafe file!
+                    target_files=[".env"],  # Unsafe file!
                 )
-            ]
+            ],
         )
         mock_structured_llm.invoke.return_value = mock_malicious_plan
-        
+
         # Setup initial state
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state_module.save(state)
-        
+
         # Verify ValueError is raised with a security block message
         with self.assertRaises(ValueError) as ctx:
             plan_node(state)
         self.assertIn("Security Block", str(ctx.exception))
         self.assertIn("'.env'", str(ctx.exception))
-        
+
         # Verify state is updated and saved as 'failed' at 'planning' phase
         saved_state = state_module.load()
         self.assertEqual(saved_state["status"], "failed")
@@ -504,33 +558,36 @@ class TestPlanNode(unittest.TestCase):
         # Create a directory structure in the temp workspace
         (self.workspace_dir / "src").mkdir()
         (self.workspace_dir / "src" / "utils").mkdir()
-        (self.workspace_dir / "src" / "main.py").write_text("print('main')", encoding="utf-8")
-        (self.workspace_dir / "src" / "utils" / "helper.py").write_text("def help(): pass", encoding="utf-8")
+        (self.workspace_dir / "src" / "main.py").write_text(
+            "print('main')", encoding="utf-8"
+        )
+        (self.workspace_dir / "src" / "utils" / "helper.py").write_text(
+            "def help(): pass", encoding="utf-8"
+        )
         (self.workspace_dir / "README.md").write_text("# Readme", encoding="utf-8")
-        
+
         # Create ignored directories
         (self.workspace_dir / ".git").mkdir()
         (self.workspace_dir / ".venv").mkdir()
         (self.workspace_dir / ".venv" / "bin").mkdir()
         (self.workspace_dir / ".venv" / "lib").mkdir()
-        
+
         from orchestrator.nodes import _get_directory_tree
-        
+
         # Generate tree
         tree = _get_directory_tree(self.workspace_dir)
-        
+
         # Verify output contains files/folders and shows hierarchy
         self.assertIn("README.md", tree)
         self.assertIn("src/", tree)
         self.assertIn("utils/", tree)
         self.assertIn("helper.py", tree)
         self.assertIn("main.py", tree)
-        
+
         # Verify ignored folders are completely absent
         self.assertNotIn(".git", tree)
         self.assertNotIn(".venv", tree)
         self.assertNotIn("lib", tree)
-
 
 
 class TestExecuteNode(unittest.TestCase):
@@ -538,23 +595,23 @@ class TestExecuteNode(unittest.TestCase):
         # Create temp directory for workspace
         self.workspace_temp = tempfile.TemporaryDirectory()
         self.workspace_dir = Path(self.workspace_temp.name).resolve()
-        
+
         # Create temp directory for state logs
         self.logs_temp = tempfile.TemporaryDirectory()
         self.logs_dir = Path(self.logs_temp.name).resolve()
-        
+
         # Set environment variables for testing
         self.original_env = {}
         vars_to_set = {
             "GITHUB_WORKSPACE": str(self.workspace_dir),
             "AGENT_LOG_PATH": str(self.logs_dir),
             "GITHUB_REPOSITORY": "test-owner/test-repo",
-            "AGENT_MODE": "local"
+            "AGENT_MODE": "local",
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
             os.environ[k] = v
-            
+
     def tearDown(self):
         # Restore environment variables
         for k, v in self.original_env.items():
@@ -562,7 +619,7 @@ class TestExecuteNode(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-                
+
         # Clean up directories
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
@@ -574,30 +631,30 @@ class TestExecuteNode(unittest.TestCase):
         # Setup mock GitHub API response
         mock_github_api.return_value = {
             "title": "Fix a bug",
-            "body": "There is a bug in main.py."
+            "body": "There is a bug in main.py.",
         }
-        
+
         # Setup initial state
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
         state["read_files"] = ["old_file.py"]
         state_module.save(state)
-        
+
         # Run execute node
         new_state = execute_node(state)
-        
+
         # Verify status transitions, read_files reset
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "executing")
         self.assertEqual(new_state["read_files"], [])
-        
+
         # Verify execute_worker was called with correct parameters
         mock_execute_worker.assert_called_once_with(
             "Title: Fix a bug\n\nThere is a bug in main.py.",
-            '{"rationale": "...", "tasks": []}'
+            '{"rationale": "...", "tasks": []}',
         )
-        
+
         # Verify state file was saved
         saved_state = state_module.load()
         self.assertEqual(saved_state["status"], "executing")
@@ -609,19 +666,19 @@ class TestExecuteNode(unittest.TestCase):
         """Test that Execute-Node appends previous verification feedback to the worker prompt on retry."""
         mock_github_api.return_value = {
             "title": "Fix a bug",
-            "body": "There is a bug in main.py."
+            "body": "There is a bug in main.py.",
         }
-        
+
         # Setup initial state with feedback
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
         state["feedback"] = "AssertionError: 2 != 3 in test_main.py"
         state_module.save(state)
-        
+
         # Run execute node
-        new_state = execute_node(state)
-        
+        execute_node(state)
+
         # Verify execute_worker was called with the feedback appended
         expected_issue_description = (
             "Title: Fix a bug\n\nThere is a bug in main.py.\n\n"
@@ -630,8 +687,7 @@ class TestExecuteNode(unittest.TestCase):
             "AssertionError: 2 != 3 in test_main.py"
         )
         mock_execute_worker.assert_called_once_with(
-            expected_issue_description,
-            '{"rationale": "...", "tasks": []}'
+            expected_issue_description, '{"rationale": "...", "tasks": []}'
         )
 
     @patch("orchestrator.nodes._github_api_request")
@@ -639,17 +695,17 @@ class TestExecuteNode(unittest.TestCase):
         """Test that Execute-Node transitions status to failed and propagates exception on worker error."""
         # Setup GitHub API to raise an exception
         mock_github_api.side_effect = RuntimeError("API rate limit")
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
         state_module.save(state)
-        
+
         # Verify exception is propagated
         with self.assertRaises(RuntimeError) as ctx:
             execute_node(state)
         self.assertEqual(str(ctx.exception), "API rate limit")
-        
+
         # Verify state is updated to failed at executing phase
         saved_state = state_module.load()
         self.assertEqual(saved_state["status"], "failed")
@@ -661,23 +717,23 @@ class TestVerifyNode(unittest.TestCase):
         # Create temp directory for workspace
         self.workspace_temp = tempfile.TemporaryDirectory()
         self.workspace_dir = Path(self.workspace_temp.name).resolve()
-        
+
         # Create temp directory for state logs
         self.logs_temp = tempfile.TemporaryDirectory()
         self.logs_dir = Path(self.logs_temp.name).resolve()
-        
+
         # Set environment variables for testing
         self.original_env = {}
         vars_to_set = {
             "GITHUB_WORKSPACE": str(self.workspace_dir),
             "AGENT_LOG_PATH": str(self.logs_dir),
             "GITHUB_REPOSITORY": "test-owner/test-repo",
-            "AGENT_MODE": "local"
+            "AGENT_MODE": "local",
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
             os.environ[k] = v
-            
+
     def tearDown(self):
         # Restore environment variables
         for k, v in self.original_env.items():
@@ -685,7 +741,7 @@ class TestVerifyNode(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-                
+
         # Clean up directories
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
@@ -698,23 +754,23 @@ class TestVerifyNode(unittest.TestCase):
         mock_res.returncode = 0
         mock_res.stdout = b"All 10 tests passed."
         mock_subprocess_run.return_value = mock_res
-        
+
         # Setup initial state with existing attempts and feedback
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["attempts"] = {"verify": 2}
         state["feedback"] = "some previous error"
         state_module.save(state)
-        
+
         # Run verify node
         new_state = verify_node(state)
-        
+
         # Verify state changes: status 'verifying', attempts reset to 0, feedback cleared
         self.assertEqual(new_state["status"], "verifying")
         self.assertEqual(new_state["phase"], "verifying")
         self.assertEqual(new_state["attempts"]["verify"], 0)
         self.assertIsNone(new_state["feedback"])
-        
+
         # Verify subprocess was called correctly (default command: 'make verify')
         mock_subprocess_run.assert_called_once_with(
             ["make", "verify"],
@@ -722,7 +778,7 @@ class TestVerifyNode(unittest.TestCase):
             stderr=subprocess.STDOUT,
             cwd=self.workspace_dir,
             timeout=300,
-            shell=False
+            shell=False,
         )
 
     @patch("orchestrator.nodes.subprocess.run")
@@ -732,16 +788,16 @@ class TestVerifyNode(unittest.TestCase):
         mock_res.returncode = 1
         mock_res.stdout = b"AssertionError: 1 != 2"
         mock_subprocess_run.return_value = mock_res
-        
+
         # Setup initial state
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["attempts"] = {"verify": 1}
         state_module.save(state)
-        
+
         # Run verify node
         new_state = verify_node(state)
-        
+
         # Verify state: status becomes 'executing' for retry, attempts incremented to 2, feedback saved
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "verifying")
@@ -755,16 +811,16 @@ class TestVerifyNode(unittest.TestCase):
         mock_res.returncode = 1
         mock_res.stdout = b"AssertionError: 1 != 2"
         mock_subprocess_run.return_value = mock_res
-        
+
         # Setup initial state at 2 attempts
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["attempts"] = {"verify": 2}
         state_module.save(state)
-        
+
         # Run verify node (this is attempt 3)
         new_state = verify_node(state)
-        
+
         # Verify state: status becomes 'failed', attempts incremented to 3
         self.assertEqual(new_state["status"], "failed")
         self.assertEqual(new_state["phase"], "verifying")
@@ -775,18 +831,22 @@ class TestVerifyNode(unittest.TestCase):
     def test_verify_node_timeout(self, mock_subprocess_run):
         """Test verification command timing out: captures timeout error, increments attempts."""
         import subprocess
-        mock_subprocess_run.side_effect = subprocess.TimeoutExpired(cmd=["make", "verify"], timeout=300, output=b"Starting tests...\n")
-        
+
+        mock_subprocess_run.side_effect = subprocess.TimeoutExpired(
+            cmd=["make", "verify"], timeout=300, output=b"Starting tests...\n"
+        )
+
         # Setup initial state
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state_module.save(state)
-        
+
         # Run verify node
         new_state = verify_node(state)
-        
+
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["attempts"]["verify"], 1)
+        assert new_state["feedback"] is not None
         self.assertIn("timed out after 300 seconds", new_state["feedback"])
         self.assertIn("Starting tests...", new_state["feedback"])
 
@@ -799,18 +859,18 @@ class TestVerifyNode(unittest.TestCase):
         mock_res.returncode = 1
         mock_res.stdout = large_content.encode("utf-8")
         mock_subprocess_run.return_value = mock_res
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state_module.save(state)
-        
+
         new_state = verify_node(state)
-        
+
         # Verify that the saved feedback is under 10 KB (10240 bytes)
+        assert new_state["feedback"] is not None
         feedback_bytes = new_state["feedback"].encode("utf-8")
         self.assertTrue(len(feedback_bytes) <= 10240)
         self.assertIn("exceeded 10 KB limit", new_state["feedback"])
-
 
 
 class TestPRNode(unittest.TestCase):
@@ -819,26 +879,45 @@ class TestPRNode(unittest.TestCase):
         self.workspace_dir = Path(self.workspace_temp.name).resolve()
         self.logs_temp = tempfile.TemporaryDirectory()
         self.logs_dir = Path(self.logs_temp.name).resolve()
-        
+
         self.original_env = {}
         vars_to_set = {
             "GITHUB_WORKSPACE": str(self.workspace_dir),
             "AGENT_LOG_PATH": str(self.logs_dir),
             "GITHUB_REPOSITORY": "test-owner/test-repo",
-            "AGENT_MODE": "local"
+            "AGENT_MODE": "local",
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
             os.environ[k] = v
-            
-        subprocess.run(["git", "init", "-b", "main"], cwd=str(self.workspace_dir), check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(self.workspace_dir), check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.workspace_dir), check=True)
-        
+
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+
         self.initial_file = self.workspace_dir / "README.md"
         self.initial_file.write_text("# Test Repo", encoding="utf-8")
-        subprocess.run(["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True)
-        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
 
     def tearDown(self):
         for k, v in self.original_env.items():
@@ -863,30 +942,35 @@ class TestPRNode(unittest.TestCase):
             elif method == "POST" and "/pulls" in path:
                 return {"html_url": "https://github.com/test-owner/test-repo/pull/1"}
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import pr_node
+
         new_state = pr_node(state)
-        
+
         self.assertEqual(new_state["status"], "pr_open")
         self.assertEqual(new_state["phase"], "pr_open")
-        
+
         # Verify POST request was called
-        post_calls = [call for call in mock_api.mock_calls if call[1][0] == 'POST' and "/pulls" in call[1][1]]
+        post_calls = [
+            call
+            for call in mock_api.mock_calls
+            if call[1][0] == "POST" and "/pulls" in call[1][1]
+        ]
         self.assertTrue(len(post_calls) > 0)
-        
+
         # Verify commit and push mock calls
         mock_commit.assert_called_once()
         mock_push.assert_called_once()
 
 
 class TestMergeNode(unittest.TestCase):
-
     @staticmethod
     def _hidden_block_body(verdicts):
         """Build a review body containing the hidden llm-pr-review-verdicts block.
@@ -907,7 +991,7 @@ class TestMergeNode(unittest.TestCase):
         self.workspace_dir = Path(self.workspace_temp.name).resolve()
         self.logs_temp = tempfile.TemporaryDirectory()
         self.logs_dir = Path(self.logs_temp.name).resolve()
-        
+
         self.original_env = {}
         vars_to_set = {
             "GITHUB_WORKSPACE": str(self.workspace_dir),
@@ -915,20 +999,39 @@ class TestMergeNode(unittest.TestCase):
             "GITHUB_REPOSITORY": "test-owner/test-repo",
             "AGENT_MODE": "local",
             "AGENT_MERGE_POLL_INTERVAL": "1",
-            "AGENT_MERGE_POLL_TIMEOUT": "2"
+            "AGENT_MERGE_POLL_TIMEOUT": "2",
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
             os.environ[k] = v
-            
-        subprocess.run(["git", "init", "-b", "main"], cwd=str(self.workspace_dir), check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(self.workspace_dir), check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.workspace_dir), check=True)
-        
+
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+
         self.initial_file = self.workspace_dir / "README.md"
         self.initial_file.write_text("# Test Repo", encoding="utf-8")
-        subprocess.run(["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True)
-        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
 
     def tearDown(self):
         for k, v in self.original_env.items():
@@ -943,7 +1046,7 @@ class TestMergeNode(unittest.TestCase):
     @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_success(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
-        
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if path.endswith("/user"):
@@ -955,23 +1058,25 @@ class TestMergeNode(unittest.TestCase):
                 elif path.endswith("/reviews"):
                     return []
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import merge_node
+
         new_state = merge_node(state)
-        
+
         self.assertEqual(new_state["status"], "done")
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_blocked_by_security(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
-        
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if path.endswith("/user"):
@@ -984,29 +1089,39 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS", "security": "FAIL"}),
-                            "user": {"login": "test-judge-user"}
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "PASS",
+                                    "test_coverage": "PASS",
+                                    "architecture": "PASS",
+                                    "security": "FAIL",
+                                }
+                            ),
+                            "user": {"login": "test-judge-user"},
                         }
                     ]
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import merge_node
+
         new_state = merge_node(state)
-        
+
         self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
         self.assertIn("security check verdict is 'FAIL'", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_blocked_by_architecture(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
-        
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if path.endswith("/user"):
@@ -1019,29 +1134,39 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "FAIL", "security": "PASS"}),
-                            "user": {"login": "test-judge-user"}
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "PASS",
+                                    "test_coverage": "PASS",
+                                    "architecture": "FAIL",
+                                    "security": "PASS",
+                                }
+                            ),
+                            "user": {"login": "test-judge-user"},
                         }
                     ]
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import merge_node
+
         new_state = merge_node(state)
-        
+
         self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
         self.assertIn("architecture check verdict is 'FAIL'", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_ignores_untrusted_review(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
-        
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if path.endswith("/user"):
@@ -1055,29 +1180,39 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS", "security": "PASS"}),
-                            "user": {"login": "malicious-user"}
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "PASS",
+                                    "test_coverage": "PASS",
+                                    "architecture": "PASS",
+                                    "security": "PASS",
+                                }
+                            ),
+                            "user": {"login": "malicious-user"},
                         }
                     ]
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import merge_node
+
         new_state = merge_node(state)
-        
+
         self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
         self.assertIn("Polling timed out", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_blocked_by_syntax_lint(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
-        
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if path.endswith("/user"):
@@ -1090,29 +1225,39 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": self._hidden_block_body({"syntax_lint": "FAIL", "test_coverage": "PASS", "architecture": "PASS", "security": "PASS"}),
-                            "user": {"login": "test-judge-user"}
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "FAIL",
+                                    "test_coverage": "PASS",
+                                    "architecture": "PASS",
+                                    "security": "PASS",
+                                }
+                            ),
+                            "user": {"login": "test-judge-user"},
                         }
                     ]
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import merge_node
+
         new_state = merge_node(state)
-        
+
         self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
         self.assertIn("syntax_lint check verdict is 'FAIL'", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_blocked_by_test_coverage(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
-        
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if path.endswith("/user"):
@@ -1125,29 +1270,39 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "FAIL", "architecture": "PASS", "security": "PASS"}),
-                            "user": {"login": "test-judge-user"}
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "PASS",
+                                    "test_coverage": "FAIL",
+                                    "architecture": "PASS",
+                                    "security": "PASS",
+                                }
+                            ),
+                            "user": {"login": "test-judge-user"},
                         }
                     ]
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import merge_node
+
         new_state = merge_node(state)
-        
+
         self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
         self.assertIn("test_coverage check verdict is 'FAIL'", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_blocked_by_needs_review(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
-        
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if path.endswith("/user"):
@@ -1160,29 +1315,39 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS", "security": "NEEDS REVIEW"}),
-                            "user": {"login": "test-judge-user"}
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "PASS",
+                                    "test_coverage": "PASS",
+                                    "architecture": "PASS",
+                                    "security": "NEEDS REVIEW",
+                                }
+                            ),
+                            "user": {"login": "test-judge-user"},
                         }
                     ]
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import merge_node
+
         new_state = merge_node(state)
-        
+
         self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
         self.assertIn("security check verdict is 'NEEDS REVIEW'", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_all_pass_not_merged_polls(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
-        
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if path.endswith("/user"):
@@ -1195,30 +1360,40 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS", "security": "PASS"}),
-                            "user": {"login": "test-judge-user"}
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "PASS",
+                                    "test_coverage": "PASS",
+                                    "architecture": "PASS",
+                                    "security": "PASS",
+                                }
+                            ),
+                            "user": {"login": "test-judge-user"},
                         }
                     ]
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import merge_node
+
         new_state = merge_node(state)
-        
+
         # 4x PASS does not auto-merge; with the PR still open the node polls until timeout.
         self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
         self.assertIn("Polling timed out", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_stale_review_ignored(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
-        
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if path.endswith("/user"):
@@ -1232,30 +1407,40 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T11:00:00Z",
-                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS", "security": "PASS"}),
-                            "user": {"login": "test-judge-user"}
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "PASS",
+                                    "test_coverage": "PASS",
+                                    "architecture": "PASS",
+                                    "security": "PASS",
+                                }
+                            ),
+                            "user": {"login": "test-judge-user"},
                         }
                     ]
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import merge_node
+
         new_state = merge_node(state)
-        
+
         # Stale review yields no qualifying fresh block -> polls until timeout.
         self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
         self.assertIn("Polling timed out", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_missing_verdict_line_blocks(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
-        
+
         def api_side_effect(method, path, body=None):
             if method == "GET":
                 if path.endswith("/user"):
@@ -1269,22 +1454,31 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS"}),
-                            "user": {"login": "test-judge-user"}
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "PASS",
+                                    "test_coverage": "PASS",
+                                    "architecture": "PASS",
+                                }
+                            ),
+                            "user": {"login": "test-judge-user"},
                         }
                     ]
             raise ValueError(f"Unexpected API call: {method} {path}")
+
         mock_api.side_effect = api_side_effect
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         state_module.save(state)
-        
+
         from orchestrator.nodes import merge_node
+
         new_state = merge_node(state)
-        
+
         self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
         self.assertIn("security check verdict is 'NEEDS REVIEW'", new_state["feedback"])
 
 
@@ -1294,7 +1488,7 @@ class TestRecoveryNode(unittest.TestCase):
         self.workspace_dir = Path(self.workspace_temp.name).resolve()
         self.logs_temp = tempfile.TemporaryDirectory()
         self.logs_dir = Path(self.logs_temp.name).resolve()
-        
+
         self.original_env = {}
         vars_to_set = {
             "GITHUB_WORKSPACE": str(self.workspace_dir),
@@ -1302,20 +1496,39 @@ class TestRecoveryNode(unittest.TestCase):
             "GITHUB_REPOSITORY": "test-owner/test-repo",
             "AGENT_MODE": "local",
             "AGENT_LABEL_READY": "agent-ready",
-            "AGENT_LABEL_IN_PROGRESS": "agent-in-progress"
+            "AGENT_LABEL_IN_PROGRESS": "agent-in-progress",
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
             os.environ[k] = v
 
-        subprocess.run(["git", "init", "-b", "main"], cwd=str(self.workspace_dir), check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(self.workspace_dir), check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.workspace_dir), check=True)
-        
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+
         self.initial_file = self.workspace_dir / "README.md"
         self.initial_file.write_text("# Test Repo", encoding="utf-8")
-        subprocess.run(["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True)
-        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(self.workspace_dir), check=True)
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
 
     def tearDown(self):
         for k, v in self.original_env.items():
@@ -1331,16 +1544,29 @@ class TestRecoveryNode(unittest.TestCase):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state_module.save(state)
-        
+
         from orchestrator.nodes import recovery_node
+
         new_state = recovery_node(state)
-        
+
         self.assertEqual(new_state["status"], "failed")
         self.assertEqual(new_state["phase"], "recovery")
-        
+
         # Verify labels reset was called via GitHub API
-        add_label_call = [call for call in mock_api.mock_calls if "labels" in str(call) and "POST" in str(call) and "agent-ready" in str(call)]
-        remove_label_call = [call for call in mock_api.mock_calls if "labels" in str(call) and "DELETE" in str(call) and "agent-in-progress" in str(call)]
+        add_label_call = [
+            call
+            for call in mock_api.mock_calls
+            if "labels" in str(call)
+            and "POST" in str(call)
+            and "agent-ready" in str(call)
+        ]
+        remove_label_call = [
+            call
+            for call in mock_api.mock_calls
+            if "labels" in str(call)
+            and "DELETE" in str(call)
+            and "agent-in-progress" in str(call)
+        ]
         self.assertTrue(len(add_label_call) > 0)
         self.assertTrue(len(remove_label_call) > 0)
 
@@ -1351,13 +1577,13 @@ class TestTestWriterNode(unittest.TestCase):
         self.workspace_dir = Path(self.workspace_temp.name).resolve()
         self.logs_temp = tempfile.TemporaryDirectory()
         self.logs_dir = Path(self.logs_temp.name).resolve()
-        
+
         self.original_env = {}
         vars_to_set = {
             "GITHUB_WORKSPACE": str(self.workspace_dir),
             "AGENT_LOG_PATH": str(self.logs_dir),
             "GITHUB_REPOSITORY": "test-owner/test-repo",
-            "AGENT_MODE": "local"
+            "AGENT_MODE": "local",
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
@@ -1375,32 +1601,35 @@ class TestTestWriterNode(unittest.TestCase):
     @patch("orchestrator.nodes.subprocess.run")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
-    def test_test_writer_node_success(self, mock_github_api, mock_execute_worker, mock_run):
+    def test_test_writer_node_success(
+        self, mock_github_api, mock_execute_worker, mock_run
+    ):
         # Setup mock GitHub API response
         mock_github_api.return_value = {
             "title": "Fix a bug",
-            "body": "There is a bug in main.py."
+            "body": "There is a bug in main.py.",
         }
         # Setup mock subprocess output (success, no bad errors)
         mock_res = unittest.mock.MagicMock()
         mock_res.stdout = "Ran 5 tests in 0.1s\nOK"
         mock_res.stderr = ""
         mock_run.return_value = mock_res
-        
+
         # Setup initial state
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
         state_module.save(state)
-        
+
         # Run test writer node
         from orchestrator.nodes import test_writer_node
+
         new_state = test_writer_node(state)
-        
+
         # Verify status transitions, phase
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "test_writing")
-        
+
         # Verify execute_worker was called
         mock_execute_worker.assert_called_once()
         mock_run.assert_called_once()
@@ -1408,30 +1637,33 @@ class TestTestWriterNode(unittest.TestCase):
     @patch("orchestrator.nodes.subprocess.run")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
-    def test_test_writer_node_retry_and_success(self, mock_github_api, mock_execute_worker, mock_run):
+    def test_test_writer_node_retry_and_success(
+        self, mock_github_api, mock_execute_worker, mock_run
+    ):
         mock_github_api.return_value = {
             "title": "Fix a bug",
-            "body": "There is a bug in main.py."
+            "body": "There is a bug in main.py.",
         }
         # First check fails with SyntaxError, second succeeds
         res_fail = unittest.mock.MagicMock()
         res_fail.stdout = ""
         res_fail.stderr = "SyntaxError: invalid syntax"
-        
+
         res_success = unittest.mock.MagicMock()
         res_success.stdout = "Ran 5 tests\nOK"
         res_success.stderr = ""
-        
+
         mock_run.side_effect = [res_fail, res_success]
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
         state_module.save(state)
-        
+
         from orchestrator.nodes import test_writer_node
+
         new_state = test_writer_node(state)
-        
+
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "test_writing")
         self.assertEqual(mock_execute_worker.call_count, 2)
@@ -1439,36 +1671,34 @@ class TestTestWriterNode(unittest.TestCase):
     @patch("orchestrator.nodes.subprocess.run")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
-    def test_test_writer_node_all_attempts_fail(self, mock_github_api, mock_execute_worker, mock_run):
-        mock_github_api.return_value = {
-            "title": "Fix a bug",
-            "body": "There is a bug."
-        }
+    def test_test_writer_node_all_attempts_fail(
+        self, mock_github_api, mock_execute_worker, mock_run
+    ):
+        mock_github_api.return_value = {"title": "Fix a bug", "body": "There is a bug."}
         res_fail = unittest.mock.MagicMock()
         res_fail.stdout = ""
         res_fail.stderr = "ModuleNotFoundError: No module named foo"
         mock_run.return_value = res_fail
-        
+
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
         state_module.save(state)
-        
+
         from orchestrator.nodes import test_writer_node
+
         with self.assertRaises(RuntimeError):
             test_writer_node(state)
-            
+
         self.assertEqual(mock_execute_worker.call_count, 3)
 
 
 class TestGraphCompilation(unittest.TestCase):
     def test_graph_compiles_successfully(self):
         from orchestrator.graph import graph
+
         self.assertIsNotNone(graph)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
