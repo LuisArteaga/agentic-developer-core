@@ -217,6 +217,58 @@ class TestResolveModelConfig(unittest.TestCase):
         self.assertEqual(cfg["temperature"], 0.0)
 
 
+class TestResolveJudgeConfigs(unittest.TestCase):
+    """Tests for the 4 PR-review judge entries in config/factory.json (issue #37)."""
+
+    def setUp(self):
+        self.original_env = {}
+        for var in [
+            "AGENT_MODEL",
+            "SYNTAX_LINT_MODEL",
+            "TEST_COVERAGE_MODEL",
+            "ARCHITECTURE_MODEL",
+            "SECURITY_MODEL",
+        ]:
+            self.original_env[var] = os.environ.get(var)
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        for var, val in self.original_env.items():
+            if val is not None:
+                os.environ[var] = val
+            else:
+                os.environ.pop(var, None)
+
+    def test_resolve_judge_configs(self):
+        """Each judge resolves its model/routing/temperature from factory.json; security has options."""
+        syntax = resolve_model_config("syntax_lint")
+        self.assertEqual(syntax["model"], "moonshotai/kimi-k2.7-code")
+        self.assertEqual(syntax["routing"], ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"])
+        self.assertEqual(syntax["temperature"], 0.0)
+        self.assertIsNone(syntax["options"])
+
+        test_cov = resolve_model_config("test_coverage")
+        self.assertEqual(test_cov["model"], "moonshotai/kimi-k2.7-code")
+        self.assertEqual(test_cov["temperature"], 0.0)
+
+        arch = resolve_model_config("architecture")
+        self.assertEqual(arch["model"], "z-ai/glm-5.2")
+        self.assertEqual(arch["routing"], ["Together", "DeepInfra", "Fireworks", "Parasail", "Inceptron"])
+
+        sec = resolve_model_config("security")
+        self.assertEqual(sec["model"], "deepseek/deepseek-v4-pro")
+        self.assertEqual(sec["routing"], ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"])
+        self.assertEqual(sec["options"], {"thinking": "max"})
+
+    def test_judge_env_override_disables_routing(self):
+        """A node-specific env override disables routing and resets temperature to 0.0."""
+        os.environ["SYNTAX_LINT_MODEL"] = "foo"
+        cfg = resolve_model_config("syntax_lint")
+        self.assertEqual(cfg["model"], "foo")
+        self.assertIsNone(cfg["routing"])
+        self.assertEqual(cfg["temperature"], 0.0)
+
+
 class TestGetChatModelFromConfig(unittest.TestCase):
     """Tests for get_chat_model_from_config construction and extra_body wiring."""
 

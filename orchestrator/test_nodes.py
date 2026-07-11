@@ -886,6 +886,22 @@ class TestPRNode(unittest.TestCase):
 
 
 class TestMergeNode(unittest.TestCase):
+
+    @staticmethod
+    def _hidden_block_body(verdicts):
+        """Build a review body containing the hidden llm-pr-review-verdicts block.
+
+        verdicts maps judge keys to PASS/FAIL/NEEDS REVIEW. A key omitted from
+        the dict is omitted from the block (used to test missing-line handling).
+        """
+        lines = ["<!-- llm-pr-review-verdicts"]
+        for k in ["syntax_lint", "test_coverage", "architecture", "security"]:
+            v = verdicts.get(k)
+            if v is not None:
+                lines.append(f"{k}: {v}")
+        lines.append("-->")
+        return "\n".join(lines)
+
     def setUp(self):
         self.workspace_temp = tempfile.TemporaryDirectory()
         self.workspace_dir = Path(self.workspace_temp.name).resolve()
@@ -968,7 +984,7 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": "### LLM PR Review - Security: FAIL\nSecurity vulnerability found.",
+                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS", "security": "FAIL"}),
                             "user": {"login": "test-judge-user"}
                         }
                     ]
@@ -984,7 +1000,7 @@ class TestMergeNode(unittest.TestCase):
         new_state = merge_node(state)
         
         self.assertEqual(new_state["status"], "failed")
-        self.assertIn("Security check", new_state["feedback"])
+        self.assertIn("security check verdict is 'FAIL'", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
@@ -1003,7 +1019,7 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": "### LLM PR Review - Architecture Compliance: FAIL\nConvention violations.",
+                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "FAIL", "security": "PASS"}),
                             "user": {"login": "test-judge-user"}
                         }
                     ]
@@ -1019,7 +1035,7 @@ class TestMergeNode(unittest.TestCase):
         new_state = merge_node(state)
         
         self.assertEqual(new_state["status"], "failed")
-        self.assertIn("Architecture compliance check", new_state["feedback"])
+        self.assertIn("architecture check verdict is 'FAIL'", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
@@ -1039,7 +1055,7 @@ class TestMergeNode(unittest.TestCase):
                     return [
                         {
                             "submitted_at": "2026-06-27T12:05:00Z",
-                            "body": "### LLM PR Review: PASS",
+                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS", "security": "PASS"}),
                             "user": {"login": "malicious-user"}
                         }
                     ]
@@ -1056,6 +1072,220 @@ class TestMergeNode(unittest.TestCase):
         
         self.assertEqual(new_state["status"], "failed")
         self.assertIn("Polling timed out", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_blocked_by_syntax_lint(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": self._hidden_block_body({"syntax_lint": "FAIL", "test_coverage": "PASS", "architecture": "PASS", "security": "PASS"}),
+                            "user": {"login": "test-judge-user"}
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("syntax_lint check verdict is 'FAIL'", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_blocked_by_test_coverage(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "FAIL", "architecture": "PASS", "security": "PASS"}),
+                            "user": {"login": "test-judge-user"}
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("test_coverage check verdict is 'FAIL'", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_blocked_by_needs_review(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS", "security": "NEEDS REVIEW"}),
+                            "user": {"login": "test-judge-user"}
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("security check verdict is 'NEEDS REVIEW'", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_all_pass_not_merged_polls(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS", "security": "PASS"}),
+                            "user": {"login": "test-judge-user"}
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        # 4x PASS does not auto-merge; with the PR still open the node polls until timeout.
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("Polling timed out", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_stale_review_ignored(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    # Review authored before the reference (push) time -> stale, ignored.
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T11:00:00Z",
+                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS", "security": "PASS"}),
+                            "user": {"login": "test-judge-user"}
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        # Stale review yields no qualifying fresh block -> polls until timeout.
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("Polling timed out", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_missing_verdict_line_blocks(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    # security line omitted -> treated as NEEDS REVIEW -> blocks.
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": self._hidden_block_body({"syntax_lint": "PASS", "test_coverage": "PASS", "architecture": "PASS"}),
+                            "user": {"login": "test-judge-user"}
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+        mock_api.side_effect = api_side_effect
+        
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+        
+        from orchestrator.nodes import merge_node
+        new_state = merge_node(state)
+        
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("security check verdict is 'NEEDS REVIEW'", new_state["feedback"])
 
 
 class TestRecoveryNode(unittest.TestCase):
