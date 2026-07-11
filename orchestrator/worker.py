@@ -1,8 +1,6 @@
-import os
 import logging
 
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
 from orchestrator import tools as codebase_tools
@@ -10,47 +8,56 @@ from orchestrator import tools as codebase_tools
 # Set up logging
 logger = logging.getLogger("orchestrator.worker")
 
+
 # Define the 5 custom tools wrapped for LangChain ReAct Agent
 @tool
-def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+def read_file(
+    path: str, start_line: int | None = None, end_line: int | None = None
+) -> str:
     """Read contents of a file, with optional 1-based start_line and end_line bounds (inclusive).
-    
+
     You MUST call read_file to inspect a file's contents before you can modify it using patch_file.
     """
     return codebase_tools.read_file(path, start_line=start_line, end_line=end_line)
+
 
 @tool
 def list_directory(path: str) -> str:
     """List the contents of a directory, sorted alphabetically with directories first, followed by files."""
     return codebase_tools.list_directory(path)
 
+
 @tool
 def grep_search(query: str, path: str) -> str:
     """Search for the literal query string inside the target path (recursively if directory)."""
     return codebase_tools.grep_search(query, path)
 
+
 @tool
 def patch_file(path: str, old_string: str, new_string: str) -> str:
     """Perform exact search-and-replace of old_string with new_string.
-    
+
     You can only call patch_file on a file after you have read it using read_file in the current cycle.
     The old_string MUST match exactly once in the file (Ambiguity Abort rule). Include enough surrounding
     context lines in old_string to make it unique. Do not attempt to rewrite the entire file.
     """
     return codebase_tools.patch_file(path, old_string=old_string, new_string=new_string)
 
+
 @tool
 def run_command(command: str) -> str:
     """Execute a shell command safely in a subprocess with shell=False.
-    
+
     Use this tool to run tests (e.g., `make verify` or python test runner) to verify that your changes
     are correct and do not break the build.
     """
     return codebase_tools.run_command(command)
 
+
 def get_worker_tools() -> list:
     """Return the list of wrapped LangChain tools for the worker agent."""
     return [read_file, list_directory, grep_search, patch_file, run_command]
+
 
 # System Prompt incorporating all behavior guardrails
 SYSTEM_PROMPT = (
@@ -77,31 +84,36 @@ SYSTEM_PROMPT = (
     "Work carefully, keep your changes minimal, and ensure the test suite passes before concluding your work."
 )
 
-def execute_worker(issue_description: str, plan: str, node_name: str = "execute") -> str:
+
+def execute_worker(
+    issue_description: str, plan: str, node_name: str = "execute"
+) -> str:
     """Execute the worker agent using LangGraph's prebuilt ReAct agent.
-    
+
     Args:
         issue_description: The description of the issue to solve.
         plan: The step-by-step development plan.
         node_name: The orchestrator node name whose model config to resolve
             via resolve_model_config() (default "execute"). Test-Writer callers
             pass "test_writer" to use the test-writer model.
-        
+
     Returns:
         The final response text from the agent.
     """
     from orchestrator.config import resolve_model_config, get_chat_model_from_config
 
     cfg = resolve_model_config(node_name)
-    logger.info(f"Initializing worker agent (node=%s) with model: %s", node_name, cfg["model"])
-    
+    logger.info(
+        "Initializing worker agent (node=%s) with model: %s", node_name, cfg["model"]
+    )
+
     llm = get_chat_model_from_config(cfg)
     tools = get_worker_tools()
-    
+
     # Compile the prebuilt ReAct agent
     # We pass the system prompt as the 'prompt' parameter
     agent = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
-    
+
     # Formulate the user message combining issue and plan
     user_message = (
         f"Please solve the following issue:\n\n"
@@ -111,14 +123,15 @@ def execute_worker(issue_description: str, plan: str, node_name: str = "execute"
         f"{plan}\n\n"
         f"Start by exploring the codebase to locate the files and read them before editing."
     )
-    
+
     # We execute the agent with a recursion limit of 30 steps (max_iterations equivalent in LangGraph)
     # to prevent infinite loops.
     config = {"recursion_limit": 30}
-    
+
     logger.info("Starting worker execution loop...")
-    result = agent.invoke({"messages": [("user", user_message)]}, config=config)
-    
+    # LangGraph Pregel.invoke overload mismatch; config dict works at runtime.
+    result = agent.invoke({"messages": [("user", user_message)]}, config=config)  # type: ignore[call-overload]
+
     # Extract the last message from the result
     final_message = result["messages"][-1]
     return final_message.content

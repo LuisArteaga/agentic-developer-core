@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Literal, Optional, TypedDict, Union
+from typing import Dict, Literal, Optional, TypedDict, Union, cast
 
 # Set up logging for state persistence warnings
 logger = logging.getLogger("orchestrator.state")
@@ -21,6 +21,7 @@ StatusType = Literal[
     "failed",
 ]
 
+
 class AgentState(TypedDict):
     issue_number: Optional[int]
     status: StatusType
@@ -33,6 +34,7 @@ class AgentState(TypedDict):
     updated_at: str
     feedback: Optional[str]
     pushed_at: Optional[str]
+
 
 DEFAULT_STATE: AgentState = {
     "issue_number": None,
@@ -60,11 +62,12 @@ VALID_STATUSES = {
     "failed",
 }
 
+
 def get_state_filepath() -> Path:
     """Resolve and return the path to the state.json file, honoring the AGENT_LOG_PATH env var."""
     log_dir_name = os.getenv("AGENT_LOG_PATH", ".agent_logs")
     log_dir = Path(log_dir_name)
-    
+
     # If the path is relative, resolve it relative to the project root
     if not log_dir.is_absolute():
         project_root = Path(__file__).resolve().parent.parent
@@ -75,6 +78,7 @@ def get_state_filepath() -> Path:
     except Exception:
         pass
     return log_dir / "state.json"
+
 
 def save(state: AgentState, filepath: Optional[Union[str, Path]] = None) -> None:
     """Save the agent state atomically to the specified filepath or default state.json path.
@@ -106,6 +110,7 @@ def save(state: AgentState, filepath: Optional[Union[str, Path]] = None) -> None
                 pass
         raise e
 
+
 def load(filepath: Optional[Union[str, Path]] = None) -> AgentState:
     """Load the agent state from the specified filepath or default state.json path.
 
@@ -128,7 +133,17 @@ def load(filepath: Optional[Union[str, Path]] = None) -> AgentState:
             raise ValueError("State JSON root is not a dictionary")
 
         # Validate that all required keys exist
-        required_keys = {"issue_number", "status", "phase", "attempts", "branch", "model", "plan", "read_files", "updated_at"}
+        required_keys = {
+            "issue_number",
+            "status",
+            "phase",
+            "attempts",
+            "branch",
+            "model",
+            "plan",
+            "read_files",
+            "updated_at",
+        }
         missing_keys = required_keys - data.keys()
         if missing_keys:
             raise ValueError(f"State is missing required keys: {missing_keys}")
@@ -152,7 +167,7 @@ def load(filepath: Optional[Union[str, Path]] = None) -> AgentState:
             raise ValueError("Field 'read_files' must be a list")
 
         # Return successfully parsed state
-        return data
+        return cast(AgentState, data)
 
     except Exception as e:
         logger.warning(

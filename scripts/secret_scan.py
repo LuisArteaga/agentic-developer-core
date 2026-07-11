@@ -7,7 +7,6 @@ Upgrade path: swap to trufflehog pre-commit hook when dependency install is okay
 """
 
 import argparse
-import os
 import re
 import subprocess
 import sys
@@ -16,9 +15,12 @@ from pathlib import Path
 PATTERNS = {
     "github-pat": re.compile(r"ghp_[a-zA-Z0-9]{10,}"),
     "openrouter-key": re.compile(r"sk-or-v1-[a-zA-Z0-9_-]+"),
-    "pem-private-key": re.compile(r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),
+    "pem-private-key": re.compile(
+        r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+    ),
     "high-entropy-base64": re.compile(r"(?:[A-Za-z0-9+/]{40,}(?:={0,2})\n?){2,}"),
 }
+
 
 def is_binary(path: Path) -> bool:
     try:
@@ -44,7 +46,6 @@ def scan_file(path: Path) -> list:
         return []
     with path.open("r", encoding="utf-8", errors="replace") as f:
         return scan_text(f.read(), str(path))
-
 
 
 def get_staged_files() -> list[Path]:

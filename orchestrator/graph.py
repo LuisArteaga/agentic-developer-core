@@ -14,11 +14,12 @@ from orchestrator.nodes import (
 
 logger = logging.getLogger("orchestrator.graph")
 
+
 def route_after_claim(state: AgentState) -> str:
     """Routes execution after the Claim-Node, supporting both fresh runs and resume paths."""
     status = state.get("status")
     phase = state.get("phase")
-    
+
     if status == "idle":
         return "end"
     elif status == "claimed":
@@ -40,8 +41,11 @@ def route_after_claim(state: AgentState) -> str:
     elif status == "done":
         return "end"
     else:
-        logger.warning("Unknown status '%s' in route_after_claim. Defaulting to plan.", status)
+        logger.warning(
+            "Unknown status '%s' in route_after_claim. Defaulting to plan.", status
+        )
         return "plan"
+
 
 def route_after_plan(state: AgentState) -> str:
     """Routes execution after the Plan-Node to Test-Writer Node (Test-First/TDD)."""
@@ -49,17 +53,20 @@ def route_after_plan(state: AgentState) -> str:
         return "recovery"
     return "test_writer"
 
+
 def route_after_test_writer(state: AgentState) -> str:
     """Routes execution after the Test-Writer Node to Execute-Node."""
     if state.get("status") == "failed":
         return "recovery"
     return "execute"
 
+
 def route_after_execute(state: AgentState) -> str:
     """Routes execution after the Execute-Node."""
     if state.get("status") == "failed":
         return "recovery"
     return "verify"
+
 
 def route_after_verify(state: AgentState) -> str:
     """Routes execution after the Verify-Node based on success, retry, or failure status."""
@@ -71,11 +78,13 @@ def route_after_verify(state: AgentState) -> str:
     else:
         return "pr"
 
+
 def route_after_pr(state: AgentState) -> str:
     """Routes execution after the PR-Node."""
     if state.get("status") == "failed":
         return "recovery"
     return "merge"
+
 
 def route_after_merge(state: AgentState) -> str:
     """Routes execution after the Merge-Node."""
@@ -111,63 +120,36 @@ builder.add_conditional_edges(
         "verify": "verify",
         "pr": "pr",
         "merge": "merge",
-        "recovery": "recovery"
-    }
+        "recovery": "recovery",
+    },
 )
 
 builder.add_conditional_edges(
-    "plan",
-    route_after_plan,
-    {
-        "test_writer": "test_writer",
-        "recovery": "recovery"
-    }
+    "plan", route_after_plan, {"test_writer": "test_writer", "recovery": "recovery"}
 )
 
 builder.add_conditional_edges(
     "test_writer",
     route_after_test_writer,
-    {
-        "execute": "execute",
-        "recovery": "recovery"
-    }
+    {"execute": "execute", "recovery": "recovery"},
 )
 
 builder.add_conditional_edges(
-    "execute",
-    route_after_execute,
-    {
-        "verify": "verify",
-        "recovery": "recovery"
-    }
+    "execute", route_after_execute, {"verify": "verify", "recovery": "recovery"}
 )
 
 builder.add_conditional_edges(
     "verify",
     route_after_verify,
-    {
-        "execute": "execute",
-        "recovery": "recovery",
-        "pr": "pr"
-    }
+    {"execute": "execute", "recovery": "recovery", "pr": "pr"},
 )
 
 builder.add_conditional_edges(
-    "pr",
-    route_after_pr,
-    {
-        "merge": "merge",
-        "recovery": "recovery"
-    }
+    "pr", route_after_pr, {"merge": "merge", "recovery": "recovery"}
 )
 
 builder.add_conditional_edges(
-    "merge",
-    route_after_merge,
-    {
-        "end": END,
-        "recovery": "recovery"
-    }
+    "merge", route_after_merge, {"end": END, "recovery": "recovery"}
 )
 
 builder.add_edge("recovery", END)

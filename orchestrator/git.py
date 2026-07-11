@@ -5,30 +5,43 @@ from typing import Optional
 
 logger = logging.getLogger("orchestrator.git")
 
+
 class GitError(Exception):
     """Base exception for all Git operations."""
+
     pass
+
 
 class NotAGitRepositoryError(GitError):
     """Raised when a Git operation is attempted in a non-repository directory."""
+
     pass
+
 
 class GitCommandError(GitError):
     """Raised when a Git command exits with a non-zero status."""
+
     def __init__(self, command: list[str], returncode: int, stdout: str, stderr: str):
-        super().__init__(f"Git command {' '.join(command)} failed with exit code {returncode}.\nStderr: {stderr}")
+        super().__init__(
+            f"Git command {' '.join(command)} failed with exit code {returncode}.\nStderr: {stderr}"
+        )
         self.command = command
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
 
+
 class GitPushConflictError(GitCommandError):
     """Raised when a Git push fails due to conflicts or non-fast-forward updates."""
+
     pass
 
-def _run_git(repo_dir: Path | str, args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+
+def _run_git(
+    repo_dir: Path | str, args: list[str], check: bool = True
+) -> subprocess.CompletedProcess[str]:
     """Runs a Git command in the specified directory, capturing stdout and stderr.
-    
+
     Args:
         repo_dir: The directory to run the command in.
         args: The command arguments (excluding the 'git' binary itself).
@@ -36,7 +49,7 @@ def _run_git(repo_dir: Path | str, args: list[str], check: bool = True) -> subpr
     """
     cmd = ["git"] + args
     logger.debug("Running git command: %s in %s", " ".join(cmd), repo_dir)
-    
+
     try:
         result = subprocess.run(
             cmd,
@@ -44,21 +57,24 @@ def _run_git(repo_dir: Path | str, args: list[str], check: bool = True) -> subpr
             capture_output=True,
             text=True,
             shell=False,
-            errors="replace"
+            errors="replace",
         )
     except FileNotFoundError as e:
         raise GitError("Git executable not found on the system path.") from e
     except Exception as e:
         raise GitError(f"Failed to execute git command: {e}") from e
-        
+
     if check and result.returncode != 0:
         if "push" in args and any(
             x in result.stderr for x in ["rejected", "non-fast-forward", "fetch first"]
         ):
-            raise GitPushConflictError(cmd, result.returncode, result.stdout, result.stderr)
+            raise GitPushConflictError(
+                cmd, result.returncode, result.stdout, result.stderr
+            )
         raise GitCommandError(cmd, result.returncode, result.stdout, result.stderr)
-        
+
     return result
+
 
 def is_git_repository(repo_dir: Path | str) -> bool:
     """Verifies if the specified directory is inside a Git repository work tree."""
@@ -68,26 +84,32 @@ def is_git_repository(repo_dir: Path | str) -> bool:
     except GitError:
         return False
 
+
 def checkout(repo_dir: Path | str, branch: str, create: bool = False) -> None:
     """Checks out the specified branch. If create is True, attempts to create it first.
-    
+
     If the branch already exists locally and create is True, handles it gracefully by
     falling back to a standard checkout of the existing branch.
     """
     if create:
         # Check if branch already exists locally
-        exists_check = _run_git(repo_dir, ["show-ref", "--verify", f"refs/heads/{branch}"], check=False)
+        exists_check = _run_git(
+            repo_dir, ["show-ref", "--verify", f"refs/heads/{branch}"], check=False
+        )
         if exists_check.returncode == 0:
-            logger.info("Branch '%s' already exists locally. Falling back to checkout.", branch)
+            logger.info(
+                "Branch '%s' already exists locally. Falling back to checkout.", branch
+            )
             _run_git(repo_dir, ["checkout", branch])
         else:
             _run_git(repo_dir, ["checkout", "-b", branch])
     else:
         _run_git(repo_dir, ["checkout", branch])
 
+
 def commit(repo_dir: Path | str, message: str, author: Optional[str] = None) -> bool:
     """Commits staged changes. If there are no staged changes, returns False without raising an error.
-    
+
     Returns:
         True if a commit was created, False otherwise.
     """
@@ -97,44 +119,52 @@ def commit(repo_dir: Path | str, message: str, author: Optional[str] = None) -> 
     if diff_check.returncode == 0:
         logger.info("No staged changes to commit in %s.", repo_dir)
         return False
-        
+
     cmd = ["commit", "-m", message]
     if author:
         cmd += ["--author", author]
-        
+
     _run_git(repo_dir, cmd)
     return True
 
-def push(repo_dir: Path | str, branch: str, remote: str = "origin", force: bool = False) -> None:
+
+def push(
+    repo_dir: Path | str, branch: str, remote: str = "origin", force: bool = False
+) -> None:
     """Pushes the specified branch to the remote repository."""
     cmd = ["push", remote, branch]
     if force:
         cmd.append("--force")
     _run_git(repo_dir, cmd)
 
-def clean(repo_dir: Path | str, force: bool = True, remove_directories: bool = True) -> None:
+
+def clean(
+    repo_dir: Path | str, force: bool = True, remove_directories: bool = True
+) -> None:
     """Cleans untracked files from the working directory.
-    
+
     Raises NotAGitRepositoryError if the directory is not a Git repository.
     """
     if not is_git_repository(repo_dir):
         raise NotAGitRepositoryError(f"Directory '{repo_dir}' is not a Git repository.")
-        
+
     cmd = ["clean"]
     if force:
         cmd.append("-f")
     if remove_directories:
         cmd.append("-d")
-        
+
     _run_git(repo_dir, cmd)
+
 
 def reset_hard(repo_dir: Path | str, commit_or_ref: str = "HEAD") -> None:
     """Performs a hard reset to the specified commit or ref."""
     _run_git(repo_dir, ["reset", "--hard", commit_or_ref])
 
+
 def current_branch(repo_dir: Path | str) -> str:
     """Returns the name of the current active branch.
-    
+
     If the repository is in a detached HEAD state or has no commits, returns 'HEAD' or the default branch name.
     """
     try:
@@ -155,49 +185,54 @@ def current_branch(repo_dir: Path | str) -> str:
         except GitError:
             return "HEAD"
 
+
 def get_remote_url(repo_dir: Path | str, remote: str = "origin") -> str:
     """Returns the remote URL for the specified remote name."""
     result = _run_git(repo_dir, ["remote", "get-url", remote])
     return result.stdout.strip()
 
+
 def clone(repo_dir: Path | str, github_repo: str, token: Optional[str] = None) -> None:
     """Clones the target GitHub repository into the specified directory.
-    
+
     Utilizes Git's credential helper with an environment variable reference to prevent
     persisting the plaintext token in the local git config.
     """
     clean_url = f"https://github.com/{github_repo}.git"
-    
+
     if token:
         token_stripped = token.strip()
         import os
+
         # Ensure the token is set in the environment of any subprocess
         # referencing GH_PAT (or GITHUB_TOKEN if needed)
         os.environ["GH_PAT"] = token_stripped
-        
+
         # Configure credential helper referencing the GH_PAT env var
-        helper_cmd = '!f() { echo "username=x-access-token"; echo "password=$GH_PAT"; }; f'
+        helper_cmd = (
+            '!f() { echo "username=x-access-token"; echo "password=$GH_PAT"; }; f'
+        )
         cmd = [
             "clone",
-            "-c", f"credential.helper={helper_cmd}",
+            "-c",
+            f"credential.helper={helper_cmd}",
             clean_url,
-            str(repo_dir)
+            str(repo_dir),
         ]
     else:
         cmd = ["clone", clean_url, str(repo_dir)]
-        
+
     parent_dir = Path(repo_dir).parent
     parent_dir.mkdir(parents=True, exist_ok=True)
     _run_git(parent_dir, cmd)
+
 
 def get_commit_time(repo_dir: Path | str, commit_ref: str = "HEAD") -> str:
     """Returns the committer date of the specified commit ref in ISO 8601 format."""
     result = _run_git(repo_dir, ["show", "-s", "--format=%cI", commit_ref])
     return result.stdout.strip()
 
+
 def add(repo_dir: Path | str, path_spec: str = ".") -> None:
     """Stages files matching path_spec (defaults to all files in work tree)."""
     _run_git(repo_dir, ["add", path_spec])
-
-
-

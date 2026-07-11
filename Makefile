@@ -1,15 +1,24 @@
-.PHONY: verify setup secret-scan
+.PHONY: verify setup secret-scan lint format-check type-check test
+
+verify: lint format-check type-check test
 
 setup:
-	@echo "Installing native git pre-commit hook..."
-	@echo "#!/bin/sh" > .git/hooks/pre-commit
-	@echo "python3 scripts/secret_scan.py --staged" >> .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
-	@echo "Git hook setup completed successfully."
+	@echo "Installing pre-commit git hooks..."
+	pre-commit install
+	@echo "Git hooks installed successfully."
 
 secret-scan:
 	python3 scripts/secret_scan.py
 
-verify: secret-scan
-	python3 -m unittest discover -s . -p "test_*.py"
+test:
+	python -m pytest
+
+lint:
+	python -m ruff check orchestrator scripts
+
+format-check:
+	python -m ruff format --check orchestrator scripts
+
+type-check:
+	python -m mypy orchestrator scripts
 

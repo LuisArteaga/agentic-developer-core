@@ -4,7 +4,7 @@
 import os
 import sys
 import unittest
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 # Add scripts directory to path to import entrypoint
@@ -12,7 +12,7 @@ scripts_dir = Path(__file__).resolve().parent
 if str(scripts_dir) not in sys.path:
     sys.path.insert(0, str(scripts_dir))
 
-import entrypoint
+import entrypoint  # noqa: E402
 
 
 class EntrypointTests(unittest.TestCase):
@@ -65,7 +65,9 @@ class EntrypointTests(unittest.TestCase):
     @patch("time.sleep")
     @patch("entrypoint.check_url")
     @patch("sys.exit")
-    def test_verify_reachability_retry_success(self, mock_exit, mock_check_url, mock_sleep):
+    def test_verify_reachability_retry_success(
+        self, mock_exit, mock_check_url, mock_sleep
+    ):
         """Should retry up to 3 times and succeed if a target becomes reachable."""
         if "SKIP_REACHABILITY" in os.environ:
             del os.environ["SKIP_REACHABILITY"]
@@ -118,11 +120,11 @@ class EntrypointTests(unittest.TestCase):
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 0
         mock_popen.return_value = mock_proc
-        
+
         crashes, should_exit, code = entrypoint.run_iteration(
             consecutive_crashes=0, run_once=False, poll_interval=10.0
         )
-        
+
         self.assertEqual(crashes, 0)
         self.assertFalse(should_exit)
         self.assertIsNone(code)
@@ -137,11 +139,11 @@ class EntrypointTests(unittest.TestCase):
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 0
         mock_popen.return_value = mock_proc
-        
+
         crashes, should_exit, code = entrypoint.run_iteration(
             consecutive_crashes=0, run_once=False, poll_interval=10.0
         )
-        
+
         self.assertEqual(crashes, 0)
         self.assertFalse(should_exit)
         self.assertIsNone(code)
@@ -154,11 +156,11 @@ class EntrypointTests(unittest.TestCase):
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 0
         mock_popen.return_value = mock_proc
-        
+
         crashes, should_exit, code = entrypoint.run_iteration(
             consecutive_crashes=0, run_once=True, poll_interval=10.0
         )
-        
+
         self.assertEqual(crashes, 0)
         self.assertTrue(should_exit)
         self.assertEqual(code, 0)
@@ -168,44 +170,48 @@ class EntrypointTests(unittest.TestCase):
     @patch("time.time")
     @patch("subprocess.Popen")
     @patch("time.sleep")
-    def test_run_iteration_crash_startup(self, mock_sleep, mock_popen, mock_time, mock_random):
+    def test_run_iteration_crash_startup(
+        self, mock_sleep, mock_popen, mock_time, mock_random
+    ):
         """Should increment crashes, sleep for initial backoff, and return no-exit on startup crash."""
         mock_random.return_value = 0.0  # Jitter = 0
         # Startup crash: process duration < 30 seconds
         mock_time.side_effect = [0.0, 5.0]
-        
+
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 1
         mock_popen.return_value = mock_proc
-        
+
         crashes, should_exit, code = entrypoint.run_iteration(
             consecutive_crashes=0, run_once=False, poll_interval=10.0
         )
-        
+
         self.assertEqual(crashes, 1)
         self.assertFalse(should_exit)
         self.assertIsNone(code)
-        mock_sleep.assert_called_once_with(1.0) # initial_delay (1.0s) + jitter (0.0s)
+        mock_sleep.assert_called_once_with(1.0)  # initial_delay (1.0s) + jitter (0.0s)
 
     @patch("random.uniform")
     @patch("time.time")
     @patch("subprocess.Popen")
     @patch("time.sleep")
-    def test_run_iteration_crash_runtime_reset(self, mock_sleep, mock_popen, mock_time, mock_random):
+    def test_run_iteration_crash_runtime_reset(
+        self, mock_sleep, mock_popen, mock_time, mock_random
+    ):
         """Should reset consecutive crashes on runtime crash (>30s) and sleep for initial backoff."""
         mock_random.return_value = 0.0
         # Runtime crash: process duration > 30 seconds (40.0s)
         mock_time.side_effect = [0.0, 40.0]
-        
+
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 1
         mock_popen.return_value = mock_proc
-        
+
         # Started with 3 consecutive crashes, but duration > 30s resets it to 0, then increments to 1
         crashes, should_exit, code = entrypoint.run_iteration(
             consecutive_crashes=3, run_once=False, poll_interval=10.0
         )
-        
+
         self.assertEqual(crashes, 1)
         self.assertFalse(should_exit)
         self.assertIsNone(code)
@@ -215,20 +221,22 @@ class EntrypointTests(unittest.TestCase):
     @patch("time.time")
     @patch("subprocess.Popen")
     @patch("time.sleep")
-    def test_run_iteration_crash_escalating_backoff(self, mock_sleep, mock_popen, mock_time, mock_random):
+    def test_run_iteration_crash_escalating_backoff(
+        self, mock_sleep, mock_popen, mock_time, mock_random
+    ):
         """Should increment crashes and sleep for escalating exponential backoff."""
         mock_random.return_value = 0.0
         mock_time.side_effect = [0.0, 5.0]
-        
+
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 1
         mock_popen.return_value = mock_proc
-        
+
         # Starts with 2 consecutive crashes -> becomes 3 -> delay = 2^(3-1) * 1.0 = 4.0s
         crashes, should_exit, code = entrypoint.run_iteration(
             consecutive_crashes=2, run_once=False, poll_interval=10.0
         )
-        
+
         self.assertEqual(crashes, 3)
         self.assertFalse(should_exit)
         self.assertIsNone(code)
@@ -241,11 +249,11 @@ class EntrypointTests(unittest.TestCase):
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 1
         mock_popen.return_value = mock_proc
-        
+
         crashes, should_exit, code = entrypoint.run_iteration(
             consecutive_crashes=0, run_once=True, poll_interval=10.0
         )
-        
+
         self.assertEqual(crashes, 1)
         self.assertTrue(should_exit)
         self.assertEqual(code, 1)

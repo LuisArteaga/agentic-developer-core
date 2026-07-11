@@ -10,9 +10,31 @@ dependencies = [
     "langgraph>=0.1.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.3.0",
+    "mypy>=1.0.0",
+    "pytest-cov>=4.0.0",
+    "semgrep>=1.0.0",
+    "pip-audit>=2.0.0",
+    "pre-commit",
+]
+
 [build-system]
 requires = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["orchestrator"]
+
+[tool.mypy]
+ignore_missing_imports = true
+check_untyped_defs = true
+explicit_package_bases = true
+disable_error_code = ["call-arg", "dict-item", "assignment"]
+
+[tool.coverage.run]
+omit = [
+    "orchestrator/__main__.py",
+]
