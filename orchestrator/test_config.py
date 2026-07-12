@@ -66,6 +66,7 @@ class TestResolveModelConfig(unittest.TestCase):
             "PLAN_MODEL",
             "TEST_WRITER_MODEL",
             "EXECUTE_MODEL",
+            "SYNTAX_LINT_MODEL",
         ]:
             self.original_env[var] = os.environ.get(var)
             os.environ.pop(var, None)
@@ -218,6 +219,67 @@ class TestResolveModelConfig(unittest.TestCase):
         cfg = resolve_model_config("plan")
         self.assertEqual(cfg["temperature"], 0.0)
 
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_factory_resolution_returns_fallback_model(self, mock_load):
+        """fallback_model from factory.json is passed through in the factory path."""
+        mock_load.return_value = {
+            "syntax_lint": {
+                "model": "moonshotai/kimi-k2.7-code",
+                "routing": ["Together"],
+                "temperature": 0.0,
+                "fallback_model": "z-ai/glm-5.2",
+            }
+        }
+        cfg = resolve_model_config("syntax_lint")
+        self.assertEqual(cfg["fallback_model"], "z-ai/glm-5.2")
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_factory_resolution_no_fallback_model_defaults_none(self, mock_load):
+        """Absent fallback_model in factory.json resolves to None."""
+        mock_load.return_value = {
+            "plan": {
+                "model": "deepseek/deepseek-v4-flash",
+                "routing": ["DeepInfra"],
+                "temperature": 0.0,
+            }
+        }
+        cfg = resolve_model_config("plan")
+        self.assertIsNone(cfg["fallback_model"])
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_env_override_returns_fallback_model_from_factory(self, mock_load):
+        """Env override still reads fallback_model from the factory entry."""
+        mock_load.return_value = {
+            "syntax_lint": {
+                "model": "moonshotai/kimi-k2.7-code",
+                "routing": ["Together"],
+                "temperature": 0.0,
+                "fallback_model": "z-ai/glm-5.2",
+            }
+        }
+        os.environ["SYNTAX_LINT_MODEL"] = "env-override-model"
+        cfg = resolve_model_config("syntax_lint")
+        self.assertEqual(cfg["model"], "env-override-model")
+        self.assertIsNone(cfg["routing"])
+        self.assertEqual(cfg["fallback_model"], "z-ai/glm-5.2")
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_env_override_no_factory_fallback_model_is_none(self, mock_load):
+        """Env override with absent factory entry -> fallback_model is None."""
+        mock_load.return_value = {}
+        os.environ["PLAN_MODEL"] = "env-model"
+        cfg = resolve_model_config("plan")
+        self.assertEqual(cfg["model"], "env-model")
+        self.assertIsNone(cfg["fallback_model"])
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_node_absent_falls_back_to_default_no_fallback_model(self, mock_load):
+        """Hardcoded default path has fallback_model=None."""
+        mock_load.return_value = {"plan": {"model": "x"}}
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["model"], DEFAULT_MODEL)
+        self.assertIsNone(cfg["fallback_model"])
+
 
 class TestResolveJudgeConfigs(unittest.TestCase):
     """Tests for the 4 PR-review judge entries in config/factory.json (issue #37)."""
@@ -269,6 +331,20 @@ class TestResolveJudgeConfigs(unittest.TestCase):
             ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
         )
         self.assertEqual(sec["options"], {"thinking": "max"})
+
+    def test_resolve_judge_fallback_models(self):
+        """Each judge resolves its fallback_model from factory.json (ADR-0021)."""
+        syntax = resolve_model_config("syntax_lint")
+        self.assertEqual(syntax["fallback_model"], "z-ai/glm-5.2")
+
+        test_cov = resolve_model_config("test_coverage")
+        self.assertEqual(test_cov["fallback_model"], "z-ai/glm-5.2")
+
+        arch = resolve_model_config("architecture")
+        self.assertEqual(arch["fallback_model"], "deepseek/deepseek-v4-pro")
+
+        sec = resolve_model_config("security")
+        self.assertEqual(sec["fallback_model"], "z-ai/glm-5.2")
 
     def test_judge_env_override_disables_routing(self):
         """A node-specific env override disables routing and resets temperature to 0.0."""
