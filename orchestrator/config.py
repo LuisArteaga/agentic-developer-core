@@ -98,7 +98,8 @@ def resolve_model_config(node_name: str) -> Dict[str, Any]:
 
     Returns:
         {"model": str, "routing": List[str] | None,
-         "temperature": float, "options": Dict[str, Any] | None}
+         "temperature": float, "options": Dict[str, Any] | None,
+         "fallback_model": str | None}
     """
     factory = _load_factory_config()
     factory_cfg = factory.get(node_name) if isinstance(factory, dict) else None
@@ -129,6 +130,9 @@ def resolve_model_config(node_name: str) -> Dict[str, Any]:
             "routing": None,
             "temperature": temperature,
             "options": options,
+            "fallback_model": factory_cfg.get("fallback_model")
+            if factory_cfg
+            else None,
         }
 
     # 3. Factory configuration
@@ -138,6 +142,7 @@ def resolve_model_config(node_name: str) -> Dict[str, Any]:
             "routing": factory_cfg.get("routing"),
             "temperature": factory_cfg.get("temperature", 0.0),
             "options": factory_cfg.get("options"),
+            "fallback_model": factory_cfg.get("fallback_model"),
         }
 
     # 4. Hardcoded fallback (factory missing/malformed or node absent)
@@ -151,6 +156,7 @@ def resolve_model_config(node_name: str) -> Dict[str, Any]:
         "routing": DEFAULT_ROUTING.get(node_name),
         "temperature": 0.0,
         "options": None,
+        "fallback_model": None,
     }
 
 

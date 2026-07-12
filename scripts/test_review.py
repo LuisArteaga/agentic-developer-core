@@ -101,7 +101,14 @@ class SystemPromptTests(unittest.TestCase):
         self.assertIn("<reasoning>", review.SYSTEM_PROMPT_TEST_COVERAGE)
 
 
-def _build_judges_data(statuses, findings=None, errors=None, reasoning="ok"):
+def _build_judges_data(
+    statuses,
+    findings=None,
+    errors=None,
+    reasoning="ok",
+    fallbacks=None,
+    final_models=None,
+):
     """Helper to assemble a judges_data dict for build_review_body tests."""
     data = {}
     for key in review.JUDGE_KEYS:
@@ -112,6 +119,8 @@ def _build_judges_data(statuses, findings=None, errors=None, reasoning="ok"):
             "reasoning": reasoning,
             "findings": (findings or {}).get(key, []),
             "error": (errors or {}).get(key, None),
+            "used_fallback": (fallbacks or {}).get(key, False),
+            "final_model": (final_models or {}).get(key, None),
         }
     return data
 
@@ -219,13 +228,16 @@ class ProviderPayloadTests(unittest.TestCase):
 
 
 class RunJudgeTests(unittest.TestCase):
+    def _build_llm_response(self, content: str) -> str:
+        return json.dumps({"choices": [{"message": {"content": content}}]})
+
     def test_run_judge_llm_failure_returns_needs_review(self):
         """AC: LLM call raising -> status 'NEEDS REVIEW' with error captured."""
 
         def raising_caller(judge_key, prompt, diff, api_key):
             raise RuntimeError("LLM down")
 
-        status, reasoning, findings, error = review.run_judge(
+        status, reasoning, findings, error, used_fb, final_m = review.run_judge(
             "security",
             review.SYSTEM_PROMPT_SECURITY,
             "diff",
@@ -236,24 +248,17 @@ class RunJudgeTests(unittest.TestCase):
         self.assertEqual(findings, [])
         self.assertEqual(error, "LLM down")
         self.assertIn("Exception encountered: LLM down", reasoning)
+        self.assertFalse(used_fb)
 
     def test_run_judge_pass_normalizes_uppercase(self):
         """AC: a Pass verdict normalizes to uppercase 'PASS'."""
 
         def passing_caller(judge_key, prompt, diff, api_key):
-            return json.dumps(
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "<reasoning>r</reasoning><findings></findings>"
-                            }
-                        }
-                    ]
-                }
-            )
+            return self._build_llm_response(
+                "<reasoning>r</reasoning><findings></findings>"
+            ), {"used_fallback": False, "final_model": "test-model", "attempt_count": 1}
 
-        status, reasoning, findings, error = review.run_judge(
+        status, reasoning, findings, error, used_fb, final_m = review.run_judge(
             "syntax_lint",
             review.SYSTEM_PROMPT_SYNTAX_LINT,
             "diff",
@@ -262,6 +267,267 @@ class RunJudgeTests(unittest.TestCase):
         )
         self.assertEqual(status, "PASS")
         self.assertIsNone(error)
+        self.assertFalse(used_fb)
+        self.assertEqual(final_m, "test-model")
+
+    def test_run_judge_propagates_fallback_metadata(self):
+        """AC: used_fallback=True from llm_caller propagates through run_judge."""
+
+        def fallback_caller(judge_key, prompt, diff, api_key):
+            return self._build_llm_response(
+                "<reasoning>r</reasoning><findings></findings>"
+            ), {
+                "used_fallback": True,
+                "final_model": "fallback-model",
+                "attempt_count": 3,
+            }
+
+        status, reasoning, findings, error, used_fb, final_m = review.run_judge(
+            "architecture",
+            review.SYSTEM_PROMPT_ARCH,
+            "diff",
+            "key",
+            llm_caller=fallback_caller,
+        )
+        self.assertEqual(status, "PASS")
+        self.assertTrue(used_fb)
+        self.assertEqual(final_m, "fallback-model")
+
+
+class EmptyContentHelperTests(unittest.TestCase):
+    def test_is_empty_content_empty_string(self):
+        """AC: empty string content -> True."""
+        raw = json.dumps({"choices": [{"message": {"content": ""}}]})
+        self.assertTrue(review._is_empty_content(raw))
+
+    def test_is_empty_content_whitespace_only(self):
+        """AC: whitespace-only content -> True."""
+        raw = json.dumps({"choices": [{"message": {"content": "  \n  "}}]})
+        self.assertTrue(review._is_empty_content(raw))
+
+    def test_is_empty_content_non_empty(self):
+        """AC: non-empty content -> False."""
+        raw = json.dumps({"choices": [{"message": {"content": "hello"}}]})
+        self.assertFalse(review._is_empty_content(raw))
+
+
+class CallLlmForReviewTests(unittest.TestCase):
+    """Tests for the layered retry + fallback logic in call_llm_for_review.
+
+    These tests mock _call_with_api_retry to control the response sequence
+    without making real HTTP calls.
+    """
+
+    def _build_response(self, content: str) -> str:
+        return json.dumps({"choices": [{"message": {"content": content}}]})
+
+    @patch("review._call_with_api_retry")
+    @patch("review.resolve_model_config")
+    @patch("review.get_tracer")
+    def test_first_attempt_non_empty_no_retry(self, mock_tracer, mock_cfg, mock_retry):
+        """AC: non-empty content on first attempt -> no fallback, attempt_count=1."""
+        from telemetry import DummyTracer
+
+        mock_tracer.return_value = DummyTracer()
+        mock_cfg.return_value = {
+            "model": "primary-model",
+            "routing": ["Together"],
+            "temperature": 0.0,
+            "options": None,
+            "fallback_model": "fallback-model",
+        }
+        good_resp = self._build_response(
+            "<reasoning>r</reasoning><findings></findings>"
+        )
+        mock_retry.return_value = good_resp
+
+        body, metadata = review.call_llm_for_review(
+            "syntax_lint", "sys prompt", "diff", "key"
+        )
+        self.assertEqual(body, good_resp)
+        self.assertFalse(metadata["used_fallback"])
+        self.assertEqual(metadata["final_model"], "primary-model")
+        self.assertEqual(metadata["attempt_count"], 1)
+        self.assertEqual(mock_retry.call_count, 1)
+
+    @patch("review._call_with_api_retry")
+    @patch("review.resolve_model_config")
+    @patch("review.get_tracer")
+    def test_empty_then_nudge_succeeds(self, mock_tracer, mock_cfg, mock_retry):
+        """AC: empty first, non-empty on nudge -> 2 attempts, no fallback."""
+        from telemetry import DummyTracer
+
+        mock_tracer.return_value = DummyTracer()
+        mock_cfg.return_value = {
+            "model": "primary-model",
+            "routing": ["Together"],
+            "temperature": 0.0,
+            "options": None,
+            "fallback_model": "fallback-model",
+        }
+        empty_resp = self._build_response("")
+        good_resp = self._build_response(
+            "<reasoning>r</reasoning><findings></findings>"
+        )
+        mock_retry.side_effect = [empty_resp, good_resp]
+
+        body, metadata = review.call_llm_for_review(
+            "syntax_lint", "sys prompt", "diff", "key"
+        )
+        self.assertEqual(body, good_resp)
+        self.assertFalse(metadata["used_fallback"])
+        self.assertEqual(metadata["final_model"], "primary-model")
+        self.assertEqual(metadata["attempt_count"], 2)
+
+    @patch("review._call_with_api_retry")
+    @patch("review.resolve_model_config")
+    @patch("review.get_tracer")
+    def test_empty_twice_then_fallback_succeeds(
+        self, mock_tracer, mock_cfg, mock_retry
+    ):
+        """AC: two empties then fallback succeeds -> used_fallback=True, 3 attempts."""
+        from telemetry import DummyTracer
+
+        mock_tracer.return_value = DummyTracer()
+        mock_cfg.return_value = {
+            "model": "primary-model",
+            "routing": ["Together"],
+            "temperature": 0.0,
+            "options": None,
+            "fallback_model": "fallback-model",
+        }
+        empty_resp = self._build_response("")
+        good_resp = self._build_response(
+            "<reasoning>r</reasoning><findings></findings>"
+        )
+        mock_retry.side_effect = [empty_resp, empty_resp, good_resp]
+
+        body, metadata = review.call_llm_for_review(
+            "syntax_lint", "sys prompt", "diff", "key"
+        )
+        self.assertEqual(body, good_resp)
+        self.assertTrue(metadata["used_fallback"])
+        self.assertEqual(metadata["final_model"], "fallback-model")
+        self.assertEqual(metadata["attempt_count"], 3)
+
+    @patch("review._call_with_api_retry")
+    @patch("review.resolve_model_config")
+    @patch("review.get_tracer")
+    def test_empty_all_three_returns_empty(self, mock_tracer, mock_cfg, mock_retry):
+        """AC: all 3 attempts empty -> returns empty body (evaluate_response will
+        produce NEEDS REVIEW)."""
+        from telemetry import DummyTracer
+
+        mock_tracer.return_value = DummyTracer()
+        mock_cfg.return_value = {
+            "model": "primary-model",
+            "routing": ["Together"],
+            "temperature": 0.0,
+            "options": None,
+            "fallback_model": "fallback-model",
+        }
+        empty_resp = self._build_response("")
+        mock_retry.side_effect = [empty_resp, empty_resp, empty_resp]
+
+        body, metadata = review.call_llm_for_review(
+            "syntax_lint", "sys prompt", "diff", "key"
+        )
+        self.assertTrue(review._is_empty_content(body))
+        self.assertTrue(metadata["used_fallback"])
+        self.assertEqual(metadata["final_model"], "fallback-model")
+        self.assertEqual(metadata["attempt_count"], 3)
+
+    @patch("review._call_with_api_retry")
+    @patch("review.resolve_model_config")
+    @patch("review.get_tracer")
+    def test_no_fallback_model_skips_attempt_3(self, mock_tracer, mock_cfg, mock_retry):
+        """AC: no fallback_model configured -> only 2 attempts, returns empty."""
+        from telemetry import DummyTracer
+
+        mock_tracer.return_value = DummyTracer()
+        mock_cfg.return_value = {
+            "model": "primary-model",
+            "routing": ["Together"],
+            "temperature": 0.0,
+            "options": None,
+            "fallback_model": None,
+        }
+        empty_resp = self._build_response("")
+        mock_retry.side_effect = [empty_resp, empty_resp]
+
+        body, metadata = review.call_llm_for_review(
+            "syntax_lint", "sys prompt", "diff", "key"
+        )
+        self.assertTrue(review._is_empty_content(body))
+        self.assertFalse(metadata["used_fallback"])
+        self.assertEqual(metadata["attempt_count"], 2)
+
+    @patch("review._call_with_api_retry")
+    @patch("review.resolve_model_config")
+    @patch("review.get_tracer")
+    def test_fallback_uses_no_routing_no_options(
+        self, mock_tracer, mock_cfg, mock_retry
+    ):
+        """AC: fallback call uses routing=None, options=None, temperature=0.0."""
+        from telemetry import DummyTracer
+
+        mock_tracer.return_value = DummyTracer()
+        mock_cfg.return_value = {
+            "model": "primary-model",
+            "routing": ["Together"],
+            "temperature": 0.5,
+            "options": {"thinking": "max"},
+            "fallback_model": "fallback-model",
+        }
+        empty_resp = self._build_response("")
+        good_resp = self._build_response(
+            "<reasoning>r</reasoning><findings></findings>"
+        )
+        mock_retry.side_effect = [empty_resp, empty_resp, good_resp]
+
+        review.call_llm_for_review("security", "sys", "diff", "key")
+
+        # Third call (fallback) should have routing=None, options=None, temp=0.0
+        third_call = mock_retry.call_args_list[2]
+        # _call_with_api_retry(model, messages, api_key, routing, temperature, options)
+        self.assertIsNone(third_call.args[3])  # routing
+        self.assertIsNone(third_call.args[5])  # options
+        self.assertEqual(third_call.args[4], 0.0)  # temperature
+
+
+class FallbackIndicatorTests(unittest.TestCase):
+    def test_fallback_indicator_shown_when_used(self):
+        """AC: used_fallback=True -> visible fallback notice in review body."""
+        statuses = {k: "PASS" for k in review.JUDGE_KEYS}
+        fallbacks = {"security": True}
+        final_models = {"security": "z-ai/glm-5.2"}
+        data = _build_judges_data(
+            statuses, fallbacks=fallbacks, final_models=final_models
+        )
+        body = review.build_review_body(data)
+        self.assertIn("⚠️ **Fallback Model Used**", body)
+        self.assertIn("z-ai/glm-5.2", body)
+
+    def test_no_fallback_indicator_when_not_used(self):
+        """AC: used_fallback=False -> no fallback notice in review body."""
+        statuses = {k: "PASS" for k in review.JUDGE_KEYS}
+        data = _build_judges_data(statuses)
+        body = review.build_review_body(data)
+        self.assertNotIn("Fallback Model Used", body)
+
+    def test_fallback_indicator_only_for_specific_judge(self):
+        """AC: only the judge that used fallback shows the indicator."""
+        statuses = {k: "PASS" for k in review.JUDGE_KEYS}
+        fallbacks = {"test_coverage": True}
+        final_models = {"test_coverage": "z-ai/glm-5.2"}
+        data = _build_judges_data(
+            statuses, fallbacks=fallbacks, final_models=final_models
+        )
+        body = review.build_review_body(data)
+        # Should appear in the test_coverage section
+        self.assertIn("Fallback Model Used", body)
+        # Count occurrences — should be exactly 1
+        self.assertEqual(body.count("Fallback Model Used"), 1)
 
 
 if __name__ == "__main__":
