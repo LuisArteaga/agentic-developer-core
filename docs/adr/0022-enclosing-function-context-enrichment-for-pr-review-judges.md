@@ -10,7 +10,7 @@ The PR Review Judges (`scripts/review.py`) receive only the raw `git diff` as in
 
 1. **Missing semantic context:** A diff hunk shows a fragment of a function, not the full function body. A judge cannot reliably determine whether added lines are true duplicates, whether assertions are meaningful, or whether a taint flow is safe — without seeing the enclosing function.
 
-2. **False positives:** The sister project `agentic-planner-core` documented incident INC-001, where the `architecture` judge flagged a "duplicate assertion" in a test file. The two `assertFalse` lines used different IP addresses (`127.0.0.1` vs `169.254.169.254`), but the diff's ±3 line window didn't show enough surrounding context for the judge to distinguish them. The full test function body would have made the distinction obvious.
+2. **False positives:** During development of a similar LLM judge system, the `architecture` judge flagged a "duplicate assertion" in a test file. The two `assertFalse` lines used different IP addresses (`127.0.0.1` vs `169.254.169.254`), but the diff's ±3 line window didn't show enough surrounding context for the judge to distinguish them. The full test function body would have made the distinction obvious.
 
 This is hard to reverse because it changes `review.py`'s input pipeline (diff → diff + context blocks), introduces tree-sitter as a CI-side dependency for the first time, and establishes an enrichment contract that all four judges depend on. A future reader will wonder why judges receive function bodies beyond the diff, and why tree-sitter is used instead of regex.
 
@@ -106,8 +106,8 @@ Files without parseable `def`/`class` boundaries (JSON, YAML, Markdown, empty fi
 
 * [pr-agent (Qodo/CodiumAI)](https://pr-agent.ai) — `allow_dynamic_context`, enclosing-component strategy, asymmetric context window.
 * [CodeRabbit](https://coderabbit.ai) — AST + 1-hop call-graph as a further evolution.
-* `agentic-planner-core` [ADR-0011](https://github.com/LuisArteaga/agentic-planner-core/blob/main/docs/adr/0011-judge-kontext-strategie.md) — the original enclosing-function design for the sister project.
-* `agentic-planner-core` [INC-001](https://github.com/LuisArteaga/agentic-planner-core/blob/main/docs/post-mortems/INC-001-judge-false-positive-ip-rendering.md) — the false-positive post-mortem that motivated the design.
+* [Graphite — "How much context do AI code reviews need?"](https://graphite.com/guides/ai-code-review-context-full-repo-vs-diff) — recommends hybrid "diff + relevant slices" strategy capturing ~80–90% of needed context.
+* [Tencent — "Reducing False Positives in Static Bug Detection with LLMs" (arXiv)](https://arxiv.org/html/2601.18844v1) — hybrid LLM + static analysis eliminates 94–98% of false positives.
 * [ADR-0017: tree-sitter-language-pack for Structural Outlines](./0017-tree-sitter-language-pack-for-structural-outlines.md) — the tree-sitter dependency decision this enrichment builds on.
 * [ADR-0014: PR Verification and LLM Judge Review Integration](./0014-pr-verification-and-llm-judge-review-integration.md) — the merge gate this enrichment improves.
 * [ADR-0019: Combined PR Review Body with Hidden Verdict Block](./0019-combined-pr-review-body-with-hidden-verdict-block.md) — the verdict contract this enrichment is transparent to.

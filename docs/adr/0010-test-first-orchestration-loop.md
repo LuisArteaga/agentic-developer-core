@@ -1,7 +1,7 @@
 # ADR 0010: Test-First Orchestration Loop with Test-Writer Node
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 In our current orchestrator pipeline design ([PRD.md](./../../PRD.md) §1 & [ADR-0009](./0009-pure-python-langgraph-orchestrator.md)), the workflow transitions from planning straight to execution (Worker / Execute Node). The Worker is responsible for implementing code changes and verifying them during the subsequent Verify Node.
