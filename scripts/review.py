@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import datetime
@@ -7,7 +8,7 @@ import urllib.error
 import subprocess
 import tempfile
 import time
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 # Add project root and scripts dir to sys.path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -203,6 +204,8 @@ SYSTEM_PROMPT_SECURITY = (
 )
 
 MAX_DIFF_CHARS = 250000
+
+BATCH_BUDGET_CHARS = 200000
 
 EMPTY_CONTENT_INSTRUCTION = (
     "\n\nYour previous response was empty. Please provide a verdict "
@@ -578,6 +581,137 @@ def truncate_diff(diff: str) -> str:
     return diff
 
 
+def _get_batch_budget() -> int:
+    """Resolve the per-batch character budget, overridable via env var."""
+    return int(os.getenv("REVIEW_BATCH_BUDGET_CHARS", str(BATCH_BUDGET_CHARS)))
+
+
+def clip_chunk(chunk: str, budget: int) -> str:
+    """Clip a single file's diff chunk to *budget* chars, appending a note when
+    clipped. The note instructs the judge to return NEEDS REVIEW if it cannot
+    fully evaluate the visible portion — preserving the strict-on-truncation
+    semantics from the original ``truncate_diff`` (ADR-0023).
+    """
+    if len(chunk) > budget:
+        return (
+            chunk[:budget]
+            + f"\n\n[NOTE: diff truncated to {budget} chars due to context limits. Evaluate the visible portion; return NEEDS REVIEW if you cannot fully evaluate.]"
+        )
+    return chunk
+
+
+# Regex to detect the start of a per-file section in a unified diff.
+# Lines look like: "diff --git a/foo.py b/foo.py"
+_DIFF_FILE_HEADER_RE = re.compile(r"^diff --git ", re.MULTILINE)
+
+
+def split_diff_by_file(diff: str) -> List[Tuple[str, str]]:
+    """Split a unified ``git diff`` string into per-file sections.
+
+    Returns a list of ``(filename, file_diff_section)`` pairs preserving the
+    natural order of the diff. Each section starts at the ``diff --git`` line
+    and includes all subsequent lines until the next ``diff --git`` or end of
+    string.
+
+    Edge cases:
+      * Binary files (``Binary files ... differ``) — included as chunks with
+        just the header lines; the judge trivially PASSes.
+      * New/deleted/renamed files — included verbatim.
+      * Leading text before the first ``diff --git`` (empty or whitespace) —
+        discarded.
+    """
+    if not diff or not diff.strip():
+        return []
+
+    # Find all diff --git header positions.
+    positions = [m.start() for m in _DIFF_FILE_HEADER_RE.finditer(diff)]
+    if not positions:
+        # No diff --git lines — treat the whole string as a single chunk with
+        # an empty filename (defensive; shouldn't happen for real git diffs).
+        return [("", diff)]
+
+    chunks: List[Tuple[str, str]] = []
+    for i, pos in enumerate(positions):
+        section = diff[pos : positions[i + 1]] if i + 1 < len(positions) else diff[pos:]
+        section = section.rstrip("\n")
+        if not section:
+            continue
+        filename = _extract_filename_from_section(section)
+        chunks.append((filename, section))
+
+    return chunks
+
+
+def _extract_filename_from_section(section: str) -> str:
+    """Extract the destination filename from a single ``diff --git`` section.
+
+    The ``diff --git a/<path> b/<path>`` line is the first line. We parse the
+    ``b/`` path (the destination), falling back to the ``a/`` path for deleted
+    files where both sides are identical.
+    """
+    first_line = section.split("\n", 1)[0]
+    # Format: "diff --git a/foo.py b/foo.py"
+    # Also handle renames: "diff --git a/old.py b/new.py"
+    tokens = first_line.split(" ")
+    # tokens: ["diff", "--git", "a/foo.py", "b/foo.py"]
+    if len(tokens) >= 4:
+        b_path = tokens[-1]
+        if b_path.startswith("b/"):
+            return b_path[2:]
+        # Deleted files or unusual formats — fall back to a/ path
+        a_path = tokens[-2] if len(tokens) >= 4 else ""
+        if a_path.startswith("a/"):
+            return a_path[2:]
+        return b_path
+    return ""
+
+
+def pack_into_batches(chunks: List[Tuple[str, str]], budget: int) -> List[str]:
+    """Pack per-file chunks into batch strings under a character budget.
+
+    Files are packed in natural order (no size-based sorting, per ADR-0023).
+    A single file exceeding the budget is clipped via :func:`clip_chunk` and
+    becomes its own batch — preserving the strict-on-truncation gate for the
+    pathological single-file case.
+
+    Returns a list of batch strings, each containing one or more file sections
+    joined by newlines. An empty input produces an empty list.
+    """
+    if not chunks:
+        return []
+
+    batches: List[str] = []
+    current_parts: List[str] = []
+    current_len = 0
+
+    for filename, section in chunks:
+        section_len = len(section)
+
+        if section_len > budget:
+            # Flush current batch first.
+            if current_parts:
+                batches.append("\n".join(current_parts))
+                current_parts = []
+                current_len = 0
+            # Clipped single file becomes its own batch.
+            batches.append(clip_chunk(section, budget))
+            continue
+
+        if current_len + section_len + 1 > budget and current_parts:
+            # Starting a new file would overflow — flush current batch.
+            batches.append("\n".join(current_parts))
+            current_parts = [section]
+            current_len = section_len
+        else:
+            current_parts.append(section)
+            current_len += section_len + 1  # +1 for the newline join
+
+    if current_parts:
+        batches.append("\n".join(current_parts))
+
+    return batches
+
+
 JUDGE_KEYS = ["syntax_lint", "test_coverage", "architecture", "security"]
 
 JUDGE_DISPLAY_NAMES = {
@@ -595,9 +729,101 @@ JUDGE_PROMPTS = {
 }
 
 
+def _aggregate_verdicts(
+    chunk_results: List[Tuple[str, str, List[str], Optional[str], bool, str]],
+) -> Tuple[str, str, List[str], Optional[str], bool, Optional[str]]:
+    """Aggregate per-chunk judge results into a single judge verdict.
+
+    Aggregation rules (ADR-0023):
+      - status: FAIL if any chunk FAIL; NEEDS REVIEW if any chunk NEEDS REVIEW
+        (and none FAIL); PASS only if all chunks PASS.
+      - reasoning: concatenate with ``--- Chunk N: <filename> ---`` separators.
+      - findings: concatenate all chunks' findings lists.
+      - used_fallback: True if any chunk used the fallback model.
+      - final_model: the fallback model if any chunk fell back, else the
+        primary model (worst-case reporting so the Fallback Indicator is
+        surfaced when any chunk degraded).
+      - error: first error encountered; subsequent errors appear in reasoning.
+
+    Args:
+        chunk_results: list of (status, reasoning, findings, error,
+            used_fallback, final_model) tuples, one per chunk.
+
+    Returns:
+        Aggregated (status, reasoning, findings, error, used_fallback,
+        final_model) tuple.
+    """
+    if not chunk_results:
+        return "PASS", "", [], None, False, None
+
+    if len(chunk_results) == 1:
+        return chunk_results[0]
+
+    agg_status = "PASS"
+    all_findings: List[str] = []
+    reasoning_parts: List[str] = []
+    first_error = None
+    any_fallback = False
+    fallback_model = None
+    primary_model = None
+
+    for i, (
+        c_status,
+        c_reasoning,
+        c_findings,
+        c_error,
+        c_fallback,
+        c_model,
+    ) in enumerate(chunk_results):
+        if c_status == "FAIL":
+            agg_status = "FAIL"
+        elif c_status == "NEEDS REVIEW" and agg_status != "FAIL":
+            agg_status = "NEEDS REVIEW"
+
+        all_findings.extend(c_findings)
+
+        label = f"--- Chunk {i + 1} ---"
+        if c_reasoning:
+            reasoning_parts.append(f"{label}\n{c_reasoning}")
+        elif c_error:
+            reasoning_parts.append(f"{label}\nException: {c_error}")
+
+        if c_error and first_error is None:
+            first_error = c_error
+
+        if c_fallback:
+            any_fallback = True
+            fallback_model = c_model
+        elif primary_model is None:
+            primary_model = c_model
+
+    final_model = fallback_model if any_fallback else primary_model
+    combined_reasoning = "\n\n".join(reasoning_parts)
+
+    return (
+        agg_status,
+        combined_reasoning,
+        all_findings,
+        first_error,
+        any_fallback,
+        final_model,
+    )
+
+
 def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
     """Runs a single judge evaluation, returning (status, reasoning, findings,
     error, used_fallback, final_model).
+
+    Evaluation path (ADR-0023):
+      1. **Empty diff** → short-circuit to PASS, no LLM call.
+      2. **Fast path** (diff ≤ batch budget) → single LLM call, no splitting,
+         no aggregation. Zero behavioral change for normal PRs.
+      3. **Multi-batch path** (diff > budget) → split per-file, pack into
+         batches under the budget, one LLM call per batch, aggregate verdicts.
+
+    Each chunk receives the full ADR-0021 retry/fallback treatment via
+    ``llm_caller``. Aggregation: FAIL in any chunk → judge FAIL; any NEEDS
+    REVIEW → judge NEEDS REVIEW; all PASS → judge PASS.
 
     status is normalized to uppercase ('PASS', 'FAIL', 'NEEDS REVIEW').
     On an exception the judge returns 'NEEDS REVIEW' with the error captured.
@@ -610,46 +836,126 @@ def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
         span.set_attribute(LLM_MODEL_NAME, cfg["model"])
         span.set_attribute("eval.dimension", judge_key)
 
-        reasoning = ""
-        findings: List[str] = []
-        error = None
-        status = "NEEDS REVIEW"
-        used_fallback = False
-        final_model = cfg["model"]
+        budget = _get_batch_budget()
 
-        try:
-            raw_resp, metadata = llm_caller(judge_key, prompt, diff, api_key)
-            used_fallback = metadata.get("used_fallback", False)
-            final_model = metadata.get("final_model", cfg["model"])
-            verdict, reasoning, findings = evaluate_response(raw_resp)
-            if verdict == "Pass":
-                status = "PASS"
-            elif verdict == "Fail":
-                status = "FAIL"
-            else:
-                status = "NEEDS REVIEW"
-        except Exception as e:
-            log(f"[ERR] Judge {judge_key} failed: {e}")
-            status = "NEEDS REVIEW"
-            error = str(e)
-            reasoning = f"Exception encountered: {e}"
-            span.record_exception(e)
+        # 1. Empty diff — short-circuit to PASS.
+        if not diff or not diff.strip():
+            span.set_attribute("eval.chunk_count", 0)
+            span.set_attribute("eval.diff_total_chars", 0)
+            span.set_attribute("eval.verdict", "PASS")
+            span.set_attribute("eval.findings_count", 0)
+            span.set_attribute("used_fallback", False)
+            span.set_attribute("final_model", cfg["model"])
+            span.set_status(trace.Status(trace.StatusCode.OK))
+            return "PASS", "", [], None, False, cfg["model"]
 
-        span.set_attribute("eval.verdict", status)
-        span.set_attribute("eval.findings_count", len(findings))
-        span.set_attribute("used_fallback", used_fallback)
-        span.set_attribute("final_model", final_model)
-        status_code = (
-            trace.StatusCode.OK if status == "PASS" else trace.StatusCode.ERROR
-        )
-        span.set_status(
-            trace.Status(
-                status_code,
-                f"Verdict: {status}" if status_code == trace.StatusCode.ERROR else None,
+        # 2. Fast path — diff fits in one batch, no splitting.
+        if len(diff) <= budget:
+            span.set_attribute("eval.chunk_count", 1)
+            span.set_attribute("eval.diff_total_chars", len(diff))
+            status, reasoning, findings, error, used_fallback, final_model = (
+                _run_single_chunk(
+                    judge_key,
+                    prompt,
+                    diff,
+                    api_key,
+                    llm_caller,
+                    span,
+                    cfg["model"],
+                )
             )
+            _set_judge_span_attributes(
+                span, status, findings, used_fallback, final_model
+            )
+            return status, reasoning, findings, error, used_fallback, final_model
+
+        # 3. Multi-batch path — split per-file, pack, iterate, aggregate.
+        chunks = split_diff_by_file(diff)
+        batches = pack_into_batches(chunks, budget)
+
+        span.set_attribute("eval.chunk_count", len(batches))
+        span.set_attribute("eval.diff_total_chars", len(diff))
+
+        log(
+            f"[INFO] Judge {judge_key}: multi-batch path, "
+            f"{len(chunks)} files → {len(batches)} batches (budget={budget})"
         )
 
+        chunk_results: List[Tuple[str, str, List[str], Optional[str], bool, str]] = []
+        for batch in batches:
+            result = _run_single_chunk(
+                judge_key,
+                prompt,
+                batch,
+                api_key,
+                llm_caller,
+                span,
+                cfg["model"],
+            )
+            chunk_results.append(result)
+
+        status, reasoning, findings, error, used_fallback, final_model = (
+            _aggregate_verdicts(chunk_results)
+        )
+        _set_judge_span_attributes(span, status, findings, used_fallback, final_model)
         return status, reasoning, findings, error, used_fallback, final_model
+
+
+def _run_single_chunk(
+    judge_key: str,
+    prompt: str,
+    chunk_diff: str,
+    api_key: str,
+    llm_caller,
+    span,
+    default_model: str,
+) -> Tuple[str, str, List[str], Optional[str], bool, str]:
+    """Evaluate a single diff chunk via ``llm_caller`` and return a result tuple.
+
+    Catches exceptions and converts them to a NEEDS REVIEW verdict with the
+    error captured, mirroring the original ``run_judge`` error handling.
+    """
+    reasoning = ""
+    findings: List[str] = []
+    error = None
+    status = "NEEDS REVIEW"
+    used_fallback = False
+    final_model = default_model
+
+    try:
+        raw_resp, metadata = llm_caller(judge_key, prompt, chunk_diff, api_key)
+        used_fallback = metadata.get("used_fallback", False)
+        final_model = metadata.get("final_model", default_model)
+        verdict, reasoning, findings = evaluate_response(raw_resp)
+        if verdict == "Pass":
+            status = "PASS"
+        elif verdict == "Fail":
+            status = "FAIL"
+        else:
+            status = "NEEDS REVIEW"
+    except Exception as e:
+        log(f"[ERR] Judge {judge_key} chunk failed: {e}")
+        status = "NEEDS REVIEW"
+        error = str(e)
+        reasoning = f"Exception encountered: {e}"
+        span.record_exception(e)
+
+    return status, reasoning, findings, error, used_fallback, final_model
+
+
+def _set_judge_span_attributes(span, status, findings, used_fallback, final_model):
+    """Set the common span attributes for a judge evaluation."""
+    span.set_attribute("eval.verdict", status)
+    span.set_attribute("eval.findings_count", len(findings))
+    span.set_attribute("used_fallback", used_fallback)
+    span.set_attribute("final_model", final_model)
+    status_code = trace.StatusCode.OK if status == "PASS" else trace.StatusCode.ERROR
+    span.set_status(
+        trace.Status(
+            status_code,
+            f"Verdict: {status}" if status_code == trace.StatusCode.ERROR else None,
+        )
+    )
 
 
 def build_review_body(judges_data: dict) -> str:
@@ -757,7 +1063,6 @@ def main():
     os.environ["GH_TOKEN"] = token
 
     diff = sys.stdin.read()
-    diff = truncate_diff(diff)
     log(f"[INFO] Diff length: {len(diff)}")
 
     tracer = get_tracer()
