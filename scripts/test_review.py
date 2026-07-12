@@ -166,30 +166,149 @@ class BuildReviewBodyTests(unittest.TestCase):
             self.assertIn(f"{key}: PASS\n", body)
 
 
-class TruncateDiffTests(unittest.TestCase):
-    def test_truncate_diff_under_cap(self):
-        """AC: short diff unchanged."""
-        diff = "short diff content"
-        self.assertEqual(review.truncate_diff(diff), diff)
+class ClipChunkTests(unittest.TestCase):
+    def test_clip_chunk_under_budget_unchanged(self):
+        """AC: chunk under budget is returned unchanged."""
+        chunk = "short chunk content"
+        self.assertEqual(review.clip_chunk(chunk, 1000), chunk)
 
-    def test_truncate_diff_over_cap(self):
-        """AC: diff > MAX_DIFF_CHARS chars truncated with NOTE appended."""
-        diff = "x" * (review.MAX_DIFF_CHARS + 500)
-        result = review.truncate_diff(diff)
-        expected_note = (
-            f"\n\n[NOTE: diff truncated to {review.MAX_DIFF_CHARS} chars due to context limits."
-            " Evaluate the visible portion; return NEEDS REVIEW if you cannot fully evaluate.]"
+    def test_clip_chunk_over_budget_appends_note(self):
+        """AC: chunk > budget chars clipped with NOTE appended."""
+        budget = 100
+        chunk = "x" * (budget + 50)
+        result = review.clip_chunk(chunk, budget)
+        self.assertTrue(result.startswith("x" * budget))
+        self.assertIn(f"[NOTE: diff truncated to {budget} chars", result)
+        self.assertIn("return NEEDS REVIEW if you cannot fully evaluate", result)
+
+
+class SplitDiffByFileTests(unittest.TestCase):
+    def test_empty_diff_returns_empty_list(self):
+        """AC: empty or whitespace-only diff → empty list."""
+        self.assertEqual(review.split_diff_by_file(""), [])
+        self.assertEqual(review.split_diff_by_file("   \n  "), [])
+
+    def test_single_file_diff(self):
+        """AC: single file diff → one (filename, section) pair."""
+        diff = (
+            "diff --git a/foo.py b/foo.py\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " line1\n"
+            "+added\n"
+            " line3\n"
         )
-        self.assertEqual(len(result), review.MAX_DIFF_CHARS + len(expected_note))
-        self.assertIn(f"[NOTE: diff truncated to {review.MAX_DIFF_CHARS} chars", result)
+        chunks = review.split_diff_by_file(diff)
+        self.assertEqual(len(chunks), 1)
+        filename, section = chunks[0]
+        self.assertEqual(filename, "foo.py")
+        self.assertIn("diff --git a/foo.py b/foo.py", section)
 
-    def test_truncate_diff_env_override(self):
-        """AC: REVIEW_MAX_DIFF_CHARS=50 truncates at 50."""
-        diff = "y" * 200
-        with patch.dict(os.environ, {"REVIEW_MAX_DIFF_CHARS": "50"}):
-            result = review.truncate_diff(diff)
-        self.assertTrue(result.startswith("y" * 50))
-        self.assertIn("[NOTE: diff truncated to 50 chars", result)
+    def test_multi_file_diff_preserves_order(self):
+        """AC: multi-file diff → chunks in natural git diff order."""
+        diff = (
+            "diff --git a/alpha.py b/alpha.py\n"
+            "--- a/alpha.py\n"
+            "+++ b/alpha.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+            "diff --git a/beta.py b/beta.py\n"
+            "--- a/beta.py\n"
+            "+++ b/beta.py\n"
+            "@@ -1 +1 @@\n"
+            "-x\n"
+            "+y\n"
+        )
+        chunks = review.split_diff_by_file(diff)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0][0], "alpha.py")
+        self.assertEqual(chunks[1][0], "beta.py")
+
+    def test_renamed_file_extracts_destination(self):
+        """AC: renamed file → destination filename (b/ path)."""
+        diff = (
+            "diff --git a/old_name.py b/new_name.py\n"
+            "rename from old_name.py\n"
+            "rename to new_name.py\n"
+            "@@ -1 +1 @@\n"
+            "-x\n"
+            "+y\n"
+        )
+        chunks = review.split_diff_by_file(diff)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0][0], "new_name.py")
+
+    def test_new_file_mode(self):
+        """AC: new file mode → included as a chunk with correct filename."""
+        diff = (
+            "diff --git a/new_file.py b/new_file.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/new_file.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+line1\n"
+            "+line2\n"
+        )
+        chunks = review.split_diff_by_file(diff)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0][0], "new_file.py")
+
+
+class PackIntoBatchesTests(unittest.TestCase):
+    def test_empty_chunks_returns_empty_list(self):
+        """AC: no chunks → no batches."""
+        self.assertEqual(review.pack_into_batches([], 1000), [])
+
+    def test_single_chunk_under_budget_one_batch(self):
+        """AC: single chunk under budget → one batch."""
+        chunks = [("foo.py", "diff --git ...")]
+        batches = review.pack_into_batches(chunks, 1000)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0], "diff --git ...")
+
+    def test_multiple_small_files_pack_into_one_batch(self):
+        """AC: multiple small files fit in one batch."""
+        chunks = [
+            ("a.py", "section_a"),
+            ("b.py", "section_b"),
+        ]
+        batches = review.pack_into_batches(chunks, 1000)
+        self.assertEqual(len(batches), 1)
+        self.assertIn("section_a", batches[0])
+        self.assertIn("section_b", batches[0])
+
+    def test_overflow_creates_new_batch(self):
+        """AC: adding a file that overflows starts a new batch."""
+        chunks = [
+            ("a.py", "x" * 60),
+            ("b.py", "x" * 60),  # 60 + 1 + 60 = 121 > 100
+        ]
+        batches = review.pack_into_batches(chunks, 100)
+        self.assertEqual(len(batches), 2)
+
+    def test_oversized_single_file_clipped(self):
+        """AC: a single file exceeding budget is clipped and gets its own batch."""
+        big_section = "x" * 200
+        chunks = [("big.py", big_section)]
+        batches = review.pack_into_batches(chunks, 100)
+        self.assertEqual(len(batches), 1)
+        self.assertIn("[NOTE: diff truncated to 100 chars", batches[0])
+
+    def test_oversized_file_flushes_current_batch(self):
+        """AC: oversized file flushes the in-progress batch before clipping."""
+        chunks = [
+            ("a.py", "small"),
+            ("big.py", "x" * 200),
+            ("b.py", "small2"),
+        ]
+        batches = review.pack_into_batches(chunks, 100)
+        # batch 1: "small", batch 2: clipped big, batch 3: "small2"
+        self.assertEqual(len(batches), 3)
+        self.assertEqual(batches[0], "small")
+        self.assertIn("[NOTE: diff truncated", batches[1])
+        self.assertEqual(batches[2], "small2")
 
 
 class ProviderPayloadTests(unittest.TestCase):
@@ -292,6 +411,205 @@ class RunJudgeTests(unittest.TestCase):
         self.assertEqual(status, "PASS")
         self.assertTrue(used_fb)
         self.assertEqual(final_m, "fallback-model")
+
+    def test_run_judge_empty_diff_short_circuits_pass(self):
+        """AC: empty diff → PASS without LLM call."""
+
+        def never_called(judge_key, prompt, diff, api_key):
+            raise AssertionError("LLM caller should not be invoked for empty diff")
+
+        status, reasoning, findings, error, used_fb, final_m = review.run_judge(
+            "security",
+            review.SYSTEM_PROMPT_SECURITY,
+            "",
+            "key",
+            llm_caller=never_called,
+        )
+        self.assertEqual(status, "PASS")
+        self.assertEqual(findings, [])
+        self.assertIsNone(error)
+        self.assertFalse(used_fb)
+
+    def test_run_judge_fast_path_single_call(self):
+        """AC: diff under budget → one LLM call (fast path), no aggregation."""
+        call_count = [0]
+
+        def passing_caller(judge_key, prompt, diff, api_key):
+            call_count[0] += 1
+            return self._build_llm_response(
+                "<reasoning>r</reasoning><findings></findings>"
+            ), {"used_fallback": False, "final_model": "m", "attempt_count": 1}
+
+        status, _, findings, error, _, _ = review.run_judge(
+            "syntax_lint",
+            review.SYSTEM_PROMPT_SYNTAX_LINT,
+            "short diff",
+            "key",
+            llm_caller=passing_caller,
+        )
+        self.assertEqual(status, "PASS")
+        self.assertEqual(call_count[0], 1)
+
+    def test_run_judge_multi_batch_all_pass_aggregates_pass(self):
+        """AC: multi-batch with all chunks PASS → judge PASS."""
+        with patch.dict(os.environ, {"REVIEW_BATCH_BUDGET_CHARS": "50"}):
+            diff = (
+                "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+                "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n-x\n+y\n"
+            )
+
+            def passing_caller(judge_key, prompt, diff, api_key):
+                return self._build_llm_response(
+                    "<reasoning>r</reasoning><findings></findings>"
+                ), {"used_fallback": False, "final_model": "m", "attempt_count": 1}
+
+            status, _, findings, error, _, _ = review.run_judge(
+                "syntax_lint",
+                review.SYSTEM_PROMPT_SYNTAX_LINT,
+                diff,
+                "key",
+                llm_caller=passing_caller,
+            )
+            self.assertEqual(status, "PASS")
+            self.assertEqual(findings, [])
+            self.assertIsNone(error)
+
+    def test_run_judge_multi_batch_one_fail_aggregates_fail(self):
+        """AC: multi-batch with one chunk FAIL → judge FAIL, findings concatenated."""
+        with patch.dict(os.environ, {"REVIEW_BATCH_BUDGET_CHARS": "50"}):
+            diff = (
+                "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+                "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n-x\n+y\n"
+            )
+            responses = [
+                self._build_llm_response(
+                    "<reasoning>ok</reasoning><findings></findings>"
+                ),
+                self._build_llm_response(
+                    "<reasoning>bad</reasoning><findings>\n"
+                    '{"severity": "bug", "message": "issue found"}\n'
+                    "</findings>"
+                ),
+            ]
+            call_idx = [0]
+
+            def mixed_caller(judge_key, prompt, diff, api_key):
+                idx = min(call_idx[0], len(responses) - 1)
+                call_idx[0] += 1
+                return responses[idx], {
+                    "used_fallback": False,
+                    "final_model": "m",
+                    "attempt_count": 1,
+                }
+
+            status, _, findings, error, _, _ = review.run_judge(
+                "test_coverage",
+                review.SYSTEM_PROMPT_TEST_COVERAGE,
+                diff,
+                "key",
+                llm_caller=mixed_caller,
+            )
+            self.assertEqual(status, "FAIL")
+            self.assertEqual(len(findings), 1)
+            self.assertIn("issue found", findings[0])
+
+    def test_run_judge_multi_batch_one_needs_review_aggregates_needs_review(self):
+        """AC: multi-batch with one chunk NEEDS REVIEW → judge NEEDS REVIEW."""
+        with patch.dict(os.environ, {"REVIEW_BATCH_BUDGET_CHARS": "50"}):
+            diff = (
+                "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+                "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n-x\n+y\n"
+            )
+            responses = [
+                self._build_llm_response(
+                    "<reasoning>ok</reasoning><findings></findings>"
+                ),
+                self._build_llm_response(""),  # empty → NEEDS REVIEW
+            ]
+            call_idx = [0]
+
+            def mixed_caller(judge_key, prompt, diff, api_key):
+                idx = min(call_idx[0], len(responses) - 1)
+                call_idx[0] += 1
+                return responses[idx], {
+                    "used_fallback": False,
+                    "final_model": "m",
+                    "attempt_count": 1,
+                }
+
+            status, _, findings, error, _, _ = review.run_judge(
+                "security",
+                review.SYSTEM_PROMPT_SECURITY,
+                diff,
+                "key",
+                llm_caller=mixed_caller,
+            )
+            self.assertEqual(status, "NEEDS REVIEW")
+
+    def test_run_judge_multi_batch_one_exception_aggregates_needs_review(self):
+        """AC: multi-batch with one chunk raising → judge NEEDS REVIEW with error."""
+        with patch.dict(os.environ, {"REVIEW_BATCH_BUDGET_CHARS": "50"}):
+            diff = (
+                "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+                "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n-x\n+y\n"
+            )
+            call_idx = [0]
+
+            def mixed_caller(judge_key, prompt, diff, api_key):
+                call_idx[0] += 1
+                if call_idx[0] == 1:
+                    return self._build_llm_response(
+                        "<reasoning>ok</reasoning><findings></findings>"
+                    ), {"used_fallback": False, "final_model": "m", "attempt_count": 1}
+                raise RuntimeError("chunk 2 failed")
+
+            status, _, findings, error, _, _ = review.run_judge(
+                "architecture",
+                review.SYSTEM_PROMPT_ARCH,
+                diff,
+                "key",
+                llm_caller=mixed_caller,
+            )
+            self.assertEqual(status, "NEEDS REVIEW")
+            self.assertIsNotNone(error)
+            self.assertIn("chunk 2 failed", error)
+
+    def test_run_judge_multi_batch_fallback_propagates(self):
+        """AC: any chunk using fallback → used_fallback=True, final_model=fallback."""
+        with patch.dict(os.environ, {"REVIEW_BATCH_BUDGET_CHARS": "50"}):
+            diff = (
+                "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+                "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n-x\n+y\n"
+            )
+            call_idx = [0]
+
+            def mixed_caller(judge_key, prompt, diff, api_key):
+                call_idx[0] += 1
+                if call_idx[0] == 1:
+                    return self._build_llm_response(
+                        "<reasoning>r</reasoning><findings></findings>"
+                    ), {
+                        "used_fallback": False,
+                        "final_model": "primary",
+                        "attempt_count": 1,
+                    }
+                return self._build_llm_response(
+                    "<reasoning>r</reasoning><findings></findings>"
+                ), {
+                    "used_fallback": True,
+                    "final_model": "fallback-m",
+                    "attempt_count": 3,
+                }
+
+            status, _, _, _, used_fb, final_m = review.run_judge(
+                "security",
+                review.SYSTEM_PROMPT_SECURITY,
+                diff,
+                "key",
+                llm_caller=mixed_caller,
+            )
+            self.assertTrue(used_fb)
+            self.assertEqual(final_m, "fallback-m")
 
 
 class EmptyContentHelperTests(unittest.TestCase):
