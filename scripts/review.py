@@ -203,8 +203,6 @@ SYSTEM_PROMPT_SECURITY = (
     "</findings>"
 )
 
-MAX_DIFF_CHARS = 250000
-
 BATCH_BUDGET_CHARS = 200000
 
 EMPTY_CONTENT_INSTRUCTION = (
@@ -568,17 +566,6 @@ def load_architecture_context(workspace_dir: str) -> str:
         )
 
     return "\n".join(context_lines)
-
-
-def truncate_diff(diff: str) -> str:
-    """Truncates the diff to REVIEW_MAX_DIFF_CHARS chars, appending a note when truncated."""
-    max_chars = int(os.getenv("REVIEW_MAX_DIFF_CHARS", str(MAX_DIFF_CHARS)))
-    if len(diff) > max_chars:
-        return (
-            diff[:max_chars]
-            + f"\n\n[NOTE: diff truncated to {max_chars} chars due to context limits. Evaluate the visible portion; return NEEDS REVIEW if you cannot fully evaluate.]"
-        )
-    return diff
 
 
 def _get_batch_budget() -> int:
