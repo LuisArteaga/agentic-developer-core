@@ -34,7 +34,7 @@ This is hard to reverse because the contract couples two independently-deployed 
 We chose **Option 3**.
 
 `scripts/review.py` posts exactly one GitHub review per CI run. The body contains:
-1. A human-readable summary table and per-judge detail sections (mirroring `agentic-planner-core`'s report shape), for human reviewers.
+1. A human-readable summary table and per-judge detail sections, for human reviewers.
 2. A hidden HTML-comment verdict block of the form:
    ```
    <!-- llm-pr-review-verdicts
@@ -62,9 +62,10 @@ This decouples presentation from parsing: the visible table may evolve (emoji, c
 
 ## Note on Fail-Fast
 
-`agentic-planner-core` skips `test_coverage`, `architecture`, and `security` when `syntax_lint` returns `FAIL` (a cost optimisation). We deliberately **do not** adopt fail-fast: the issue's edge cases presuppose all four judges always run ("each judge is invoked as a separate LLM call"; "LLM call failure for any judge returns NEEDS REVIEW"), and a `syntax_lint` `FAIL` already blocks the merge regardless of the other judges. There is no `SKIPPED` verdict state in this repo's contract.
+A cost-optimisation strategy would skip `test_coverage`, `architecture`, and `security` when `syntax_lint` returns `FAIL`. We deliberately **do not** adopt fail-fast: the issue's edge cases presuppose all four judges always run ("each judge is invoked as a separate LLM call"; "LLM call failure for any judge returns NEEDS REVIEW"), and a `syntax_lint` `FAIL` already blocks the merge regardless of the other judges. There is no `SKIPPED` verdict state in this repo's contract. Running all four judges on every cycle ensures the Worker receives complete feedback across all dimensions in a single retry, rather than fixing one failure at a time across multiple iterations.
 
 ## Inspiration & References
 * [ADR-0014: PR Verification and LLM Judge Review Integration](./0014-pr-verification-and-llm-judge-review-integration.md) — the commit-timestamp review alignment this decision preserves and simplifies.
 * [ADR-0018: Flat Factory.json Schema](./0018-flat-factory-json-schema-over-grouped-node-taxonomy.md) — the per-node model routing that makes per-judge model selection a flat-key lookup.
-* `agentic-planner-core/scripts/review.py` — reference shape of the combined human-readable summary report (posting only; planner has no `merge_node`).
+* **GitHub Community Discussion #27939** — "Ability to add custom metadata to pull requests": documents HTML comments in PR bodies as a known community workaround for GitHub's lack of a native metadata API.
+* **GitHub REST API — Reviews endpoint** ([docs](https://docs.github.com/en/rest/pulls/reviews)): confirms the review body is a free-text field fully under writer/reader control, including HTML comments.
