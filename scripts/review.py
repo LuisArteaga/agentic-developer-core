@@ -204,6 +204,11 @@ SYSTEM_PROMPT_SECURITY = (
 
 MAX_DIFF_CHARS = 250000
 
+EMPTY_CONTENT_INSTRUCTION = (
+    "\n\nYour previous response was empty. Please provide a verdict "
+    "with <reasoning> and <findings> tags."
+)
+
 
 def run_command(cmd, env=None):
     """Runs a shell command and returns code, stdout, stderr."""
@@ -256,13 +261,72 @@ def call_openrouter_api(
         return response.status, response.read().decode("utf-8")
 
 
+def _call_with_api_retry(model, messages, api_key, routing, temperature, options):
+    """Single OpenRouter call with 2-attempt API-error retry and structural
+    validation.
+
+    Returns the raw response body string on success.
+    Raises Exception on API-level failure after retries.
+    Does NOT check for empty content — that is the caller's responsibility.
+    """
+    last_error = ""
+    for attempt in range(2):
+        try:
+            status, body = call_openrouter_api(
+                model,
+                messages,
+                api_key,
+                routing=routing,
+                temperature=temperature,
+                options=options,
+            )
+            parsed_body = json.loads(body, strict=False)
+            if "error" in parsed_body:
+                err = parsed_body["error"]
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                raise Exception(f"OpenRouter API error: {msg}")
+            elif "choices" not in parsed_body or not parsed_body["choices"]:
+                raise Exception("OpenRouter response missing choices block")
+            return body
+        except Exception as e:
+            last_error = str(e)
+            log(f"[WARN] OpenRouter attempt {attempt + 1} failed: {e}")
+            if attempt == 0:
+                time.sleep(3)
+                continue
+            raise Exception(
+                f"LLM review failed after retries. Last error: {last_error}"
+            )
+
+
+def _is_empty_content(raw_response: str) -> bool:
+    """Check if the response content is empty or whitespace-only."""
+    data = json.loads(raw_response, strict=False)
+    content = data["choices"][0]["message"]["content"]
+    return not content or not content.strip()
+
+
 def call_llm_for_review(judge_key, system_prompt, diff, api_key):
-    """Resolves config for judge_key, wraps OpenRouter API call in a trace span and executes it with retry logic."""
+    """Resolves config for judge_key, wraps OpenRouter API call in a trace span
+    and executes it with layered retry and model fallback for empty content.
+
+    Retry progression (per ADR-0021):
+      1. Primary model, original prompt (2-attempt API-error retry)
+      2. Primary model, explicit-instruction nudge (2-attempt API-error retry)
+      3. Fallback model, original prompt, routing=None, options=None
+         (2-attempt API-error retry) — only if fallback_model is configured
+      4. Fail -> raises Exception (run_judge catches it -> NEEDS REVIEW)
+
+    Returns:
+        (response_body: str, metadata: dict) where metadata is
+        {"used_fallback": bool, "final_model": str, "attempt_count": int}
+    """
     cfg = resolve_model_config(judge_key)
     model = cfg["model"]
     routing = cfg["routing"]
     temperature = cfg["temperature"]
     options = cfg["options"]
+    fallback_model = cfg.get("fallback_model")
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -276,44 +340,50 @@ def call_llm_for_review(judge_key, system_prompt, diff, api_key):
         span.set_attribute(INPUT_VALUE, json.dumps(messages))
         log(f"[INFO] Running judge {judge_key} using model: {model}")
 
-        response_body = ""
-        last_error = ""
+        used_fallback = False
+        final_model = model
+        attempt_count = 0
 
-        for attempt in range(2):
-            try:
-                status, body = call_openrouter_api(
-                    model,
-                    messages,
-                    api_key,
-                    routing=routing,
-                    temperature=temperature,
-                    options=options,
+        # Attempt 1: primary model, original prompt
+        response_body = _call_with_api_retry(
+            model, messages, api_key, routing, temperature, options
+        )
+        attempt_count += 1
+
+        if _is_empty_content(response_body):
+            log(
+                f"[WARN] Judge {judge_key}: empty content from primary model, "
+                f"retrying with explicit instruction"
+            )
+            # Attempt 2: primary model, explicit-instruction nudge
+            nudge_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": diff + EMPTY_CONTENT_INSTRUCTION},
+            ]
+            response_body = _call_with_api_retry(
+                model, nudge_messages, api_key, routing, temperature, options
+            )
+            attempt_count += 1
+
+            if _is_empty_content(response_body) and fallback_model:
+                log(f"[INFO] Judge {judge_key} fell back to model {fallback_model}")
+                # Attempt 3: fallback model, original prompt,
+                # routing=None, options=None, temperature=0.0
+                response_body = _call_with_api_retry(
+                    fallback_model, messages, api_key, None, 0.0, None
                 )
-
-                # Pre-validate structure before considering it OK
-                parsed_body = json.loads(body, strict=False)
-
-                if "error" in parsed_body:
-                    err = parsed_body["error"]
-                    msg = err.get("message") if isinstance(err, dict) else str(err)
-                    raise Exception(f"OpenRouter API error: {msg}")
-                elif "choices" not in parsed_body or not parsed_body["choices"]:
-                    raise Exception("OpenRouter response missing choices block")
-
-                response_body = body
-                break
-            except Exception as e:
-                last_error = str(e)
-                log(f"[WARN] OpenRouter attempt {attempt + 1} failed: {e}")
-                if attempt == 0:
-                    time.sleep(3)
-                    continue
-                raise Exception(
-                    f"LLM review failed after retries. Last error: {last_error}"
-                )
+                attempt_count += 1
+                used_fallback = True
+                final_model = fallback_model
 
         span.set_attribute(OUTPUT_VALUE, response_body)
-        return response_body
+        span.set_attribute("used_fallback", used_fallback)
+        span.set_attribute("final_model", final_model)
+        return response_body, {
+            "used_fallback": used_fallback,
+            "final_model": final_model,
+            "attempt_count": attempt_count,
+        }
 
 
 def submit_github_review(pr_number, action, body_content):
@@ -526,10 +596,12 @@ JUDGE_PROMPTS = {
 
 
 def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
-    """Runs a single judge evaluation, returning (status, reasoning, findings, error).
+    """Runs a single judge evaluation, returning (status, reasoning, findings,
+    error, used_fallback, final_model).
 
     status is normalized to uppercase ('PASS', 'FAIL', 'NEEDS REVIEW').
     On an exception the judge returns 'NEEDS REVIEW' with the error captured.
+    used_fallback and final_model are False/None on error paths.
     """
     tracer = get_tracer()
     with tracer.start_as_current_span(f"{judge_key}_evaluation") as span:
@@ -542,9 +614,13 @@ def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
         findings: List[str] = []
         error = None
         status = "NEEDS REVIEW"
+        used_fallback = False
+        final_model = cfg["model"]
 
         try:
-            raw_resp = llm_caller(judge_key, prompt, diff, api_key)
+            raw_resp, metadata = llm_caller(judge_key, prompt, diff, api_key)
+            used_fallback = metadata.get("used_fallback", False)
+            final_model = metadata.get("final_model", cfg["model"])
             verdict, reasoning, findings = evaluate_response(raw_resp)
             if verdict == "Pass":
                 status = "PASS"
@@ -561,6 +637,8 @@ def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
 
         span.set_attribute("eval.verdict", status)
         span.set_attribute("eval.findings_count", len(findings))
+        span.set_attribute("used_fallback", used_fallback)
+        span.set_attribute("final_model", final_model)
         status_code = (
             trace.StatusCode.OK if status == "PASS" else trace.StatusCode.ERROR
         )
@@ -571,7 +649,7 @@ def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
             )
         )
 
-        return status, reasoning, findings, error
+        return status, reasoning, findings, error, used_fallback, final_model
 
 
 def build_review_body(judges_data: dict) -> str:
@@ -622,6 +700,13 @@ def build_review_body(judges_data: dict) -> str:
         else:
             status_emoji = "⚠️ NEEDS REVIEW"
         report_lines.append(f"* **Status**: {status_emoji}")
+
+        if info.get("used_fallback"):
+            report_lines.append(
+                f"\n> ⚠️ **Fallback Model Used**: This verdict was produced by "
+                f"`{info.get('final_model', 'unknown')}` after the primary model "
+                f"returned empty responses."
+            )
 
         if info["findings"]:
             report_lines.append("\n#### 📝 Detailed Findings:")
@@ -696,6 +781,8 @@ def main():
                 "reasoning": "",
                 "findings": [],
                 "error": None,
+                "used_fallback": False,
+                "final_model": None,
             }
 
         for judge_key in JUDGE_KEYS:
@@ -712,13 +799,15 @@ def main():
                     prompt += "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\nNo specific architecture documentation found. Falling back to default rules."
 
             log(f"[INFO] Running judge: {judge_key}")
-            status, reasoning, findings, error = run_judge(
+            status, reasoning, findings, error, used_fallback, final_model = run_judge(
                 judge_key, prompt, diff, openrouter_api_key
             )
             judge_info["status"] = status
             judge_info["reasoning"] = reasoning
             judge_info["findings"] = findings
             judge_info["error"] = error
+            judge_info["used_fallback"] = used_fallback
+            judge_info["final_model"] = final_model
 
         body = build_review_body(judges_data)
         review_action = (

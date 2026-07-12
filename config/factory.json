@@ -17,22 +17,26 @@
   "syntax_lint": {
     "model": "moonshotai/kimi-k2.7-code",
     "routing": ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"],
-    "temperature": 0.0
+    "temperature": 0.0,
+    "fallback_model": "z-ai/glm-5.2"
   },
   "test_coverage": {
     "model": "moonshotai/kimi-k2.7-code",
     "routing": ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"],
-    "temperature": 0.0
+    "temperature": 0.0,
+    "fallback_model": "z-ai/glm-5.2"
   },
   "architecture": {
     "model": "z-ai/glm-5.2",
     "routing": ["Together", "DeepInfra", "Fireworks", "Parasail", "Inceptron"],
-    "temperature": 0.0
+    "temperature": 0.0,
+    "fallback_model": "deepseek/deepseek-v4-pro"
   },
   "security": {
     "model": "deepseek/deepseek-v4-pro",
     "routing": ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
     "temperature": 0.0,
-    "options": { "thinking": "max" }
+    "options": { "thinking": "max" },
+    "fallback_model": "z-ai/glm-5.2"
   }
 }
