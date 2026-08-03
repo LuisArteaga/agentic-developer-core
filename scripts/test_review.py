@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -309,6 +310,90 @@ class PackIntoBatchesTests(unittest.TestCase):
         self.assertEqual(batches[0], "small")
         self.assertIn("[NOTE: diff truncated", batches[1])
         self.assertEqual(batches[2], "small2")
+
+
+class VerifyPythonSyntaxTests(unittest.TestCase):
+    """Tests for the deterministic py_compile pre-check (ADR-0025)."""
+
+    def setUp(self):
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.test_dir.name).resolve()
+
+    def tearDown(self):
+        self.test_dir.cleanup()
+
+    def _make_file(self, name: str, content: str) -> str:
+        path = self.workspace / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+
+    def _diff_for(self, *filenames: str) -> str:
+        parts = []
+        for fn in filenames:
+            parts.append(
+                f"diff --git a/{fn} b/{fn}\n"
+                f"--- a/{fn}\n"
+                f"+++ b/{fn}\n"
+                f"@@ -1 +1 @@\n"
+                f"-old\n"
+                f"+new\n"
+            )
+        return "".join(parts)
+
+    def test_valid_python_returns_pass(self):
+        """AC: syntactically valid Python files → all_passed=True, no errors."""
+        self._make_file("good.py", "x = 1\n")
+        diff = self._diff_for("good.py")
+        passed, errors, checked = review.verify_python_syntax(str(self.workspace), diff)
+        self.assertTrue(passed)
+        self.assertEqual(errors, [])
+        self.assertEqual(checked, 1)
+
+    def test_syntax_error_returns_fail(self):
+        """AC: file with IndentationError → all_passed=False, error reported."""
+        self._make_file("bad.py", "def foo():\nx = 1\n")
+        diff = self._diff_for("bad.py")
+        passed, errors, checked = review.verify_python_syntax(str(self.workspace), diff)
+        self.assertFalse(passed)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("bad.py", errors[0])
+        self.assertEqual(checked, 1)
+
+    def test_non_python_files_skipped(self):
+        """AC: .json/.md files in diff → files_checked=0, no errors."""
+        diff = self._diff_for("config.json", "readme.md")
+        passed, errors, checked = review.verify_python_syntax(str(self.workspace), diff)
+        self.assertTrue(passed)
+        self.assertEqual(errors, [])
+        self.assertEqual(checked, 0)
+
+    def test_deleted_file_skipped(self):
+        """AC: file not in workspace (deleted) → silently skipped."""
+        diff = self._diff_for("deleted.py")
+        passed, errors, checked = review.verify_python_syntax(str(self.workspace), diff)
+        self.assertTrue(passed)
+        self.assertEqual(errors, [])
+        self.assertEqual(checked, 0)
+
+    def test_mixed_valid_and_invalid(self):
+        """AC: one valid + one invalid → all_passed=False, checked=2."""
+        self._make_file("good.py", "x = 1\n")
+        self._make_file("bad.py", "def foo():\nx = 1\n")
+        diff = self._diff_for("good.py", "bad.py")
+        passed, errors, checked = review.verify_python_syntax(str(self.workspace), diff)
+        self.assertFalse(passed)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("bad.py", errors[0])
+        self.assertEqual(checked, 2)
+
+    def test_nested_path(self):
+        """AC: file in subdirectory → resolved and checked."""
+        self._make_file("orchestrator/nested.py", "def bar():\n    pass\n")
+        diff = self._diff_for("orchestrator/nested.py")
+        passed, errors, checked = review.verify_python_syntax(str(self.workspace), diff)
+        self.assertTrue(passed)
+        self.assertEqual(checked, 1)
 
 
 class ProviderPayloadTests(unittest.TestCase):
