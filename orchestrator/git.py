@@ -1,7 +1,6 @@
 import logging
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("orchestrator.git")
 
@@ -9,13 +8,9 @@ logger = logging.getLogger("orchestrator.git")
 class GitError(Exception):
     """Base exception for all Git operations."""
 
-    pass
-
 
 class NotAGitRepositoryError(GitError):
     """Raised when a Git operation is attempted in a non-repository directory."""
-
-    pass
 
 
 class GitCommandError(GitError):
@@ -33,8 +28,6 @@ class GitCommandError(GitError):
 
 class GitPushConflictError(GitCommandError):
     """Raised when a Git push fails due to conflicts or non-fast-forward updates."""
-
-    pass
 
 
 def _run_git(
@@ -107,7 +100,7 @@ def checkout(repo_dir: Path | str, branch: str, create: bool = False) -> None:
         _run_git(repo_dir, ["checkout", branch])
 
 
-def commit(repo_dir: Path | str, message: str, author: Optional[str] = None) -> bool:
+def commit(repo_dir: Path | str, message: str, author: str | None = None) -> bool:
     """Commits staged changes. If there are no staged changes, returns False without raising an error.
 
     Returns:
@@ -192,7 +185,7 @@ def get_remote_url(repo_dir: Path | str, remote: str = "origin") -> str:
     return result.stdout.strip()
 
 
-def clone(repo_dir: Path | str, github_repo: str, token: Optional[str] = None) -> None:
+def clone(repo_dir: Path | str, github_repo: str, token: str | None = None) -> None:
     """Clones the target GitHub repository into the specified directory.
 
     Utilizes Git's credential helper with an environment variable reference to prevent

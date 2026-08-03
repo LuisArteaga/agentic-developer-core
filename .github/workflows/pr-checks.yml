@@ -59,4 +59,4 @@ jobs:
 
       - name: Run LLM review
         if: always()
-        run: git diff -w origin/main...HEAD | scripts/review.sh
+        run: git diff -w origin/main...HEAD -- . ':(exclude)uv.lock' | scripts/review.sh

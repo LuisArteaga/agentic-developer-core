@@ -9,31 +9,38 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import List, Literal, Optional, Union, cast
+from typing import Literal, cast
 
 from pydantic import BaseModel, Field
 
 from orchestrator import state as state_module
-from orchestrator.state import AgentState
-from orchestrator.config import resolve_model_config, get_chat_model_from_config
+from orchestrator.config import get_chat_model_from_config, resolve_model_config
+from orchestrator.constants import IGNORE_DIRS
 from orchestrator.git import (
-    is_git_repository,
+    add,
     checkout,
     clean,
-    reset_hard,
-    get_remote_url,
     clone,
     commit,
-    push,
     get_commit_time,
-    add,
+    get_remote_url,
+    is_git_repository,
+    push,
+    reset_hard,
 )
+from orchestrator.outline import (
+    OUTLINE_CHAR_CAP,
+    OutlineResult,
+    build_outlines,
+    build_outlines_for_files,
+)
+from orchestrator.path_safety import is_safe_path
+from orchestrator.state import AgentState
 from scripts.telemetry import (
+    end_orchestrator_phase,
     start_orchestrator_loop,
     start_orchestrator_phase,
-    end_orchestrator_phase,
 )
-
 
 logger = logging.getLogger("orchestrator.nodes")
 
@@ -47,8 +54,8 @@ def _safe_telemetry(func, *args, **kwargs):
 
 
 def _github_api_request(
-    method: str, path: str, body: Optional[dict] = None
-) -> Union[dict, list]:
+    method: str, path: str, body: dict | None = None
+) -> dict | list:
     """Helper to make authenticated HTTP requests to the GitHub REST API using urllib."""
     token = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
 
@@ -132,8 +139,7 @@ def _get_github_repository(workspace_path: Path) -> str:
             # Fallback for other formats
             part = url.split(":")[-1]
 
-        if part.endswith(".git"):
-            part = part[:-4]
+        part = part.removesuffix(".git")
         return part
     except Exception as e:
         raise ValueError(
@@ -141,7 +147,7 @@ def _get_github_repository(workspace_path: Path) -> str:
         )
 
 
-def _parse_dependencies(body: Optional[str]) -> list[int]:
+def _parse_dependencies(body: str | None) -> list[int]:
     """Parse the '## Blocked by' section of an issue body and return a list of blocked-by issue numbers."""
     if not body:
         return []
@@ -453,7 +459,7 @@ class PlanningTask(BaseModel):
     description: str = Field(
         description="Clear, unambiguous instruction for what the worker must do."
     )
-    target_files: List[str] = Field(
+    target_files: list[str] = Field(
         description="Project-relative paths of the files to read or modify in this step."
     )
 
@@ -462,60 +468,28 @@ class DevelopmentPlan(BaseModel):
     rationale: str = Field(
         description="High-level architectural reasoning and analysis of the issue."
     )
-    tasks: List[PlanningTask] = Field(
+    tasks: list[PlanningTask] = Field(
         description="The sequential list of structured tasks to execute."
+    )
+    requested_files: list[str] = Field(
+        default_factory=list,
+        description="Files whose full structural outlines are needed to plan accurately. "
+        "Populate this only if outlines were truncated and you need more detail. "
+        "Leave empty if the plan is complete.",
     )
 
 
 def _is_safe_path(path_str: str) -> bool:
-    """Verifies that a path is safe and does not point to sensitive configuration or credential files."""
-    p = Path(path_str)
-    # Reject absolute paths and directory traversal attempts
-    if p.is_absolute() or ".." in p.parts:
-        return False
+    """Verifies that a path is safe and does not point to sensitive configuration or credential files.
 
-    # Set of forbidden file names and directories
-    forbidden_names = {
-        ".env",
-        "id_rsa",
-        "id_dsa",
-        "id_ecdsa",
-        "id_ed25519",
-        "credentials",
-        "passwd",
-        "shadow",
-        "authorized_keys",
-    }
-    forbidden_dirs = {".git", ".venv", ".agent_logs", ".agents", "node_modules"}
-
-    for part in p.parts:
-        # Reject paths going into forbidden directories
-        if part in forbidden_dirs:
-            return False
-        # Reject forbidden filenames (exact or stem/name without extension)
-        part_stem = Path(part).stem
-        if part in forbidden_names or part_stem in forbidden_names:
-            return False
-        # Reject sensitive file extensions
-        if part.endswith((".pem", ".key", ".pkcs12", ".pfx")):
-            return False
-
-    return True
+    Delegates to the centralized implementation in orchestrator.path_safety.
+    """
+    return is_safe_path(path_str)
 
 
 def _get_directory_tree(workspace_path: Path) -> str:
     """Generates a text-based visual tree of the workspace directory, ignoring common build and environment folders."""
-    ignore_dirs = {
-        ".git",
-        ".venv",
-        ".agent_logs",
-        ".agents",
-        "node_modules",
-        "dist",
-        "build",
-        "__pycache__",
-        ".pytest_cache",
-    }
+    ignore_dirs = IGNORE_DIRS
     lines = []
 
     def walk(directory: Path, prefix: str = ""):
@@ -577,8 +551,29 @@ def plan_node(state: AgentState) -> AgentState:
         issue_title = issue_data.get("title", "")
         issue_body = issue_data.get("body", "")
 
-        # 3. Get codebase structure
+        # 3. Get codebase structure (directory tree + structural outlines)
         codebase_structure = _get_directory_tree(workspace_path)
+
+        outlines_budget = max(0, OUTLINE_CHAR_CAP - len(codebase_structure))
+        outline_result: OutlineResult = build_outlines(workspace_path, outlines_budget)
+
+        # Build the codebase + outlines prompt section
+        codebase_section = f"=== CODEBASE STRUCTURE ===\n{codebase_structure}\n\n"
+
+        if outline_result.outlines:
+            codebase_section += (
+                f"=== STRUCTURAL OUTLINES ===\n{outline_result.outlines}\n\n"
+            )
+            if outline_result.truncated_files:
+                truncated_list = "\n".join(
+                    f"- {f}" for f in outline_result.truncated_files
+                )
+                codebase_section += (
+                    f"The following files had outlines truncated due to budget:\n"
+                    f"{truncated_list}\n"
+                    f"If you need the full outline for any of these files to plan accurately, "
+                    f"list them in requested_files.\n\n"
+                )
 
         # 4. Resolve LLM model config (per-node routing per ADR-0018)
         cfg = resolve_model_config("plan")
@@ -602,8 +597,7 @@ def plan_node(state: AgentState) -> AgentState:
             f"=== CLAIMED ISSUE ===\n"
             f"<issue_title>{issue_title}</issue_title>\n"
             f"<issue_body>{issue_body}</issue_body>\n\n"
-            f"=== CODEBASE STRUCTURE ===\n"
-            f"{codebase_structure}\n\n"
+            f"{codebase_section}"
             f"Formulate a structured plan decomposing this issue into sequential tasks. For each task, specify the target "
             f"files that the worker needs to read or modify, the action type (read, patch, verify), and a clear instruction."
         )
@@ -614,7 +608,33 @@ def plan_node(state: AgentState) -> AgentState:
         if not plan_obj or not getattr(plan_obj, "tasks", None):
             raise ValueError("LLM returned an empty or invalid plan.")
 
-        # Validate target files in the generated plan for safety (path traversal / sensitive files)
+        # 7. Plan Detail Request — bounded follow-up (ADR-0024)
+        # If the planner requested outlines for truncated files, fetch them
+        # and re-invoke the LLM once. The second plan replaces the first.
+        if plan_obj.requested_files:
+            logger.info(
+                "Plan Detail Request: fetching outlines for %d files...",
+                len(plan_obj.requested_files),
+            )
+
+            requested_outlines = build_outlines_for_files(
+                workspace_path, plan_obj.requested_files
+            )
+
+            if requested_outlines:
+                prompt += (
+                    f"\n\n=== REQUESTED OUTLINES ===\n{requested_outlines}\n\n"
+                    f"Using the additional outlines above, revise your plan with improved accuracy."
+                )
+                logger.info("Re-invoking LLM with enriched context...")
+                plan_obj = cast(DevelopmentPlan, structured_llm.invoke(prompt))
+
+                if not plan_obj or not getattr(plan_obj, "tasks", None):
+                    raise ValueError(
+                        "LLM returned an empty or invalid plan after Plan Detail Request."
+                    )
+
+        # 8. Validate target files in the generated plan for safety (path traversal / sensitive files)
         for task in plan_obj.tasks:
             for file_path in task.target_files:
                 if not _is_safe_path(file_path):
@@ -622,7 +642,7 @@ def plan_node(state: AgentState) -> AgentState:
                         f"Security Block: Plan contains unsafe or forbidden target path '{file_path}'."
                     )
 
-        # 7. Serialize plan and update state
+        # 9. Serialize plan and update state
         plan_json = plan_obj.model_dump_json(indent=2)
         state["plan"] = plan_json
 
@@ -903,7 +923,7 @@ def pr_node(state: AgentState) -> AgentState:
 
         logger.info("Pushing feature branch '%s' to remote...", branch_name)
         push(workspace_path, branch_name)
-        state["pushed_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        state["pushed_at"] = datetime.datetime.now(datetime.UTC).isoformat()
 
         # 4. Resolve owner/repo and check if a PR already exists
         github_repo = _get_github_repository(workspace_path)

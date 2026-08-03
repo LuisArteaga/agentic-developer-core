@@ -7,8 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator import state as state_module
+from orchestrator.nodes import claim_node, execute_node, plan_node, verify_node
 from orchestrator.state import DEFAULT_STATE
-from orchestrator.nodes import claim_node, plan_node, execute_node, verify_node
 
 
 class TestClaimNode(unittest.TestCase):
@@ -588,6 +588,118 @@ class TestPlanNode(unittest.TestCase):
         self.assertNotIn(".git", tree)
         self.assertNotIn(".venv", tree)
         self.assertNotIn("lib", tree)
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_plan_node_requested_files_triggers_followup(
+        self, mock_github_api, mock_get_chat_model
+    ):
+        """Test that requested_files in the first plan triggers a second LLM call (ADR-0024)."""
+        from orchestrator.nodes import DevelopmentPlan, PlanningTask
+
+        mock_github_api.return_value = {
+            "title": "Refactor module",
+            "body": "Refactor the calculator module.",
+        }
+
+        mock_llm = unittest.mock.MagicMock()
+        mock_structured_llm = unittest.mock.MagicMock()
+        mock_get_chat_model.return_value = mock_llm
+        mock_llm.with_structured_output.return_value = mock_structured_llm
+
+        # First plan requests a file, second plan is the final version
+        first_plan = DevelopmentPlan(
+            rationale="Need more detail.",
+            tasks=[
+                PlanningTask(
+                    step_number=1,
+                    action="read",
+                    description="Read file",
+                    target_files=["schema.py"],
+                )
+            ],
+            requested_files=["src/main.py"],
+        )
+        second_plan = DevelopmentPlan(
+            rationale="Now I have the full picture.",
+            tasks=[
+                PlanningTask(
+                    step_number=1,
+                    action="patch",
+                    description="Patch main.py",
+                    target_files=["src/main.py"],
+                )
+            ],
+        )
+        mock_structured_llm.invoke.side_effect = [first_plan, second_plan]
+
+        # Create the requested file so build_outlines_for_files returns content
+        (self.workspace_dir / "src").mkdir(exist_ok=True)
+        (self.workspace_dir / "src" / "main.py").write_text(
+            "def main() -> None:\n    pass\n", encoding="utf-8"
+        )
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state_module.save(state)
+
+        new_state = plan_node(state)
+
+        # LLM should have been called twice
+        self.assertEqual(mock_structured_llm.invoke.call_count, 2)
+
+        # The second plan should be the one persisted
+        assert new_state["plan"] is not None
+        plan_data = json.loads(new_state["plan"])
+        self.assertEqual(plan_data["rationale"], "Now I have the full picture.")
+        self.assertEqual(plan_data["tasks"][0]["target_files"], ["src/main.py"])
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_plan_node_no_requested_files_no_followup(
+        self, mock_github_api, mock_get_chat_model
+    ):
+        """Test that empty requested_files does not trigger a follow-up call."""
+        from orchestrator.nodes import DevelopmentPlan, PlanningTask
+
+        mock_github_api.return_value = {
+            "title": "Simple fix",
+            "body": "Fix a typo.",
+        }
+
+        mock_llm = unittest.mock.MagicMock()
+        mock_structured_llm = unittest.mock.MagicMock()
+        mock_get_chat_model.return_value = mock_llm
+        mock_llm.with_structured_output.return_value = mock_structured_llm
+
+        mock_plan = DevelopmentPlan(
+            rationale="Simple fix.",
+            tasks=[
+                PlanningTask(
+                    step_number=1,
+                    action="patch",
+                    description="Fix typo",
+                    target_files=["README.md"],
+                )
+            ],
+        )
+        mock_structured_llm.invoke.return_value = mock_plan
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state_module.save(state)
+
+        plan_node(state)
+
+        # LLM should have been called only once
+        self.assertEqual(mock_structured_llm.invoke.call_count, 1)
+
+    def test_development_plan_has_requested_files_field(self):
+        """Test that DevelopmentPlan schema includes requested_files with default empty list."""
+        from orchestrator.nodes import DevelopmentPlan
+
+        plan = DevelopmentPlan(rationale="test", tasks=[])
+        self.assertEqual(plan.requested_files, [])
 
 
 class TestExecuteNode(unittest.TestCase):

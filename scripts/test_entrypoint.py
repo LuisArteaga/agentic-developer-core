@@ -4,8 +4,8 @@
 import os
 import sys
 import unittest
-from unittest.mock import patch, MagicMock
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 # Add scripts directory to path to import entrypoint
 scripts_dir = Path(__file__).resolve().parent

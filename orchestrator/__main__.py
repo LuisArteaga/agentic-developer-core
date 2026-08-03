@@ -1,8 +1,9 @@
 import logging
 import sys
+
 from orchestrator import state as state_module
 from orchestrator.graph import graph
-from scripts.telemetry import init_telemetry, end_orchestrator_loop
+from scripts.telemetry import end_orchestrator_loop, init_telemetry
 
 
 def setup_logging():

@@ -1,17 +1,17 @@
-import os
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.telemetry import (
-    init_telemetry,
-    start_orchestrator_loop,
+    HAS_OTEL,
     end_orchestrator_loop,
-    start_orchestrator_phase,
     end_orchestrator_phase,
     get_agent_logs_dir,
-    HAS_OTEL,
+    init_telemetry,
+    start_orchestrator_loop,
+    start_orchestrator_phase,
 )
 
 
