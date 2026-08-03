@@ -11,7 +11,9 @@ remains the safety net against hallucinated edits.
 
 import logging
 from dataclasses import dataclass, field
-from importlib import resources
+from importlib import (
+    resources,
+)  # nosemgrep: python37-compatibility-importlib2 — project requires Python >=3.12
 from pathlib import Path
 
 from tree_sitter import Language, Node, Query, QueryCursor
@@ -314,9 +316,15 @@ def build_outlines(workspace_path: Path, char_cap: int) -> OutlineResult:
         for rel_path, outline in file_outlines:
             included.append(f"{rel_path}:\n{outline}")
     else:
-        # Drop from the end until we fit
+        # Include files in tree-walk order until budget is exhausted.
+        # Once a file doesn't fit, all remaining files are truncated —
+        # strict tree-walk-order dropping (last-generated dropped first).
         budget = char_cap
+        dropped = False
         for rel_path, outline in file_outlines:
+            if dropped:
+                truncated_files.append(rel_path)
+                continue
             entry = f"{rel_path}:\n{outline}"
             entry_size = len(entry) + 2  # +2 for \n\n separator
             if entry_size <= budget:
@@ -324,11 +332,7 @@ def build_outlines(workspace_path: Path, char_cap: int) -> OutlineResult:
                 budget -= entry_size
             else:
                 truncated_files.append(rel_path)
-        # Remaining files after the first drop are also truncated
-        remaining_start = len(included)
-        for i in range(remaining_start, len(file_outlines)):
-            if file_outlines[i][0] not in truncated_files:
-                truncated_files.append(file_outlines[i][0])
+                dropped = True
 
     outlines_text = "\n\n".join(included)
 
