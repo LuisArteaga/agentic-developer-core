@@ -11,9 +11,7 @@ remains the safety net against hallucinated edits.
 
 import logging
 from dataclasses import dataclass, field
-from importlib import (
-    resources,
-)  # nosemgrep: python37-compatibility-importlib2 — project requires Python >=3.12
+from importlib import resources  # nosemgrep
 from pathlib import Path
 
 from tree_sitter import Language, Node, Query, QueryCursor
@@ -352,6 +350,7 @@ def build_outlines_for_files(workspace_path: Path, file_paths: list[str]) -> str
     (defense-in-depth) in addition to the primary validation in plan_node.
     """
     included: list[str] = []
+    workspace_resolved = workspace_path.resolve()
 
     for rel_path in file_paths:
         if not is_safe_path(rel_path):
@@ -361,6 +360,17 @@ def build_outlines_for_files(workspace_path: Path, file_paths: list[str]) -> str
         full_path = workspace_path / rel_path
         if not full_path.exists() or not full_path.is_file():
             logger.debug("Skipping non-existent file in outline request: %s", rel_path)
+            continue
+
+        # Resolve symlinks and verify the real path stays within the workspace
+        # (defense against symlink-based workspace escape via prompt injection)
+        try:
+            resolved = full_path.resolve()
+            resolved.relative_to(workspace_resolved)
+        except (ValueError, OSError):
+            logger.warning(
+                "Skipping path outside workspace in outline request: %s", rel_path
+            )
             continue
 
         ext = full_path.suffix
