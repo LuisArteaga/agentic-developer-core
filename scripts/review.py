@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import py_compile
 import re
 import subprocess
 import sys
@@ -699,6 +700,37 @@ def pack_into_batches(chunks: list[tuple[str, str]], budget: int) -> list[str]:
     return batches
 
 
+def verify_python_syntax(workspace_dir: str, diff: str) -> tuple[bool, list[str], int]:
+    """Deterministically verify Python syntax of all modified .py files.
+
+    Runs ``py_compile`` on each modified Python file found in the diff, using
+    the workspace checkout. Returns ``(all_passed, errors, files_checked)``.
+
+    Files that don't exist in the workspace (deleted files) are silently
+    skipped. Non-Python files are not checked.
+    """
+    chunks = split_diff_by_file(diff)
+    errors: list[str] = []
+    files_checked = 0
+
+    for filename, _ in chunks:
+        if not filename.endswith(".py"):
+            continue
+
+        filepath = os.path.join(workspace_dir, filename)
+        if not os.path.isfile(filepath):
+            continue
+
+        try:
+            py_compile.compile(filepath, doraise=True)
+            files_checked += 1
+        except py_compile.PyCompileError as e:
+            files_checked += 1
+            errors.append(f"{filename}: {e}")
+
+    return (len(errors) == 0, errors, files_checked)
+
+
 JUDGE_KEYS = ["syntax_lint", "test_coverage", "architecture", "security"]
 
 JUDGE_DISPLAY_NAMES = {
@@ -1077,11 +1109,40 @@ def main():
                 "final_model": None,
             }
 
+        workspace_dir = os.getenv("GITHUB_WORKSPACE", ".")
+        syntax_passed, syntax_errors, syntax_checked = verify_python_syntax(
+            workspace_dir, diff
+        )
+        if syntax_checked > 0:
+            log(
+                f"[INFO] Deterministic syntax check: {syntax_checked} Python files "
+                f"checked, {'all passed' if syntax_passed else f'{len(syntax_errors)} errors'}"
+            )
+
         for judge_key in JUDGE_KEYS:
             judge_info = judges_data[judge_key]
             prompt = judge_info["prompt"]
+            if judge_key == "syntax_lint" and syntax_checked > 0:
+                if syntax_passed:
+                    prompt += (
+                        "\n\n=== DETERMINISTIC SYNTAX VERIFICATION ===\n"
+                        "All modified Python files have been programmatically verified "
+                        "via py_compile.\n"
+                        "Q1 (Syntax Validation) is PASS — do NOT flag syntax, "
+                        "indentation, or compilation issues.\n"
+                        "Focus your review on Q2 (JSON Schema) and "
+                        "Q3 (Naming Conventions)."
+                    )
+                else:
+                    error_lines = "\n".join(f"- {e}" for e in syntax_errors)
+                    prompt += (
+                        "\n\n=== DETERMINISTIC SYNTAX VERIFICATION ===\n"
+                        "The following syntax errors were detected by py_compile:\n"
+                        f"{error_lines}\n"
+                        "Q1 (Syntax Validation) is FAIL based on deterministic "
+                        "verification. Report these as confirmed findings."
+                    )
             if judge_key == "architecture":
-                workspace_dir = os.getenv("GITHUB_WORKSPACE", ".")
                 arch_context = load_architecture_context(workspace_dir)
                 if arch_context:
                     prompt += (
