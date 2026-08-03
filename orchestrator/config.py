@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
@@ -21,7 +21,7 @@ DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 # that return empty responses (e.g. kimi-k2.7-code via non-DeepInfra
 # providers). Used only in the degraded path (missing/malformed factory or
 # absent node); factory.json routing takes precedence when present.
-DEFAULT_ROUTING: Dict[str, List[str]] = {
+DEFAULT_ROUTING: dict[str, list[str]] = {
     "plan": ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
     "test_writer": ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"],
     "execute": ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"],
@@ -38,7 +38,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FACTORY_JSON_PATH = _PROJECT_ROOT / "config" / "factory.json"
 
 
-def _load_factory_config(filepath: Path = FACTORY_JSON_PATH) -> Dict[str, Any]:
+def _load_factory_config(filepath: Path = FACTORY_JSON_PATH) -> dict[str, Any]:
     """Load and parse config/factory.json. Returns an empty dict on missing or
     malformed files, logging a warning. Never raises — the resolver degrades
     gracefully to DEFAULT_MODEL.
@@ -82,7 +82,7 @@ def _load_factory_config(filepath: Path = FACTORY_JSON_PATH) -> Dict[str, Any]:
     return data
 
 
-def resolve_model_config(node_name: str) -> Dict[str, Any]:
+def resolve_model_config(node_name: str) -> dict[str, Any]:
     """Resolve the Model Config for a given orchestrator node.
 
     Precedence (highest to lowest):
@@ -160,7 +160,7 @@ def resolve_model_config(node_name: str) -> Dict[str, Any]:
     }
 
 
-def get_chat_model_from_config(cfg: Dict[str, Any]) -> ChatOpenAI:
+def get_chat_model_from_config(cfg: dict[str, Any]) -> ChatOpenAI:
     """Construct a ChatOpenAI client from a resolved Model Config dict.
 
     Honors the routing and options fields: the routing list is passed to
@@ -176,7 +176,7 @@ def get_chat_model_from_config(cfg: Dict[str, Any]) -> ChatOpenAI:
     temperature = cfg.get("temperature", 0.0)
     options = cfg.get("options")
 
-    extra_body: Dict[str, Any] = {}
+    extra_body: dict[str, Any] = {}
 
     if routing:
         extra_body["provider"] = {

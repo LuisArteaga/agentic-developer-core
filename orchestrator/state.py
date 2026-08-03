@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Literal, Optional, TypedDict, Union, cast
+from typing import Literal, TypedDict, cast
 
 # Set up logging for state persistence warnings
 logger = logging.getLogger("orchestrator.state")
@@ -23,17 +23,17 @@ StatusType = Literal[
 
 
 class AgentState(TypedDict):
-    issue_number: Optional[int]
+    issue_number: int | None
     status: StatusType
     phase: str
-    attempts: Dict[str, int]
-    branch: Optional[str]
+    attempts: dict[str, int]
+    branch: str | None
     model: str
-    plan: Optional[str]
+    plan: str | None
     read_files: list[str]
     updated_at: str
-    feedback: Optional[str]
-    pushed_at: Optional[str]
+    feedback: str | None
+    pushed_at: str | None
 
 
 DEFAULT_STATE: AgentState = {
@@ -80,7 +80,7 @@ def get_state_filepath() -> Path:
     return log_dir / "state.json"
 
 
-def save(state: AgentState, filepath: Optional[Union[str, Path]] = None) -> None:
+def save(state: AgentState, filepath: str | Path | None = None) -> None:
     """Save the agent state atomically to the specified filepath or default state.json path.
 
     Creates the parent directory if it does not exist. Updates the 'updated_at' timestamp.
@@ -91,7 +91,7 @@ def save(state: AgentState, filepath: Optional[Union[str, Path]] = None) -> None
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Update updated_at field with current ISO-8601 UTC timestamp
-    state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    state["updated_at"] = datetime.datetime.now(datetime.UTC).isoformat()
 
     # Write to a temporary file in the same directory to guarantee atomic replace
     temp_path = target_path.with_suffix(".tmp")
@@ -111,7 +111,7 @@ def save(state: AgentState, filepath: Optional[Union[str, Path]] = None) -> None
         raise e
 
 
-def load(filepath: Optional[Union[str, Path]] = None) -> AgentState:
+def load(filepath: str | Path | None = None) -> AgentState:
     """Load the agent state from the specified filepath or default state.json path.
 
     If the file does not exist, or the JSON content is corrupt or invalid, logs a warning

@@ -9,13 +9,13 @@ from orchestrator.git import (
     GitError,
     GitPushConflictError,
     NotAGitRepositoryError,
-    is_git_repository,
     checkout,
-    commit,
-    push,
     clean,
-    reset_hard,
+    commit,
     current_branch,
+    is_git_repository,
+    push,
+    reset_hard,
 )
 
 
@@ -263,7 +263,7 @@ class TestGitSubprocessHelper(unittest.TestCase):
         # Mock _run_git's subprocess call to throw FileNotFoundError
         # We can test this by calling a non-existent git path, but since _run_git hardcodes 'git',
         # we can mock subprocess.run to raise FileNotFoundError.
-        import unittest.mock as mock
+        from unittest import mock
 
         with mock.patch(
             "subprocess.run", side_effect=FileNotFoundError("git not found")
@@ -305,7 +305,7 @@ class TestGitSubprocessHelper(unittest.TestCase):
                 # If we want to test clone() without hitting github.com, we can mock clean_url in clone() or mock the subprocess call,
                 # or just mock the remote URL.
                 # Let's patch clean_url inside git.clone to point to our local bare repo!
-                import unittest.mock as mock
+                from unittest import mock
 
                 original_run = subprocess.run
                 with mock.patch("subprocess.run") as mock_run:

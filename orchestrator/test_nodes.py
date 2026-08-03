@@ -7,8 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator import state as state_module
+from orchestrator.nodes import claim_node, execute_node, plan_node, verify_node
 from orchestrator.state import DEFAULT_STATE
-from orchestrator.nodes import claim_node, plan_node, execute_node, verify_node
 
 
 class TestClaimNode(unittest.TestCase):

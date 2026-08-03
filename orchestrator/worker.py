@@ -100,7 +100,7 @@ def execute_worker(
     Returns:
         The final response text from the agent.
     """
-    from orchestrator.config import resolve_model_config, get_chat_model_from_config
+    from orchestrator.config import get_chat_model_from_config, resolve_model_config
 
     cfg = resolve_model_config(node_name)
     logger.info(

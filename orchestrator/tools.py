@@ -1,10 +1,10 @@
 import os
 from pathlib import Path
-from typing import Optional
+
 from orchestrator import state
 
 # Can be overridden for testing purposes
-_PROJECT_ROOT: Optional[Path] = None
+_PROJECT_ROOT: Path | None = None
 
 
 def get_workspace_root() -> Path:
@@ -44,7 +44,7 @@ def _normalize_path(path_str: str) -> tuple[Path, str]:
 
 
 def read_file(
-    path: str, start_line: Optional[int] = None, end_line: Optional[int] = None
+    path: str, start_line: int | None = None, end_line: int | None = None
 ) -> str:
     """Read contents of a file, with optional 1-based start_line and end_line bounds (inclusive).
 
@@ -81,13 +81,13 @@ def read_file(
     if start_line is not None:
         if not isinstance(start_line, int) or start_line <= 0:
             return "Error: start_line must be a positive integer."
-        if start_line > total_lines and total_lines > 0:
+        if start_line > total_lines > 0:
             return f"Error: start_line {start_line} exceeds total lines {total_lines}."
 
     if end_line is not None:
         if not isinstance(end_line, int) or end_line <= 0:
             return "Error: end_line must be a positive integer."
-        if end_line > total_lines and total_lines > 0:
+        if end_line > total_lines > 0:
             return f"Error: end_line {end_line} exceeds total lines {total_lines}."
 
     if start_line is not None and end_line is not None and start_line > end_line:

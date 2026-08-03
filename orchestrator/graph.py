@@ -1,16 +1,18 @@
 import logging
-from langgraph.graph import StateGraph, START, END
-from orchestrator.state import AgentState
+
+from langgraph.graph import END, START, StateGraph
+
 from orchestrator.nodes import (
     claim_node,
-    plan_node,
-    test_writer_node,
     execute_node,
-    verify_node,
-    pr_node,
     merge_node,
+    plan_node,
+    pr_node,
     recovery_node,
+    test_writer_node,
+    verify_node,
 )
+from orchestrator.state import AgentState
 
 logger = logging.getLogger("orchestrator.graph")
 
@@ -22,9 +24,7 @@ def route_after_claim(state: AgentState) -> str:
 
     if status == "idle":
         return "end"
-    elif status == "claimed":
-        return "plan"
-    elif status == "planning":
+    elif status == "claimed" or status == "planning":
         return "plan"
     elif status == "executing" and phase == "test_writing":
         return "test_writer"

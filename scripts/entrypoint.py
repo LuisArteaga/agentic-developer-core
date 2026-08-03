@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
+import json
 import os
+import pathlib
+import random
+import subprocess
 import sys
 import time
-import subprocess
-import urllib.request
 import urllib.error
-import random
-import json
-import pathlib
+import urllib.request
 
 
 def log(msg, level="INFO"):

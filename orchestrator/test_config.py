@@ -10,8 +10,8 @@ from orchestrator.config import (
     DEFAULT_ROUTING,
     FACTORY_JSON_PATH,
     _load_factory_config,
-    resolve_model_config,
     get_chat_model_from_config,
+    resolve_model_config,
 )
 
 

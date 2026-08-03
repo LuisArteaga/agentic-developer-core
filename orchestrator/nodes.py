@@ -9,14 +9,25 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import List, Literal, Optional, Union, cast
+from typing import Literal, cast
 
 from pydantic import BaseModel, Field
 
 from orchestrator import state as state_module
-from orchestrator.state import AgentState
-from orchestrator.config import resolve_model_config, get_chat_model_from_config
+from orchestrator.config import get_chat_model_from_config, resolve_model_config
 from orchestrator.constants import IGNORE_DIRS
+from orchestrator.git import (
+    add,
+    checkout,
+    clean,
+    clone,
+    commit,
+    get_commit_time,
+    get_remote_url,
+    is_git_repository,
+    push,
+    reset_hard,
+)
 from orchestrator.outline import (
     OUTLINE_CHAR_CAP,
     OutlineResult,
@@ -24,24 +35,12 @@ from orchestrator.outline import (
     build_outlines_for_files,
 )
 from orchestrator.path_safety import is_safe_path
-from orchestrator.git import (
-    is_git_repository,
-    checkout,
-    clean,
-    reset_hard,
-    get_remote_url,
-    clone,
-    commit,
-    push,
-    get_commit_time,
-    add,
-)
+from orchestrator.state import AgentState
 from scripts.telemetry import (
+    end_orchestrator_phase,
     start_orchestrator_loop,
     start_orchestrator_phase,
-    end_orchestrator_phase,
 )
-
 
 logger = logging.getLogger("orchestrator.nodes")
 
@@ -55,8 +54,8 @@ def _safe_telemetry(func, *args, **kwargs):
 
 
 def _github_api_request(
-    method: str, path: str, body: Optional[dict] = None
-) -> Union[dict, list]:
+    method: str, path: str, body: dict | None = None
+) -> dict | list:
     """Helper to make authenticated HTTP requests to the GitHub REST API using urllib."""
     token = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
 
@@ -140,8 +139,7 @@ def _get_github_repository(workspace_path: Path) -> str:
             # Fallback for other formats
             part = url.split(":")[-1]
 
-        if part.endswith(".git"):
-            part = part[:-4]
+        part = part.removesuffix(".git")
         return part
     except Exception as e:
         raise ValueError(
@@ -149,7 +147,7 @@ def _get_github_repository(workspace_path: Path) -> str:
         )
 
 
-def _parse_dependencies(body: Optional[str]) -> list[int]:
+def _parse_dependencies(body: str | None) -> list[int]:
     """Parse the '## Blocked by' section of an issue body and return a list of blocked-by issue numbers."""
     if not body:
         return []
@@ -461,7 +459,7 @@ class PlanningTask(BaseModel):
     description: str = Field(
         description="Clear, unambiguous instruction for what the worker must do."
     )
-    target_files: List[str] = Field(
+    target_files: list[str] = Field(
         description="Project-relative paths of the files to read or modify in this step."
     )
 
@@ -470,10 +468,10 @@ class DevelopmentPlan(BaseModel):
     rationale: str = Field(
         description="High-level architectural reasoning and analysis of the issue."
     )
-    tasks: List[PlanningTask] = Field(
+    tasks: list[PlanningTask] = Field(
         description="The sequential list of structured tasks to execute."
     )
-    requested_files: List[str] = Field(
+    requested_files: list[str] = Field(
         default_factory=list,
         description="Files whose full structural outlines are needed to plan accurately. "
         "Populate this only if outlines were truncated and you need more detail. "
@@ -925,7 +923,7 @@ def pr_node(state: AgentState) -> AgentState:
 
         logger.info("Pushing feature branch '%s' to remote...", branch_name)
         push(workspace_path, branch_name)
-        state["pushed_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        state["pushed_at"] = datetime.datetime.now(datetime.UTC).isoformat()
 
         # 4. Resolve owner/repo and check if a PR already exists
         github_repo = _get_github_repository(workspace_path)

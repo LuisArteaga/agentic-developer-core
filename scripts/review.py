@@ -1,14 +1,14 @@
+import datetime
+import json
 import os
 import re
-import sys
-import json
-import datetime
-import urllib.request
-import urllib.error
 import subprocess
+import sys
 import tempfile
 import time
-from typing import List, Tuple, Dict, Any, Optional
+import urllib.error
+import urllib.request
+from typing import Any
 
 # Add project root and scripts dir to sys.path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,19 +18,19 @@ scripts_dir = os.path.dirname(os.path.abspath(__file__))
 if scripts_dir not in sys.path:
     sys.path.insert(0, scripts_dir)
 
-from orchestrator.config import resolve_model_config  # noqa: E402
-
 from telemetry import (  # noqa: E402
-    init_telemetry,
-    get_tracer,
-    trace,
-    OPENINFERENCE_SPAN_KIND,
     INPUT_VALUE,
-    OUTPUT_VALUE,
     LLM_MODEL_NAME,
+    OPENINFERENCE_SPAN_KIND,
+    OUTPUT_VALUE,
     TOOL_NAME,
     TOOL_PARAMETERS,
+    get_tracer,
+    init_telemetry,
+    trace,
 )
+
+from orchestrator.config import resolve_model_config  # noqa: E402
 
 # Setup logger paths
 log_file_path = None
@@ -226,7 +226,7 @@ def build_openrouter_provider(routing):
 
 def build_payload(model, messages, routing, temperature, options):
     """Build the OpenRouter chat completions request payload dict."""
-    payload_dict: Dict[str, Any] = {
+    payload_dict: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "temperature": temperature if temperature is not None else 0.0,
@@ -479,7 +479,7 @@ def parse_xml_tags(text: str, open_tag: str, close_tag: str) -> str:
     return block.strip()
 
 
-def evaluate_response(raw_response: str) -> Tuple[str, str, List[str]]:
+def evaluate_response(raw_response: str) -> tuple[str, str, list[str]]:
     """Evaluates the LLM response.
 
     Returns (verdict, reasoning, findings_list)
@@ -592,7 +592,7 @@ def clip_chunk(chunk: str, budget: int) -> str:
 _DIFF_FILE_HEADER_RE = re.compile(r"^diff --git ", re.MULTILINE)
 
 
-def split_diff_by_file(diff: str) -> List[Tuple[str, str]]:
+def split_diff_by_file(diff: str) -> list[tuple[str, str]]:
     """Split a unified ``git diff`` string into per-file sections.
 
     Returns a list of ``(filename, file_diff_section)`` pairs preserving the
@@ -617,7 +617,7 @@ def split_diff_by_file(diff: str) -> List[Tuple[str, str]]:
         # an empty filename (defensive; shouldn't happen for real git diffs).
         return [("", diff)]
 
-    chunks: List[Tuple[str, str]] = []
+    chunks: list[tuple[str, str]] = []
     for i, pos in enumerate(positions):
         section = diff[pos : positions[i + 1]] if i + 1 < len(positions) else diff[pos:]
         section = section.rstrip("\n")
@@ -653,7 +653,7 @@ def _extract_filename_from_section(section: str) -> str:
     return ""
 
 
-def pack_into_batches(chunks: List[Tuple[str, str]], budget: int) -> List[str]:
+def pack_into_batches(chunks: list[tuple[str, str]], budget: int) -> list[str]:
     """Pack per-file chunks into batch strings under a character budget.
 
     Files are packed in natural order (no size-based sorting, per ADR-0023).
@@ -667,8 +667,8 @@ def pack_into_batches(chunks: List[Tuple[str, str]], budget: int) -> List[str]:
     if not chunks:
         return []
 
-    batches: List[str] = []
-    current_parts: List[str] = []
+    batches: list[str] = []
+    current_parts: list[str] = []
     current_len = 0
 
     for filename, section in chunks:
@@ -717,8 +717,8 @@ JUDGE_PROMPTS = {
 
 
 def _aggregate_verdicts(
-    chunk_results: List[Tuple[str, str, List[str], Optional[str], bool, str]],
-) -> Tuple[str, str, List[str], Optional[str], bool, Optional[str]]:
+    chunk_results: list[tuple[str, str, list[str], str | None, bool, str]],
+) -> tuple[str, str, list[str], str | None, bool, str | None]:
     """Aggregate per-chunk judge results into a single judge verdict.
 
     Aggregation rules (ADR-0023):
@@ -747,8 +747,8 @@ def _aggregate_verdicts(
         return chunk_results[0]
 
     agg_status = "PASS"
-    all_findings: List[str] = []
-    reasoning_parts: List[str] = []
+    all_findings: list[str] = []
+    reasoning_parts: list[str] = []
     first_error = None
     any_fallback = False
     fallback_model = None
@@ -868,7 +868,7 @@ def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
             f"{len(chunks)} files → {len(batches)} batches (budget={budget})"
         )
 
-        chunk_results: List[Tuple[str, str, List[str], Optional[str], bool, str]] = []
+        chunk_results: list[tuple[str, str, list[str], str | None, bool, str]] = []
         for batch in batches:
             result = _run_single_chunk(
                 judge_key,
@@ -896,14 +896,14 @@ def _run_single_chunk(
     llm_caller,
     span,
     default_model: str,
-) -> Tuple[str, str, List[str], Optional[str], bool, str]:
+) -> tuple[str, str, list[str], str | None, bool, str]:
     """Evaluate a single diff chunk via ``llm_caller`` and return a result tuple.
 
     Catches exceptions and converts them to a NEEDS REVIEW verdict with the
     error captured, mirroring the original ``run_judge`` error handling.
     """
     reasoning = ""
-    findings: List[str] = []
+    findings: list[str] = []
     error = None
     status = "NEEDS REVIEW"
     used_fallback = False
@@ -1064,7 +1064,7 @@ def main():
             sys.stderr.write("[ERR] OPENROUTER_API_KEY not configured.\n")
             sys.exit(1)
 
-        judges_data: Dict[str, Any] = {}
+        judges_data: dict[str, Any] = {}
         for judge_key in JUDGE_KEYS:
             judges_data[judge_key] = {
                 "name": JUDGE_DISPLAY_NAMES[judge_key],

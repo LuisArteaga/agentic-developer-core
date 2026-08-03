@@ -1,7 +1,7 @@
+import datetime
+import json
 import os
 import sys
-import json
-import datetime
 import threading
 from pathlib import Path
 from typing import Any
@@ -9,10 +9,10 @@ from typing import Any
 # Try importing opentelemetry, fallback to dummy classes if not installed
 try:
     from opentelemetry import trace
-    from opentelemetry.sdk.trace import TracerProvider, SpanProcessor
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor, BatchSpanProcessor
-    from opentelemetry.sdk.resources import Resource
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 
     HAS_OTEL = True
 except ImportError:
@@ -353,17 +353,16 @@ def start_orchestrator_loop(issue_number=None):
         except Exception:
             pass
 
-    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    now = datetime.datetime.now(datetime.UTC).timestamp()
     _state["loop_start_time"] = now
     _state["loop_issue_number"] = issue_number
     _save_state()
-    return None
 
 
 def end_orchestrator_loop(exit_code=0):
     """End the active orchestrator_loop span, auto-ending any open phase spans."""
     _load_state()
-    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    now = datetime.datetime.now(datetime.UTC).timestamp()
     _state["loop_end_time"] = now
     _state["loop_exit_code"] = exit_code
     _save_state()
@@ -384,12 +383,12 @@ def start_orchestrator_phase(phase_name):
     phase_name must be one of "plan", "test_writing", "execute", "verify".
     """
     if phase_name not in ("plan", "test_writing", "execute", "verify"):
-        return None
+        return
     _load_state()
-    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    now = datetime.datetime.now(datetime.UTC).timestamp()
     _state["phases"][phase_name] = {"start_time": now, "end_time": None, "exit_code": 0}
     _save_state()
-    return None
+    return
 
 
 def end_orchestrator_phase(
@@ -408,7 +407,7 @@ def end_orchestrator_phase(
     if active_phase is None:
         return
 
-    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    now = datetime.datetime.now(datetime.UTC).timestamp()
     _state["phases"][active_phase]["end_time"] = now
     _state["phases"][active_phase]["exit_code"] = exit_code
     if prompt_tokens is not None:
@@ -450,7 +449,7 @@ def _export_recorded_spans():
         p_start = phase_data.get("start_time")
         p_end = (
             phase_data.get("end_time")
-            or datetime.datetime.now(datetime.timezone.utc).timestamp()
+            or datetime.datetime.now(datetime.UTC).timestamp()
         )
         if not p_start:
             continue
