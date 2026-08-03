@@ -138,6 +138,38 @@ class TestTelemetryIntegration(unittest.TestCase):
         self.assertEqual(test_attrs.get("phase"), "test_writing")
         self.assertEqual(test_attrs.get("command.exit_code"), 1)
 
+    def test_local_jsonl_traces_without_otlp_endpoint(self):
+        """Local JSONL traces must be written even when no OTLP endpoint is set.
+
+        Regression test for issue #33: the TracerProvider and
+        LocalJSONLFileSpanProcessor must remain active when OTLP is absent,
+        degrading to local-only tracing rather than full no-op.
+        """
+        if not HAS_OTEL:
+            self.skipTest("OpenTelemetry is not installed in the current environment.")
+
+        os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+
+        init_telemetry(reset_state=True)
+
+        start_orchestrator_loop(issue_number=789)
+        start_orchestrator_phase("plan")
+        end_orchestrator_phase(exit_code=0)
+        end_orchestrator_loop(exit_code=0)
+
+        jsonl_files = list(self.test_dir_path.glob("otel_traces_*.jsonl"))
+        self.assertTrue(jsonl_files, "Expected at least one otel_traces_*.jsonl file")
+
+        span_names = set()
+        for f in jsonl_files:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    span = json.loads(line)
+                    span_names.add(span.get("name"))
+
+        self.assertIn("orchestrator_loop", span_names)
+        self.assertIn("orchestrator_phase_plan", span_names)
+
 
 if __name__ == "__main__":
     unittest.main()
