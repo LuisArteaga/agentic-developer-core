@@ -305,27 +305,25 @@ def init_telemetry(in_memory_exporter=None, reset_state=True):
         # Read environment config for exporter
         configure_otlp_endpoint()
         endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-        if not endpoint:
-            # If no OTLP endpoint is configured, run in no-op tracing mode
-            return
-        api_key = os.getenv("SMITHDB_API_KEY", "")
+        if endpoint:
+            api_key = os.getenv("SMITHDB_API_KEY", "")
 
-        headers = {}
-        if api_key:
-            headers["x-api-key"] = api_key
+            headers = {}
+            if api_key:
+                headers["x-api-key"] = api_key
 
-        extra_headers_str = os.getenv("OTEL_EXPORTER_OTLP_HEADERS", "")
-        if extra_headers_str:
-            for item in extra_headers_str.split(","):
-                if "=" in item:
-                    k, v = item.split("=", 1)
-                    headers[k.strip()] = v.strip()
+            extra_headers_str = os.getenv("OTEL_EXPORTER_OTLP_HEADERS", "")
+            if extra_headers_str:
+                for item in extra_headers_str.split(","):
+                    if "=" in item:
+                        k, v = item.split("=", 1)
+                        headers[k.strip()] = v.strip()
 
-        try:
-            exporter = OTLPSpanExporter(endpoint=endpoint, headers=headers)
-            provider.add_span_processor(BatchSpanProcessor(exporter))
-        except Exception as e:
-            sys.stderr.write(f"[WARN] Failed to initialize OTLP exporter: {e}\n")
+            try:
+                exporter = OTLPSpanExporter(endpoint=endpoint, headers=headers)
+                provider.add_span_processor(BatchSpanProcessor(exporter))
+            except Exception as e:
+                sys.stderr.write(f"[WARN] Failed to initialize OTLP exporter: {e}\n")
 
     trace.set_tracer_provider(provider)
 
