@@ -899,8 +899,9 @@ class TestVerifyNode(unittest.TestCase):
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
 
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="")
     @patch("orchestrator.nodes.subprocess.run")
-    def test_verify_node_success(self, mock_subprocess_run):
+    def test_verify_node_success(self, mock_subprocess_run, _mock_diff):
         """Test successful verification: exit code 0, clears feedback and resets attempts."""
         # Mock subprocess run to return success
         mock_res = unittest.mock.MagicMock()
@@ -1024,6 +1025,202 @@ class TestVerifyNode(unittest.TestCase):
         feedback_bytes = new_state["feedback"].encode("utf-8")
         self.assertTrue(len(feedback_bytes) <= 10240)
         self.assertIn("exceeded 10 KB limit", new_state["feedback"])
+
+
+def _make_bineval_check(check_id, dimension, description, passed, reasoning="ok"):
+    from orchestrator.nodes import BinEvalCheck
+
+    return BinEvalCheck(
+        id=check_id,
+        dimension=dimension,
+        description=description,
+        passed=passed,
+        reasoning=reasoning,
+    )
+
+
+def _all_pass_result():
+    from orchestrator.nodes import BinEvalResult
+
+    checks = [
+        _make_bineval_check("1.1", "Completeness", "Acceptance criteria", True),
+        _make_bineval_check("1.2", "Completeness", "Edge cases", True),
+        _make_bineval_check("1.3", "Completeness", "Scope discipline", True),
+        _make_bineval_check("2.1", "Simplicity", "No unnecessary abstraction", True),
+        _make_bineval_check("2.2", "Simplicity", "No dead code", True),
+        _make_bineval_check("2.3", "Simplicity", "Minimal change", True),
+        _make_bineval_check("3.1", "ADR Compliance", "Complies with ADRs", True),
+        _make_bineval_check("3.2", "ADR Compliance", "No contradictory decision", True),
+        _make_bineval_check("4.1", "Robustness", "Error paths handled", True),
+        _make_bineval_check("4.2", "Robustness", "No regression risk", True),
+    ]
+    return BinEvalResult(checks=checks, summary="all good")
+
+
+def _result_with_fail(check_id, dimension, description, reasoning):
+    result = _all_pass_result()
+    for check in result.checks:
+        if check.id == check_id:
+            check.passed = False
+            check.reasoning = reasoning
+            break
+    return result
+
+
+class TestBinEvalPhase(unittest.TestCase):
+    """Tests for the Pre-PR BinEval soft gate inside verify_node."""
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        self.original_env = {}
+        for k, v in {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+        }.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    def _state(self, attempts_verify=0):
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["attempts"] = {"verify": attempts_verify}
+        state["plan"] = '{"tasks": []}'
+        state_module.save(state)
+        return state
+
+    def _mock_make_verify_pass(self):
+        mock_res = unittest.mock.MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = b"All tests passed."
+        return mock_res
+
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch(
+        "orchestrator.nodes._get_workspace_diff",
+        return_value="diff --git a/f.py b/f.py\n+pass",
+    )
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_pass_resets_attempts(self, mock_run, _diff, mock_gh, _adrs):
+        from orchestrator.nodes import verify_node
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        mock_gh.return_value = {"body": "issue body"}
+        with patch("orchestrator.nodes._run_bineval", return_value=_all_pass_result()):
+            state = self._state(attempts_verify=2)
+            new_state = verify_node(state)
+        self.assertEqual(new_state["status"], "verifying")
+        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertIsNone(new_state["feedback"])
+
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_fail_retries_with_structured_feedback(
+        self, mock_run, _diff, mock_gh, _adrs
+    ):
+        from orchestrator.nodes import verify_node
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        mock_gh.return_value = {"body": "issue body"}
+        fail = _result_with_fail(
+            "2.1",
+            "Simplicity",
+            "No unnecessary abstraction",
+            "introduces speculative interface in f.py",
+        )
+        with patch("orchestrator.nodes._run_bineval", return_value=fail):
+            state = self._state(attempts_verify=0)
+            new_state = verify_node(state)
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["attempts"]["verify"], 1)
+        self.assertIsNotNone(new_state["feedback"])
+        assert new_state["feedback"] is not None
+        self.assertIn("[2.1]", new_state["feedback"])
+        self.assertIn("speculative interface", new_state["feedback"])
+
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_fail_exhaustion_transitions_failed(
+        self, mock_run, _diff, mock_gh, _adrs
+    ):
+        from orchestrator.nodes import verify_node
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        mock_gh.return_value = {"body": "issue body"}
+        fail = _result_with_fail(
+            "4.2", "Robustness", "No regression risk", "removes safety check"
+        )
+        with patch("orchestrator.nodes._run_bineval", return_value=fail):
+            state = self._state(attempts_verify=2)
+            new_state = verify_node(state)
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(new_state["attempts"]["verify"], 3)
+        assert new_state["feedback"] is not None
+        self.assertIn("[4.2]", new_state["feedback"])
+
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_llm_failure_treated_as_pass(self, mock_run, _diff, mock_gh, _adrs):
+        from orchestrator.nodes import verify_node
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        mock_gh.return_value = {"body": "issue body"}
+        with patch("orchestrator.nodes._run_bineval", return_value=None):
+            state = self._state(attempts_verify=1)
+            new_state = verify_node(state)
+        self.assertEqual(new_state["status"], "verifying")
+        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertIsNone(new_state["feedback"])
+
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_skipped_on_empty_diff(self, mock_run, _diff, mock_gh):
+        from orchestrator.nodes import verify_node
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        state = self._state(attempts_verify=2)
+        new_state = verify_node(state)
+        # Empty diff -> skip BinEval -> PASS path -> reset + PR transition.
+        self.assertEqual(new_state["status"], "verifying")
+        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertIsNone(new_state["feedback"])
+        # BinEval never reached the issue fetch.
+        mock_gh.assert_not_called()
+
+    def test_apply_no_adr_autopass_forces_adr_checks_pass(self):
+        from orchestrator.nodes import _apply_no_adr_autopass
+
+        result = _result_with_fail(
+            "3.1", "ADR Compliance", "Complies with ADRs", "violates ADR-0009"
+        )
+        _apply_no_adr_autopass(result)
+        for check in result.checks:
+            if check.dimension == "ADR Compliance":
+                self.assertTrue(check.passed)
+        # Non-ADR checks are untouched.
+        non_adr = [c for c in result.checks if c.dimension != "ADR Compliance"]
+        self.assertTrue(all(c.passed for c in non_adr))
 
 
 class TestPRNode(unittest.TestCase):

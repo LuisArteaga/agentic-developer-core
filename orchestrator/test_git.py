@@ -143,6 +143,33 @@ class TestGitSubprocessHelper(unittest.TestCase):
         )
         self.assertEqual(log_res.stdout.strip(), "Another Author <another@example.com>")
 
+    def test_diff_cached_captures_tracked_and_untracked(self):
+        """diff_cached stages all changes and returns diff vs HEAD (incl. new files)."""
+        from orchestrator.git import diff_cached
+
+        # Modify a tracked file and add an untracked file.
+        (self.repo_path / "initial.txt").write_text("changed", encoding="utf-8")
+        (self.repo_path / "new_file.txt").write_text("brand new", encoding="utf-8")
+
+        diff = diff_cached(self.repo_path)
+        self.assertIn("initial.txt", diff)
+        self.assertIn("changed", diff)
+        # Untracked files are captured because diff_cached stages with add -A.
+        self.assertIn("new_file.txt", diff)
+        self.assertIn("brand new", diff)
+
+    def test_diff_cached_empty_when_no_changes(self):
+        from orchestrator.git import diff_cached
+
+        self.assertEqual(diff_cached(self.repo_path), "")
+
+    def test_diff_cached_returns_empty_in_non_repository(self):
+        """diff_cached never raises on a non-repo dir; returns '' for BinEval to skip."""
+        from orchestrator.git import diff_cached
+
+        with tempfile.TemporaryDirectory() as non_repo:
+            self.assertEqual(diff_cached(Path(non_repo)), "")
+
     def test_clean_and_reset_hard(self):
         """Test workspace hygiene commands: clean and reset_hard."""
         # Modify an existing tracked file
