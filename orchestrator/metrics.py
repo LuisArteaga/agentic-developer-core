@@ -89,6 +89,7 @@ class TokenUsageCallbackHandler(BaseCallbackHandler):
                                 total += prompt + completion
             self.total_tokens += total
         except Exception as e:  # noqa: BLE001 - never break execution
+            # nosemgrep: python-logger-credential-disclosure - logs an exception, not a secret; "Token" is a class name
             logger.debug("TokenUsageCallbackHandler error: %s", e)
 
 
@@ -209,6 +210,7 @@ class MetricsCollector:
         try:
             self.tokens_planning += int(tokens)
         except Exception as e:  # noqa: BLE001
+            # nosemgrep: python-logger-credential-disclosure - logs an exception, not a secret; "tokens" is a method name
             logger.debug("add_planning_tokens error: %s", e)
 
     def add_execution_tokens(self, tokens: int) -> None:
@@ -216,6 +218,7 @@ class MetricsCollector:
         try:
             self.tokens_execution += int(tokens)
         except Exception as e:  # noqa: BLE001
+            # nosemgrep: python-logger-credential-disclosure - logs an exception, not a secret; "tokens" is a method name
             logger.debug("add_execution_tokens error: %s", e)
 
     def set_plan_alignment(
