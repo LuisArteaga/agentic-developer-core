@@ -1223,6 +1223,219 @@ class TestBinEvalPhase(unittest.TestCase):
         self.assertTrue(all(c.passed for c in non_adr))
 
 
+class TestBinEvalHelpers(unittest.TestCase):
+    """Direct unit tests for the BinEval helper functions that the phase-level
+    tests patch out: _load_grading_rubric, _load_adrs, _run_bineval.
+    """
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+
+    def tearDown(self):
+        self.workspace_temp.cleanup()
+
+    # -- _load_grading_rubric -------------------------------------------------
+
+    def test_load_grading_rubric_returns_file_contents(self):
+        from orchestrator import nodes
+
+        with patch.object(nodes, "_RUBRIC_PATH", self.workspace_dir / "rubric.md"):
+            (self.workspace_dir / "rubric.md").write_text(
+                "# RUBRIC BODY\n", encoding="utf-8"
+            )
+            self.assertIn("# RUBRIC BODY", nodes._load_grading_rubric())
+
+    def test_load_grading_rubric_missing_file_returns_empty(self):
+        from orchestrator import nodes
+
+        with patch.object(nodes, "_RUBRIC_PATH", self.workspace_dir / "missing.md"):
+            self.assertEqual(nodes._load_grading_rubric(), "")
+
+    # -- _load_adrs -----------------------------------------------------------
+
+    def test_load_adrs_no_adr_directory_returns_empty(self):
+        from orchestrator.nodes import _load_adrs
+
+        self.assertEqual(_load_adrs(self.workspace_dir), "")
+
+    def test_load_adrs_empty_directory_returns_empty(self):
+        from orchestrator.nodes import _load_adrs
+
+        (self.workspace_dir / "docs" / "adr").mkdir(parents=True)
+        self.assertEqual(_load_adrs(self.workspace_dir), "")
+
+    def test_load_adrs_concatenates_sorted_files(self):
+        from orchestrator.nodes import _load_adrs
+
+        adr_dir = self.workspace_dir / "docs" / "adr"
+        adr_dir.mkdir(parents=True)
+        (adr_dir / "0002-second.md").write_text("SECOND BODY", encoding="utf-8")
+        (adr_dir / "0001-first.md").write_text("FIRST BODY", encoding="utf-8")
+
+        adrs = _load_adrs(self.workspace_dir)
+        # Sorted by filename: 0001 before 0002.
+        self.assertLess(adrs.index("0001-first.md"), adrs.index("0002-second.md"))
+        self.assertIn("FIRST BODY", adrs)
+        self.assertIn("SECOND BODY", adrs)
+
+    def test_load_adrs_truncates_at_limit_with_marker(self):
+        from orchestrator import nodes
+        from orchestrator.nodes import _load_adrs
+
+        adr_dir = self.workspace_dir / "docs" / "adr"
+        adr_dir.mkdir(parents=True)
+        # Force a small limit so truncation triggers on a single large ADR.
+        with patch.object(nodes, "_BINEVAL_ADR_MAX_CHARS", 200):
+            big = "X" * 500
+            (adr_dir / "0001-big.md").write_text(big, encoding="utf-8")
+            adrs = _load_adrs(self.workspace_dir)
+            self.assertIn("[ADRs truncated: exceeded limit]", adrs)
+            # Output is bounded around the limit (not the full 500 chars).
+            self.assertLessEqual(len(adrs), 200 + 80)
+
+    def test_load_adrs_skips_unreadable_file(self):
+        from orchestrator.nodes import _load_adrs
+
+        adr_dir = self.workspace_dir / "docs" / "adr"
+        adr_dir.mkdir(parents=True)
+        good = adr_dir / "0001-good.md"
+        good.write_text("GOOD BODY", encoding="utf-8")
+        bad = adr_dir / "0002-bad.md"
+        bad.write_text("BAD BODY", encoding="utf-8")
+
+        with patch("pathlib.Path.read_text", side_effect=OSError("boom")):
+            # When every read raises, _load_adrs returns "" (all files skipped).
+            self.assertEqual(_load_adrs(self.workspace_dir), "")
+
+    # -- _run_bineval ---------------------------------------------------------
+
+    def _fake_llm(self, invoke_return):
+        """Build a fake LLM whose invoke() captures its prompt and returns the
+        configured value, mimicking with_structured_output(...).invoke(prompt).
+        """
+        captured = {}
+
+        def invoke(prompt):
+            captured["prompt"] = prompt
+            return invoke_return
+
+        llm = unittest.mock.MagicMock()
+        structured = unittest.mock.MagicMock()
+        structured.invoke.side_effect = invoke
+        llm.with_structured_output.return_value = structured
+        return llm, captured
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_returns_parsed_result_on_success(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, captured = self._fake_llm(_all_pass_result())
+        mock_get_llm.return_value = llm
+
+        result = _run_bineval("issue body", "plan text", "diff content", "ADR TEXT")
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(all(c.passed for c in result.checks))
+        # Prompt assembly: rubric, issue body, plan, adrs, diff all injected.
+        prompt = captured["prompt"]
+        self.assertIn("RUBRIC", prompt)
+        self.assertIn("issue body", prompt)
+        self.assertIn("plan text", prompt)
+        self.assertIn("ADR TEXT", prompt)
+        self.assertIn("diff content", prompt)
+        # Security preamble present.
+        self.assertIn("untrusted user input", prompt)
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_no_adrs_placeholder_in_prompt(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, captured = self._fake_llm(_all_pass_result())
+        mock_get_llm.return_value = llm
+
+        _run_bineval("issue body", "plan", "diff", "")
+        self.assertIn("checks 3.1 and 3.2 auto-pass", captured["prompt"])
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_empty_diff_renders_empty_marker(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, captured = self._fake_llm(_all_pass_result())
+        mock_get_llm.return_value = llm
+
+        _run_bineval("issue body", "plan", "", "ADR TEXT")
+        self.assertIn("=== DIFF ===\n(empty)", captured["prompt"])
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_truncates_large_diff(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator import nodes
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, captured = self._fake_llm(_all_pass_result())
+        mock_get_llm.return_value = llm
+
+        # Diff larger than the configured limit gets truncated with a marker.
+        big_diff = "D" * 50
+        with patch.object(nodes, "_BINEVAL_DIFF_MAX_CHARS", 20):
+            _run_bineval("issue body", "plan", big_diff, "ADR TEXT")
+        prompt = captured["prompt"]
+        self.assertIn("exceeded 20 char limit", prompt)
+        # The full 50-char diff is not present in its entirety.
+        self.assertNotIn(big_diff, prompt)
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_llm_exception_returns_none(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm = unittest.mock.MagicMock()
+        llm.with_structured_output.return_value.invoke.side_effect = RuntimeError(
+            "API down"
+        )
+        mock_get_llm.return_value = llm
+
+        self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_empty_checks_returns_none(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator.nodes import BinEvalResult, _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, _ = self._fake_llm(BinEvalResult(checks=[], summary="empty"))
+        mock_get_llm.return_value = llm
+
+        self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
+
+
 class TestPRNode(unittest.TestCase):
     def setUp(self):
         self.workspace_temp = tempfile.TemporaryDirectory()
