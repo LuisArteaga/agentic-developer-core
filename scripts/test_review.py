@@ -1314,5 +1314,127 @@ class MainTests(unittest.TestCase):
         self.assertNotIn("FAKE_CI_COVERAGE", captured_prompts["architecture"])
 
 
+class LayeredRetryPolicyTests(unittest.TestCase):
+    """Tests for ``_run_layered_retry`` directly.
+
+    The policy was extracted out of ``call_llm_for_review`` (issue #51) so the
+    empty-content retry + fallback progression is testable in isolation,
+    without resolving a Model Config or standing up a telemetry tracer. These
+    tests mock only the transport (``_call_with_api_retry``).
+    """
+
+    def _build_response(self, content: str) -> str:
+        return json.dumps({"choices": [{"message": {"content": content}}]})
+
+    def _messages(self):
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "diff"},
+        ]
+
+    @patch("review._call_with_api_retry")
+    def test_non_empty_first_attempt_no_retry(self, mock_retry):
+        """AC: non-empty on first attempt -> 1 call, no fallback."""
+        good = self._build_response("<reasoning>r</reasoning><findings></findings>")
+        mock_retry.return_value = good
+
+        body, used_fb, final_m, attempts = review._run_layered_retry(
+            "syntax_lint",
+            "primary",
+            self._messages(),
+            "fallback",
+            "key",
+            ["Together"],
+            0.0,
+            None,
+        )
+        self.assertEqual(body, good)
+        self.assertFalse(used_fb)
+        self.assertEqual(final_m, "primary")
+        self.assertEqual(attempts, 1)
+        self.assertEqual(mock_retry.call_count, 1)
+
+    @patch("review._call_with_api_retry")
+    def test_empty_then_nudge_succeeds(self, mock_retry):
+        """AC: empty first, non-empty on nudge -> 2 calls, no fallback."""
+        empty = self._build_response("")
+        good = self._build_response("<reasoning>r</reasoning><findings></findings>")
+        mock_retry.side_effect = [empty, good]
+
+        body, used_fb, final_m, attempts = review._run_layered_retry(
+            "syntax_lint",
+            "primary",
+            self._messages(),
+            "fallback",
+            "key",
+            ["Together"],
+            0.0,
+            None,
+        )
+        self.assertEqual(body, good)
+        self.assertFalse(used_fb)
+        self.assertEqual(final_m, "primary")
+        self.assertEqual(attempts, 2)
+        # The nudge must append EMPTY_CONTENT_INSTRUCTION to the last turn only.
+        second_call_messages = mock_retry.call_args_list[1].args[1]
+        self.assertEqual(second_call_messages[0]["content"], "sys")
+        self.assertEqual(
+            second_call_messages[1]["content"],
+            "diff" + review.EMPTY_CONTENT_INSTRUCTION,
+        )
+
+    @patch("review._call_with_api_retry")
+    def test_empty_twice_then_fallback_succeeds(self, mock_retry):
+        """AC: two empties then fallback -> 3 calls, used_fallback, fallback config."""
+        empty = self._build_response("")
+        good = self._build_response("<reasoning>r</reasoning><findings></findings>")
+        mock_retry.side_effect = [empty, empty, good]
+
+        body, used_fb, final_m, attempts = review._run_layered_retry(
+            "security",
+            "primary",
+            self._messages(),
+            "fallback",
+            "key",
+            ["Together"],
+            0.5,
+            {"thinking": "max"},
+        )
+        self.assertEqual(body, good)
+        self.assertTrue(used_fb)
+        self.assertEqual(final_m, "fallback")
+        self.assertEqual(attempts, 3)
+        # ADR-0021: fallback call uses routing=None, options=None, temperature=0.0.
+        third = mock_retry.call_args_list[2]
+        self.assertEqual(third.args[0], "fallback")  # model
+        self.assertIsNone(third.args[3])  # routing
+        self.assertEqual(third.args[4], 0.0)  # temperature
+        self.assertIsNone(third.args[5])  # options
+        # Fallback reuses the ORIGINAL messages, not the nudged ones.
+        self.assertEqual(third.args[1][1]["content"], "diff")
+
+    @patch("review._call_with_api_retry")
+    def test_no_fallback_model_exhausts_at_two(self, mock_retry):
+        """AC: no fallback_model -> 2 attempts, returns empty, no fallback."""
+        empty = self._build_response("")
+        mock_retry.side_effect = [empty, empty]
+
+        body, used_fb, final_m, attempts = review._run_layered_retry(
+            "syntax_lint",
+            "primary",
+            self._messages(),
+            None,
+            "key",
+            ["Together"],
+            0.0,
+            None,
+        )
+        self.assertTrue(review._is_empty_content(body))
+        self.assertFalse(used_fb)
+        self.assertEqual(final_m, "primary")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(mock_retry.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
