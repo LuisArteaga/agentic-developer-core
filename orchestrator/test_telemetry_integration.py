@@ -1,8 +1,10 @@
+import base64
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from scripts.telemetry import (
     HAS_OTEL,
@@ -195,8 +197,6 @@ class TestTelemetryIntegration(unittest.TestCase):
 
     def test_langfuse_auth_header_format(self):
         """_build_langfuse_auth_header produces correct Basic auth + ingestion version."""
-        import base64
-
         os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-1234567890"
         os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-1234567890"
 
@@ -209,30 +209,70 @@ class TestTelemetryIntegration(unittest.TestCase):
         self.assertEqual(headers["x-langfuse-ingestion-version"], "4")
 
     def test_langfuse_endpoint_precedence(self):
-        """Explicit OTEL_EXPORTER_OTLP_ENDPOINT takes precedence over Langfuse default.
+        """init_telemetry passes the correct endpoint and headers to OTLPSpanExporter.
 
-        Verifies the endpoint selection logic: when Langfuse keys are set and no
-        explicit endpoint is configured, the Langfuse default is used. When an
-        explicit endpoint is set, it overrides the Langfuse default.
+        Exercises init_telemetry and inspects the OTLPSpanExporter constructor
+        args — does NOT mirror the endpoint-selection expression.
+        Verifies: Langfuse default when no explicit endpoint, explicit endpoint
+        when set, and generic path without Langfuse auth when keys are absent.
         """
+        if not HAS_OTEL:
+            self.skipTest("OpenTelemetry is not installed in the current environment.")
+
+        # Clean env of non-Langfuse auth vars that could pollute assertions
+        os.environ.pop("SMITHDB_API_KEY", None)
+        os.environ.pop("OTEL_EXPORTER_OTLP_HEADERS", None)
+
+        # Case 1: Langfuse keys set, no explicit endpoint → Langfuse default
         os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-test"
         os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-test"
-
-        # No explicit endpoint → Langfuse default
         os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
-        endpoint = (
-            os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-            or _LANGFUSE_DEFAULT_OTLP_ENDPOINT
-        )
-        self.assertEqual(endpoint, _LANGFUSE_DEFAULT_OTLP_ENDPOINT)
 
-        # Explicit endpoint → takes precedence
+        with (
+            patch("scripts.telemetry.OTLPSpanExporter") as mock_cls,
+            patch("scripts.telemetry.trace.get_tracer_provider") as mock_get,
+            patch("scripts.telemetry.trace.set_tracer_provider"),
+        ):
+            mock_get.return_value = MagicMock()
+            init_telemetry(reset_state=True)
+            mock_cls.assert_called_once()
+            _, kwargs = mock_cls.call_args
+            self.assertEqual(kwargs["endpoint"], _LANGFUSE_DEFAULT_OTLP_ENDPOINT)
+            self.assertIn("Authorization", kwargs["headers"])
+
+        # Case 2: Langfuse keys set, explicit endpoint → explicit wins
         os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "https://custom.collector/v1/traces"
-        endpoint = (
-            os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-            or _LANGFUSE_DEFAULT_OTLP_ENDPOINT
+
+        with (
+            patch("scripts.telemetry.OTLPSpanExporter") as mock_cls,
+            patch("scripts.telemetry.trace.get_tracer_provider") as mock_get,
+            patch("scripts.telemetry.trace.set_tracer_provider"),
+        ):
+            mock_get.return_value = MagicMock()
+            init_telemetry(reset_state=True)
+            mock_cls.assert_called_once()
+            _, kwargs = mock_cls.call_args
+            self.assertEqual(kwargs["endpoint"], "https://custom.collector/v1/traces")
+            self.assertIn("Authorization", kwargs["headers"])
+
+        # Case 3: No Langfuse keys → generic OTLP path, no Authorization header
+        os.environ.pop("LANGFUSE_PUBLIC_KEY")
+        os.environ.pop("LANGFUSE_SECRET_KEY")
+        os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = (
+            "https://generic.collector/v1/traces"
         )
-        self.assertEqual(endpoint, "https://custom.collector/v1/traces")
+
+        with (
+            patch("scripts.telemetry.OTLPSpanExporter") as mock_cls,
+            patch("scripts.telemetry.trace.get_tracer_provider") as mock_get,
+            patch("scripts.telemetry.trace.set_tracer_provider"),
+        ):
+            mock_get.return_value = MagicMock()
+            init_telemetry(reset_state=True)
+            mock_cls.assert_called_once()
+            _, kwargs = mock_cls.call_args
+            self.assertEqual(kwargs["endpoint"], "https://generic.collector/v1/traces")
+            self.assertNotIn("Authorization", kwargs.get("headers", {}))
 
     def test_langfuse_session_id_in_spans(self):
         """langfuse.session.id appears as a span attribute when Langfuse is configured.

@@ -141,6 +141,42 @@ class TestClaimNode(unittest.TestCase):
         )
         self.assertEqual(branch_res.stdout.strip(), "feat/issue-10")
 
+    @patch("orchestrator.nodes.start_orchestrator_loop")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_claim_node_wires_branch_to_telemetry(self, mock_api, mock_start_loop):
+        """claim_node passes issue_number and branch to start_orchestrator_loop.
+
+        Regression test for issue #34: the telemetry call site in the claim
+        node must wire both issue_number and branch_name so the Langfuse
+        session ID is constructed correctly.
+        """
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if "labels=agent-blocked" in path:
+                    return []
+                elif "labels=agent-ready" in path:
+                    return [
+                        {
+                            "number": 10,
+                            "title": "Add database migration",
+                            "body": "We need to add a migration script.",
+                        }
+                    ]
+                elif path.endswith("/issues/10"):
+                    return {"labels": [{"name": "agent-ready"}]}
+            elif method in ("POST", "DELETE"):
+                if "/issues/10/labels" in path:
+                    return {}
+            raise ValueError(f"Unexpected API call: {method} {path} {body}")
+
+        mock_api.side_effect = api_side_effect
+
+        initial_state = DEFAULT_STATE.copy()
+        claim_node(initial_state)
+
+        mock_start_loop.assert_called_once_with(issue_number=10, branch="feat/issue-10")
+
     @patch("orchestrator.nodes._github_api_request")
     def test_resume_flow(self, mock_api):
         """Test resume flow: detects resume, skips clean/reset, checks out branch, preserves dirty files."""
