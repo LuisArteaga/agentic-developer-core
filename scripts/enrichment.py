@@ -135,8 +135,16 @@ def _get_enclosing_function_for_line(
                         break
                 else:
                     fn_node = current
+                # Use the decorated_definition's byte range to include decorators
+                body_node = current
             else:
                 fn_node = current
+                # Check if this function_definition is inside a decorated_definition
+                candidate = current.parent
+                if candidate is not None and candidate.type == "decorated_definition":
+                    body_node = candidate
+                else:
+                    body_node = current
 
             # Extract function name
             name_node = fn_node.child_by_field_name("name")
@@ -146,8 +154,8 @@ def _get_enclosing_function_for_line(
                 "utf-8", errors="replace"
             )
 
-            # Extract full function body from start_byte to end_byte
-            body = source_bytes[fn_node.start_byte : fn_node.end_byte].decode(
+            # Extract full function body (including decorators if decorated)
+            body = source_bytes[body_node.start_byte : body_node.end_byte].decode(
                 "utf-8", errors="replace"
             )
             return fn_name, body

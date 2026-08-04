@@ -224,6 +224,59 @@ class TestEnrichDiffWithFunctionContext(unittest.TestCase):
         self.assertIn("127.0.0.1", enriched)
         self.assertIn("169.254.169.254", enriched)
 
+    def test_no_hunks_returns_diff_unchanged(self):
+        """Edge case: diff with file headers but no hunks returns unchanged."""
+        # A diff with only the header line (no @@ block)
+        enriched = enrich_diff_with_function_context(
+            "diff --git a/foo.py b/foo.py\n", str(self.workspace)
+        )
+        self.assertNotIn("=== ENCLOSING FUNCTION CONTEXT ===", enriched)
+
+    def test_path_traversal_blocked(self):
+        """Edge case: path outside workspace is skipped."""
+        self._write_file("../outside.py", "def escape():\n    pass\n")
+        diff = self._diff("../outside.py", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertNotIn("escape", enriched)
+
+    def test_no_enclosing_function_skips(self):
+        """Edge case: line number not inside any function is skipped."""
+        self._write_file(
+            "top.py",
+            "import os\nimport sys\n\nx = 1\n",
+        )
+        diff = self._diff("top.py", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        # File exists, .py extension passes, but line 1 is at module level (no function)
+        # → _get_enclosing_function_for_line returns None → skip
+        self.assertNotIn("=== ENCLOSING FUNCTION CONTEXT ===", enriched)
+
+    def test_decorated_function(self):
+        """Edge case: function with decorators is correctly extracted."""
+        self._write_file(
+            "decorated.py",
+            "@app.route('/test')\n"
+            "@login_required\n"
+            "def my_view():\n"
+            "    return 'hello'\n"
+            "\n"
+            "def other():\n"
+            "    pass\n",
+        )
+        diff = self._diff("decorated.py", 3)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertIn("--- decorated.py :: my_view ---", enriched)
+        self.assertIn("@app.route('/test')", enriched)
+        self.assertIn("return 'hello'", enriched)
+        self.assertNotIn("other", enriched)
+
+    def test_parse_diff_without_b_path(self):
+        """Edge case: diff header with fewer than 4 tokens produces no hunks."""
+        enriched = enrich_diff_with_function_context(
+            "diff --git only_a_path\n", str(self.workspace)
+        )
+        self.assertEqual(enriched, "diff --git only_a_path\n")
+
 
 if __name__ == "__main__":
     unittest.main()
