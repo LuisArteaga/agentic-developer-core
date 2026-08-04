@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 # Make review.py importable from the same directory.
 scripts_dir = Path(__file__).resolve().parent
@@ -931,6 +931,387 @@ class FallbackIndicatorTests(unittest.TestCase):
         self.assertIn("Fallback Model Used", body)
         # Count occurrences — should be exactly 1
         self.assertEqual(body.count("Fallback Model Used"), 1)
+
+
+class CiCoverageOutputTests(unittest.TestCase):
+    """Tests for the CI coverage output loading + Test Coverage prompt
+    augmentation (issue #45 / ADR-0030)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self._tmp.name).resolve()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_output(self, name: str, content: str) -> str:
+        path = self.workspace / name
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+
+    # --- _tail_clip ---
+
+    def test_tail_clip_under_budget_unchanged(self):
+        """AC: text under budget is returned unchanged."""
+        self.assertEqual(review._tail_clip("short", 100), "short")
+
+    def test_tail_clip_over_budget_keeps_tail_with_note(self):
+        """AC: text over budget keeps the last budget chars and prefixes a note."""
+        budget = 50
+        text = "H" * 30 + "T" * 80  # head=H..., tail=T...
+        result = review._tail_clip(text, budget)
+        self.assertIn("[NOTE: CI output truncated to last 50 chars", result)
+        # The tail (T chars) is preserved.
+        self.assertTrue(result.endswith("T" * 50))
+        # The head (H chars) is dropped.
+        self.assertNotIn("H", result)
+
+    def test_tail_clip_exact_budget_unchanged(self):
+        """AC: text exactly at budget is returned unchanged (no note)."""
+        budget = 10
+        text = "x" * budget
+        self.assertEqual(review._tail_clip(text, budget), text)
+
+    # --- _get_ci_coverage_output_budget ---
+
+    def test_budget_env_override(self):
+        """AC: CI_COVERAGE_OUTPUT_MAX_CHARS env overrides the default."""
+        with patch.dict(os.environ, {"CI_COVERAGE_OUTPUT_MAX_CHARS": "12345"}):
+            self.assertEqual(review._get_ci_coverage_output_budget(), 12345)
+
+    def test_budget_default_when_env_unset(self):
+        """AC: default budget used when env unset."""
+        env = {
+            k: v for k, v in os.environ.items() if k != "CI_COVERAGE_OUTPUT_MAX_CHARS"
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                review._get_ci_coverage_output_budget(),
+                review.CI_COVERAGE_OUTPUT_MAX_CHARS,
+            )
+
+    # --- load_ci_coverage_output ---
+
+    def test_load_unset_env_returns_empty(self):
+        """AC: env var unset -> empty string (graceful degradation)."""
+        env = {k: v for k, v in os.environ.items() if k != "CI_COVERAGE_OUTPUT_PATH"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(review.load_ci_coverage_output(), "")
+
+    def test_load_missing_file_returns_empty(self):
+        """AC: path set but file missing -> empty string."""
+        with patch.dict(
+            os.environ,
+            {"CI_COVERAGE_OUTPUT_PATH": str(self.workspace / "nope.txt")},
+        ):
+            self.assertEqual(review.load_ci_coverage_output(), "")
+
+    def test_load_empty_file_returns_empty(self):
+        """AC: file present but empty/whitespace -> empty string."""
+        path = self._write_output("empty.txt", "   \n  ")
+        with patch.dict(os.environ, {"CI_COVERAGE_OUTPUT_PATH": path}):
+            self.assertEqual(review.load_ci_coverage_output(), "")
+
+    def test_load_present_file_returns_content(self):
+        """AC: file with real coverage output -> its content returned."""
+        content = (
+            "test_nodes.py ....\n"
+            "---- coverage: ----\n"
+            "Name                 Stmts   Miss  Cover   Missing\n"
+            "orchestrator/nodes.py   120      4    97%   45-48\n"
+            "===== 10 passed in 1.20s =====\n"
+        )
+        path = self._write_output("cov.txt", content)
+        with patch.dict(os.environ, {"CI_COVERAGE_OUTPUT_PATH": path}):
+            self.assertEqual(review.load_ci_coverage_output(), content)
+
+    def test_load_truncates_tail_when_over_budget(self):
+        """AC: content over budget is tail-clipped with note, preserving tail."""
+        tail_marker = "COVERAGE_TABLE_END_MARKER"
+        head = "H" * 200
+        content = head + "\n" + tail_marker
+        path = self._write_output("big.txt", content)
+        with patch.dict(
+            os.environ,
+            {
+                "CI_COVERAGE_OUTPUT_PATH": path,
+                "CI_COVERAGE_OUTPUT_MAX_CHARS": "60",
+            },
+        ):
+            result = review.load_ci_coverage_output()
+        self.assertIn("[NOTE: CI output truncated to last 60 chars", result)
+        # The tail marker is preserved; the head of H's is dropped.
+        self.assertIn(tail_marker, result)
+        self.assertNotIn("H" * 200, result)
+
+    def test_load_unreadable_file_returns_empty(self):
+        """AC: OSError reading the file -> empty string, no raise.
+
+        Exercises the except-OSError branch (lines 634-638): the path points
+        at a real, existing file so isfile() is True, but open() raises
+        OSError, so the function degrades gracefully.
+        """
+        path = self._write_output("unreadable.txt", "content")
+        real_open = open
+
+        def raising_open(p, *args, **kwargs):
+            if p == path:
+                raise OSError("permission denied")
+            return real_open(p, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=raising_open):
+            with patch.dict(os.environ, {"CI_COVERAGE_OUTPUT_PATH": path}):
+                self.assertEqual(review.load_ci_coverage_output(), "")
+
+    # --- build_test_coverage_ci_augmentation ---
+
+    def test_augmentation_empty_input_returns_empty(self):
+        """AC: empty/whitespace CI output -> empty augmentation (no prompt change)."""
+        self.assertEqual(review.build_test_coverage_ci_augmentation(""), "")
+        self.assertEqual(review.build_test_coverage_ci_augmentation("   \n "), "")
+
+    def test_augmentation_contains_section_markers_and_criteria(self):
+        """AC: non-empty input -> augmentation with CI output, Q3, Q4, language-agnostic note."""
+        ci_output = "===== 5 passed in 1.0s =====\norchestrator/x.py 10 2 80% 7-8\n"
+        aug = review.build_test_coverage_ci_augmentation(ci_output)
+        self.assertIn("=== CI VERIFICATION & COVERAGE OUTPUT ===", aug)
+        self.assertIn("--- BEGIN CI OUTPUT ---", aug)
+        self.assertIn("--- END CI OUTPUT ---", aug)
+        self.assertIn(ci_output, aug)
+        self.assertIn("Q3 (Test Execution)", aug)
+        self.assertIn("Q4 (Coverage of Changed Code)", aug)
+        self.assertIn("Language Agnosticism", aug)
+        # References the shared scoring rule from the base prompt.
+        self.assertIn("SCORING RULE", aug)
+
+    def test_augmentation_preserves_base_prompt_unaffected(self):
+        """AC: base SYSTEM_PROMPT_TEST_COVERAGE keeps only Q1/Q2 (no Q3/Q4 baked in)."""
+        self.assertIn("Q1 (Test Presence)", review.SYSTEM_PROMPT_TEST_COVERAGE)
+        self.assertIn(
+            "Q2 (Test Quality/Assertions)", review.SYSTEM_PROMPT_TEST_COVERAGE
+        )
+        self.assertNotIn("Q3 (Test Execution)", review.SYSTEM_PROMPT_TEST_COVERAGE)
+        self.assertNotIn(
+            "Q4 (Coverage of Changed Code)", review.SYSTEM_PROMPT_TEST_COVERAGE
+        )
+
+
+class AugmentJudgePromptTests(unittest.TestCase):
+    """Tests for the pure per-judge prompt-augmentation dispatch extracted from
+    main() (issue #45)."""
+
+    def _syntax_result(self, passed, errors=None, checked=1):
+        return (passed, errors or [], checked)
+
+    def test_security_judge_unchanged(self):
+        """AC: a judge with no augmentation (security) -> prompt unchanged."""
+        self.assertEqual(
+            review.augment_judge_prompt(
+                "security",
+                "base",
+                self._syntax_result(True),
+                "ARCH",
+                "CI",
+            ),
+            "base",
+        )
+
+    def test_syntax_lint_passed_appends_pass_message(self):
+        """AC: syntax_lint with passing py_compile -> PASS verification block."""
+        result = review.augment_judge_prompt(
+            "syntax_lint",
+            "base",
+            self._syntax_result(True, checked=2),
+            "",
+            "",
+        )
+        self.assertIn("=== DETERMINISTIC SYNTAX VERIFICATION ===", result)
+        self.assertIn("Q1 (Syntax Validation) is PASS", result)
+        self.assertIn("base", result)
+
+    def test_syntax_lint_failed_appends_fail_message_with_errors(self):
+        """AC: syntax_lint with failing py_compile -> FAIL block listing errors."""
+        result = review.augment_judge_prompt(
+            "syntax_lint",
+            "base",
+            self._syntax_result(
+                False, errors=["foo.py: bad", "bar.py: worse"], checked=2
+            ),
+            "",
+            "",
+        )
+        self.assertIn("Q1 (Syntax Validation) is FAIL", result)
+        self.assertIn("- foo.py: bad", result)
+        self.assertIn("- bar.py: worse", result)
+
+    def test_syntax_lint_zero_checked_no_augmentation(self):
+        """AC: syntax_lint with checked==0 (no .py files) -> no augmentation."""
+        result = review.augment_judge_prompt(
+            "syntax_lint",
+            "base",
+            self._syntax_result(True, checked=0),
+            "",
+            "",
+        )
+        self.assertEqual(result, "base")
+
+    def test_syntax_lint_none_result_no_augmentation(self):
+        """AC: syntax_lint with syntax_result=None -> no augmentation."""
+        result = review.augment_judge_prompt("syntax_lint", "base", None, "", "")
+        self.assertEqual(result, "base")
+
+    def test_architecture_with_context_appends_context(self):
+        """AC: architecture judge with non-empty arch_context -> context appended."""
+        result = review.augment_judge_prompt(
+            "architecture", "base", None, "ADR-0014: ...", ""
+        )
+        self.assertIn("=== REPOSITORY ARCHITECTURE CONTEXT ===", result)
+        self.assertIn("ADR-0014: ...", result)
+
+    def test_architecture_without_context_appends_fallback(self):
+        """AC: architecture judge with empty arch_context -> fallback message."""
+        result = review.augment_judge_prompt("architecture", "base", None, "", "")
+        self.assertIn("Falling back to default rules", result)
+
+    def test_test_coverage_with_ci_output_appends_augmentation(self):
+        """AC: test_coverage judge with CI output -> CI augmentation appended."""
+        result = review.augment_judge_prompt(
+            "test_coverage", "base", None, "", "fake CI output"
+        )
+        self.assertIn("=== CI VERIFICATION & COVERAGE OUTPUT ===", result)
+        self.assertIn("fake CI output", result)
+
+    def test_test_coverage_without_ci_output_no_augmentation(self):
+        """AC: test_coverage judge with empty CI output -> no augmentation."""
+        result = review.augment_judge_prompt("test_coverage", "base", None, "", "")
+        self.assertEqual(result, "base")
+
+
+class MainTests(unittest.TestCase):
+    """Focused tests for review.main() covering the wiring (CI coverage output
+    load, augment_judge_prompt dispatch, the judge loop, submit, exit paths).
+
+    External I/O (telemetry, stdin, env, LLM call, gh CLI) is mocked, mirroring
+    the test_entrypoint.py pattern. Covers the main()-level lines touched by
+    issue #45 so the changed wiring is exercised by passing tests.
+    """
+
+    def _run_main(self, judge_statuses, diff="some diff"):
+        """Invoke review.main() with all externals mocked.
+
+        ``judge_statuses`` is a dict mapping judge_key -> status string
+        returned by the mocked run_judge. Returns the captured call args so
+        assertions can inspect the review action and body.
+        """
+        from telemetry import DummyTracer
+
+        submit_calls = []
+
+        def fake_submit(pr_number, action, body):
+            submit_calls.append((pr_number, action, body))
+
+        def make_run_judge():
+            def fake_run_judge(judge_key, prompt, diff_arg, api_key):
+                status = judge_statuses.get(judge_key, "PASS")
+                return (status, "reasoning", [], None, False, "model-x")
+
+            return fake_run_judge
+
+        env = {
+            "PR_NUMBER": "42",
+            "GH_PAT": "tok",
+            "OPENROUTER_API_KEY": "or-key",
+            "GITHUB_WORKSPACE": "/tmp/nonexistent_workspace_xyz",
+        }
+        # Ensure GH_TOKEN not set so GH_PAT is used.
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN",)}
+        clean_env.update(env)
+
+        stdin_mock = MagicMock()
+        stdin_mock.read.return_value = diff
+
+        with (
+            patch("review.init_telemetry"),
+            patch("review.get_tracer", return_value=DummyTracer()),
+            patch("review.verify_python_syntax", return_value=(True, [], 0)),
+            patch("review.load_ci_coverage_output", return_value="fake CI output"),
+            patch("review.load_architecture_context", return_value="ARCH_CTX"),
+            patch("review.run_judge", side_effect=make_run_judge()),
+            patch("review.submit_github_review", side_effect=fake_submit),
+            patch("sys.exit") as mock_exit,
+            patch("sys.stdin", stdin_mock),
+            patch.dict(os.environ, clean_env, clear=True),
+        ):
+            review.main()
+
+        return mock_exit, submit_calls
+
+    def test_main_all_pass_approves_and_exits_zero(self):
+        """AC: all judges PASS -> review action 'approve', submit called, exit(0)."""
+        mock_exit, submit_calls = self._run_main({k: "PASS" for k in review.JUDGE_KEYS})
+        mock_exit.assert_called_once_with(0)
+        self.assertEqual(len(submit_calls), 1)
+        pr_num, action, body = submit_calls[0]
+        self.assertEqual(pr_num, "42")
+        self.assertEqual(action, "approve")
+        # Hidden verdict block lists all four judges as PASS.
+        for key in review.JUDGE_KEYS:
+            self.assertIn(f"{key}: PASS", body)
+
+    def test_main_any_failed_requests_changes_and_exits_one(self):
+        """AC: any judge FAIL -> review action 'request-changes', exit(1)."""
+        statuses = {k: "PASS" for k in review.JUDGE_KEYS}
+        statuses["test_coverage"] = "FAIL"
+        mock_exit, submit_calls = self._run_main(statuses)
+        mock_exit.assert_called_once_with(1)
+        self.assertEqual(len(submit_calls), 1)
+        _, action, _ = submit_calls[0]
+        self.assertEqual(action, "request-changes")
+
+    def test_main_wires_ci_coverage_into_test_coverage_prompt(self):
+        """AC: main() passes the loaded CI output into the test_coverage judge
+        prompt (via augment_judge_prompt), not to the other judges."""
+        captured_prompts = {}
+
+        def make_run_judge():
+            def fake_run_judge(judge_key, prompt, diff_arg, api_key):
+                captured_prompts[judge_key] = prompt
+                return ("PASS", "r", [], None, False, "model")
+
+            return fake_run_judge
+
+        from telemetry import DummyTracer
+
+        env = {
+            "PR_NUMBER": "42",
+            "GH_PAT": "tok",
+            "OPENROUTER_API_KEY": "or-key",
+            "GITHUB_WORKSPACE": "/tmp/nonexistent_workspace_xyz",
+        }
+        clean_env = {k: v for k, v in os.environ.items() if k != "GH_TOKEN"}
+        clean_env.update(env)
+        stdin_mock = MagicMock()
+        stdin_mock.read.return_value = "diff"
+
+        with (
+            patch("review.init_telemetry"),
+            patch("review.get_tracer", return_value=DummyTracer()),
+            patch("review.verify_python_syntax", return_value=(True, [], 0)),
+            patch("review.load_ci_coverage_output", return_value="FAKE_CI_COVERAGE"),
+            patch("review.load_architecture_context", return_value=""),
+            patch("review.run_judge", side_effect=make_run_judge()),
+            patch("review.submit_github_review"),
+            patch("sys.exit"),
+            patch("sys.stdin", stdin_mock),
+            patch.dict(os.environ, clean_env, clear=True),
+        ):
+            review.main()
+
+        self.assertIn("FAKE_CI_COVERAGE", captured_prompts["test_coverage"])
+        # Other judges must NOT receive the CI coverage augmentation.
+        self.assertNotIn("FAKE_CI_COVERAGE", captured_prompts["security"])
+        self.assertNotIn("FAKE_CI_COVERAGE", captured_prompts["syntax_lint"])
+        self.assertNotIn("FAKE_CI_COVERAGE", captured_prompts["architecture"])
 
 
 if __name__ == "__main__":
