@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 # Regex to match unified diff hunk headers: @@ -start,count +start,count @@
 _HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
-# Per-file context byte limit (ADR-0022: 15,000 chars)
-_PER_FILE_CONTEXT_BYTES = 15_000
+# Per-file context character limit (ADR-0022: 15,000 chars)
+_PER_FILE_CONTEXT_CHARS = 15_000
 
 # Truncation marker appended when a function body exceeds the per-file limit
 _TRUNCATION_MARKER = "\n[... truncated ...]\n"
@@ -240,7 +240,7 @@ def enrich_diff_with_function_context(diff: str, workspace_dir: str) -> str:
             continue
         seen.add(key)
 
-        truncated_body = _truncate_context_block(fn_body, _PER_FILE_CONTEXT_BYTES)
+        truncated_body = _truncate_context_block(fn_body, _PER_FILE_CONTEXT_CHARS)
         context_blocks.append(f"--- {filename} :: {fn_name} ---\n{truncated_body}")
 
     if not context_blocks:
