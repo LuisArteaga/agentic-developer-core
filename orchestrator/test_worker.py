@@ -33,13 +33,20 @@ class TestWorkerAgent(unittest.TestCase):
         self.logs_temp.cleanup()
 
     def test_get_worker_tools(self):
-        """Test that get_worker_tools returns the 5 expected wrapped tools."""
+        """Test that get_worker_tools returns the 6 expected wrapped tools."""
         wrapped_tools = get_worker_tools()
-        self.assertEqual(len(wrapped_tools), 5)
+        self.assertEqual(len(wrapped_tools), 6)
         tool_names = {t.name for t in wrapped_tools}
         self.assertEqual(
             tool_names,
-            {"read_file", "list_directory", "grep_search", "patch_file", "run_command"},
+            {
+                "read_file",
+                "list_directory",
+                "grep_search",
+                "patch_file",
+                "run_command",
+                "web_search",
+            },
         )
 
     @unittest.mock.patch("langchain_openai.ChatOpenAI.invoke")
