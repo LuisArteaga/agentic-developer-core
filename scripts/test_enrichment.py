@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Unit tests for scripts/enrichment.py — enclosing function context enrichment.
+
+Tests cover: hunk extraction, tree-sitter boundary detection, truncation at
+15K chars, non-Python file skip, multi-file enrichment, and the INC-001
+false-positive regression scenario.
+"""
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+# Make enrichment.py importable from the same directory.
+scripts_dir = Path(__file__).resolve().parent
+sys.path.insert(0, str(scripts_dir))
+
+from enrichment import (  # noqa: E402
+    _parse_hunks,
+    enrich_diff_with_function_context,
+)
+
+
+class TestParseHunks(unittest.TestCase):
+    """Unit tests for _parse_hunks — extracting (filename, start_line) from diffs."""
+
+    def test_single_file_single_hunk(self):
+        diff = (
+            "diff --git a/foo.py b/foo.py\n"
+            "index abc..def 100644\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -10,7 +10,7 @@ def existing_function():\n"
+        )
+        result = _parse_hunks(diff)
+        self.assertEqual(result, [("foo.py", 10)])
+
+    def test_multi_file_multi_hunk(self):
+        diff = (
+            "diff --git a/a.py b/a.py\n"
+            "--- a/a.py\n"
+            "+++ b/a.py\n"
+            "@@ -1,5 +1,6 @@\n"
+            "diff --git a/b.py b/b.py\n"
+            "--- a/b.py\n"
+            "+++ b/b.py\n"
+            "@@ -20,3 +20,4 @@\n"
+            "@@ -30,3 +31,3 @@\n"
+        )
+        result = _parse_hunks(diff)
+        self.assertEqual(result, [("a.py", 1), ("b.py", 20), ("b.py", 31)])
+
+    def test_skips_binary_files(self):
+        diff = (
+            "diff --git a/image.png b/image.png\n"
+            "Binary files a/image.png and b/image.png differ\n"
+            "diff --git a/foo.py b/foo.py\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -5,3 +5,4 @@\n"
+        )
+        result = _parse_hunks(diff)
+        self.assertEqual(result, [("foo.py", 5)])
+
+    def test_skips_deleted_files(self):
+        diff = (
+            "diff --git a/deleted.py a/deleted.py\n"
+            "deleted file mode 100644\n"
+            "index abc..000000\n"
+            "--- a/deleted.py\n"
+            "@@ -1,5 +0,0 @@\n"
+        )
+        result = _parse_hunks(diff)
+        self.assertEqual(result, [])
+
+    def test_empty_diff(self):
+        self.assertEqual(_parse_hunks(""), [])
+
+    def test_hunk_without_count(self):
+        diff = (
+            "diff --git a/foo.py b/foo.py\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -1 +1 @@\n"
+        )
+        result = _parse_hunks(diff)
+        self.assertEqual(result, [("foo.py", 1)])
+
+
+class TestEnrichDiffWithFunctionContext(unittest.TestCase):
+    """Integration tests for full enrichment pipeline using a temp workspace."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _write_file(self, path: str, content: str):
+        abs_path = self.workspace / path
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_path.write_text(content, encoding="utf-8")
+
+    def _diff(self, filepath: str, start: int, count: int = 1) -> str:
+        return (
+            f"diff --git a/{filepath} b/{filepath}\n"
+            f"--- a/{filepath}\n"
+            f"+++ b/{filepath}\n"
+            f"@@ -{start},{count} +{start},{count} @@\n"
+        )
+
+    def test_enrich_single_function(self):
+        """AC: correctly extracts the enclosing function for a single hunk."""
+        self._write_file(
+            "app.py",
+            "def greet(name):\n"
+            "    return f'Hello, {name}!'\n"
+            "\n"
+            "def farewell(name):\n"
+            "    return f'Goodbye, {name}!'\n",
+        )
+        diff = self._diff("app.py", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertIn("=== ENCLOSING FUNCTION CONTEXT ===", enriched)
+        self.assertIn("--- app.py :: greet ---", enriched)
+        self.assertIn("def greet(name):", enriched)
+        self.assertIn("return f'Hello, {name}!'", enriched)
+        self.assertNotIn("farewell", enriched)
+        self.assertTrue(enriched.startswith(diff))
+
+    def test_enrich_class_method(self):
+        """AC: correctly extracts enclosing class method."""
+        self._write_file(
+            "app.py",
+            "class Calculator:\n"
+            "    def add(self, a, b):\n"
+            "        return a + b\n"
+            "\n"
+            "    def multiply(self, a, b):\n"
+            "        return a * b\n",
+        )
+        diff = self._diff("app.py", 3)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertIn("--- app.py :: add ---", enriched)
+        self.assertIn("def add(self, a, b):", enriched)
+        self.assertIn("return a + b", enriched)
+        self.assertNotIn("multiply", enriched)
+
+    def test_non_python_file_skipped(self):
+        """AC: non-Python files (JSON, YAML, MD) are skipped gracefully."""
+        self._write_file("config.json", '{"key": "value"}')
+        diff = self._diff("config.json", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertEqual(enriched, diff)
+
+    def test_truncation_at_15k_chars(self):
+        """AC: per-file context truncated at 15,000 chars with marker."""
+        # Create a function with a body well over 15,000 chars
+        large_body = "        pass\n" * 5000  # ~45,000 chars
+        self._write_file(
+            "app.py",
+            "def large_func():\n" + large_body,
+        )
+        diff = self._diff("app.py", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertIn("[... truncated ...]", enriched)
+        context_start = enriched.find("=== ENCLOSING FUNCTION CONTEXT ===")
+        context_block = enriched[context_start:]
+        # Context block should be around 15K + overhead (headers, truncation marker)
+        self.assertLess(len(context_block), 25_000)
+
+    def test_multi_file_enrichment(self):
+        """AC: multiple files in the diff each get their own context block."""
+        self._write_file("a.py", "def func_a():\n    return 1\n")
+        self._write_file("b.py", "def func_b():\n    return 2\n")
+        diff = self._diff("a.py", 1) + self._diff("b.py", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertIn("--- a.py :: func_a ---", enriched)
+        self.assertIn("--- b.py :: func_b ---", enriched)
+
+    def test_deduplicate_same_function_multiple_hunks(self):
+        """AC: multiple hunks in the same function produce only one context block."""
+        self._write_file(
+            "app.py",
+            "def func():\n"
+            "    x = 1\n"
+            "    y = 2\n"
+            "    z = 3\n"
+            "    return x + y + z\n",
+        )
+        # Two hunks within the same function
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            "@@ -3,2 +4,2 @@\n"
+        )
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        # The function should appear only once
+        occurrences = enriched.count("--- app.py :: func ---")
+        self.assertEqual(occurrences, 1)
+
+    def test_file_not_in_workspace_skipped(self):
+        """AC: file referenced in diff but missing from workspace is skipped."""
+        diff = self._diff("nonexistent.py", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertEqual(enriched, diff)
+
+    def test_inc001_regression(self):
+        """Regression test: INC-001 false positive scenario.
+
+        Two assertFalse lines with different IPs in the same test function
+        should not produce a false duplicate finding — the full function body
+        makes the IP distinction obvious.
+        """
+        self._write_file(
+            "test_ip.py",
+            "def test_ip_ranges():\n"
+            "    assert is_private_ip('127.0.0.1')\n"
+            "    assert not is_link_local_ip('169.254.169.254')\n",
+        )
+        diff = (
+            "diff --git a/test_ip.py b/test_ip.py\n"
+            "--- a/test_ip.py\n"
+            "+++ b/test_ip.py\n"
+            "@@ -1,2 +1,2 @@\n"
+        )
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        # The function body should contain both IP addresses, making the
+        # distinction visible to the judge.
+        self.assertIn("127.0.0.1", enriched)
+        self.assertIn("169.254.169.254", enriched)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -33,6 +33,8 @@ from telemetry import (  # noqa: E402
 
 from orchestrator.config import resolve_model_config  # noqa: E402
 
+from scripts.enrichment import enrich_diff_with_function_context  # noqa: E402
+
 # Setup logger paths
 log_file_path = None
 agent_log_path = os.getenv("AGENT_LOG_PATH")
@@ -1314,6 +1316,16 @@ def main():
 
     diff = sys.stdin.read()
     log(f"[INFO] Diff length: {len(diff)}")
+
+    # Enrich diff with enclosing function context (ADR-0022)
+    workspace_dir = os.getenv("GITHUB_WORKSPACE", ".")
+    enriched_diff = enrich_diff_with_function_context(diff, workspace_dir)
+    context_size = len(enriched_diff) - len(diff)
+    if context_size > 0:
+        log(f"[INFO] Enclosing function context added: {context_size} chars")
+    else:
+        log("[INFO] No enclosing function context added")
+    diff = enriched_diff
 
     tracer = get_tracer()
     with tracer.start_as_current_span("pr_review") as main_span:
