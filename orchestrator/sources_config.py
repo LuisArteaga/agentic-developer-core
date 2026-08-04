@@ -38,7 +38,7 @@ class SearchParametersConfig(BaseModel):
 
 
 class SourcesConfig(BaseModel):
-    """Pydantic schema for parsing and validating ``config/sources.yaml``.
+    """Pydantic schema for parsing and validating ``config/sources.toml``.
 
     Under ``strict`` mode, search/fetch is restricted to the configured
     ``urls`` and ``domains``. At least one of those must be non-empty when
@@ -79,9 +79,9 @@ class SourcesConfig(BaseModel):
         return self
 
 
-# Module-level cache: sources.yaml is loaded once at orchestrator startup and
+# Module-level cache: sources.toml is loaded once at orchestrator startup and
 # re-used across tool calls (cross-cutting concern from issue #38). Re-reading a
-# small YAML file per tool call would be wasteful and would re-trigger Pydantic
+# small TOML file per tool call would be wasteful and would re-trigger Pydantic
 # validation repeatedly.
 _sources_cache: Optional[SourcesConfig] = None
 
@@ -140,7 +140,7 @@ def load_sources_config(path: Path = SOURCES_TOML_PATH) -> SourcesConfig:
 def reset_sources_config_cache() -> None:
     """Clear the cached ``SourcesConfig``.
 
-    Test helper: tests that swap ``SOURCES_YAML_PATH`` or write alternate
+    Test helper: tests that swap ``SOURCES_TOML_PATH`` or write alternate
     configs must reset the cache so the next ``load_sources_config`` re-reads.
     """
     global _sources_cache
