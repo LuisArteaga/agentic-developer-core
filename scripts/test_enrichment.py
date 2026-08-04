@@ -77,12 +77,7 @@ class TestParseHunks(unittest.TestCase):
         self.assertEqual(_parse_hunks(""), [])
 
     def test_hunk_without_count(self):
-        diff = (
-            "diff --git a/foo.py b/foo.py\n"
-            "--- a/foo.py\n"
-            "+++ b/foo.py\n"
-            "@@ -1 +1 @@\n"
-        )
+        diff = "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n"
         result = _parse_hunks(diff)
         self.assertEqual(result, [("foo.py", 1)])
 
@@ -183,11 +178,7 @@ class TestEnrichDiffWithFunctionContext(unittest.TestCase):
         """AC: multiple hunks in the same function produce only one context block."""
         self._write_file(
             "app.py",
-            "def func():\n"
-            "    x = 1\n"
-            "    y = 2\n"
-            "    z = 3\n"
-            "    return x + y + z\n",
+            "def func():\n    x = 1\n    y = 2\n    z = 3\n    return x + y + z\n",
         )
         # Two hunks within the same function
         diff = (
