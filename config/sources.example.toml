@@ -1,0 +1,26 @@
+# Example strict-mode sources configuration.
+#
+# Copy to config/sources.toml to restrict the Web Search / URL Fetch Worker
+# Tools to an allowlist of domains/URLs. Under strict mode at least one of
+# urls/domains MUST be non-empty, or config load raises ValueError.
+
+strict = true
+urls = [
+    "https://github.com/langchain-ai/langgraph",
+    "https://github.com/SWE-agent/SWE-agent",
+]
+domains = [
+    "arxiv.org",
+    "pypi.org",
+    "python.langchain.com",
+    "langgraph.org",
+    "openrouter.ai",
+    "github.com",
+]
+
+[search]
+engine = "auto"
+search_context_size = "short"
+max_results = 3
+max_total_results = 10
+excluded_domains = ["reddit.com"]

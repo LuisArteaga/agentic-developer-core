@@ -1,0 +1,19 @@
+# Sources configuration for the Web Search (#38) and URL Fetch (#39) Worker
+# Tools. Loaded once at orchestrator startup and cached
+# (orchestrator/sources_config.py).
+#
+# strict = false  => search is unrestricted (no domain allowlisting). Appropriate
+#   for the general-purpose Worker, which may need to research arbitrary library
+#   APIs, docs, and error messages across any domain.
+# strict = true   => search is restricted to the listed urls/domains. When strict
+#   is true, at least one of urls/domains MUST be non-empty (validated at load,
+#   raising ValueError otherwise). See config/sources.example.toml.
+
+strict = false
+urls = []
+domains = []
+
+[search]
+engine = "auto"
+search_context_size = "medium"
+max_results = 5

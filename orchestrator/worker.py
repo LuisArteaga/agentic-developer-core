@@ -5,6 +5,7 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
 from orchestrator import tools as codebase_tools
+from orchestrator.research_tools import web_search
 from orchestrator.state import get_log_dir
 
 # Set up logging
@@ -58,7 +59,7 @@ def run_command(command: str) -> str:
 
 def get_worker_tools() -> list:
     """Return the list of wrapped LangChain tools for the worker agent."""
-    return [read_file, list_directory, grep_search, patch_file, run_command]
+    return [read_file, list_directory, grep_search, patch_file, run_command, web_search]
 
 
 # System Prompt incorporating all behavior guardrails
@@ -83,6 +84,12 @@ SYSTEM_PROMPT = (
     "   Your responsibility is purely local codebase editing and verification. Do NOT attempt to run git commands "
     "like `git commit`, `git push`, or use the GitHub CLI to create or merge pull requests. Those high-level lifecycle "
     "phases are handled automatically by other nodes in the orchestrator graph after you exit.\n\n"
+    "5. WEB SEARCH (ON-DEMAND RESEARCH):\n"
+    "   The `web_search` tool is available to research library APIs, error messages, or unfamiliar patterns that you "
+    "cannot resolve from the codebase alone. Use it sparingly and only when you hit a genuine knowledge gap — e.g. an "
+    "unfamiliar API signature, a library version change, or an error message you cannot diagnose. Do NOT search for "
+    "things you can determine by reading the codebase with `read_file`, `list_directory`, or `grep_search`. Search "
+    "results are returned as a JSON list of {title, url, snippet}; use them to inform your edits.\n\n"
     "Work carefully, keep your changes minimal, and ensure the test suite passes before concluding your work."
 )
 
