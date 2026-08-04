@@ -33,9 +33,9 @@ class TestWorkerAgent(unittest.TestCase):
         self.logs_temp.cleanup()
 
     def test_get_worker_tools(self):
-        """Test that get_worker_tools returns the 6 expected wrapped tools."""
+        """Test that get_worker_tools returns the 7 expected wrapped tools."""
         wrapped_tools = get_worker_tools()
-        self.assertEqual(len(wrapped_tools), 6)
+        self.assertEqual(len(wrapped_tools), 7)
         tool_names = {t.name for t in wrapped_tools}
         self.assertEqual(
             tool_names,
@@ -46,6 +46,7 @@ class TestWorkerAgent(unittest.TestCase):
                 "patch_file",
                 "run_command",
                 "web_search",
+                "fetch_url",
             },
         )
 
