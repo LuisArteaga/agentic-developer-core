@@ -3,6 +3,7 @@ import sys
 
 from orchestrator import state as state_module
 from orchestrator.graph import graph
+from orchestrator.metrics import get_collector
 from scripts.telemetry import end_orchestrator_loop, init_telemetry
 
 
@@ -46,6 +47,10 @@ def main():
 
     exit_code = 0
     try:
+        # Run Observability (ADR-0029): reset the in-process metric accumulator
+        # at the start of each cycle so a resumed process does not carry stale
+        # partial metrics from a previous (crashed) run.
+        get_collector().reset()
         logger.info("Invoking LangGraph execution workflow...")
         final_state = graph.invoke(state)
         logger.info(
@@ -54,6 +59,19 @@ def main():
         )
         if final_state.get("status") == "failed":
             exit_code = 1
+        # Run Observability (ADR-0029): write one metrics record per completed
+        # issue cycle. Only a fully completed (status == "done") cycle
+        # contributes — crashed or failed runs produce no record, so the trend
+        # data is never polluted by partial work. The write degrades gracefully.
+        if final_state.get("status") == "done":
+            try:
+                get_collector().write_record(
+                    issue_number=final_state.get("issue_number"),
+                    branch=final_state.get("branch"),
+                    model=final_state.get("model", ""),
+                )
+            except Exception as e:
+                logger.debug("Non-fatal metrics write error: %s", e)
     except Exception as e:
         logger.exception("Orchestrator execution encountered a critical error: %s", e)
         exit_code = 1
