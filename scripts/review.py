@@ -699,6 +699,63 @@ def _get_batch_budget() -> int:
     return int(os.getenv("REVIEW_BATCH_BUDGET_CHARS", str(BATCH_BUDGET_CHARS)))
 
 
+def augment_judge_prompt(
+    judge_key: str,
+    prompt: str,
+    syntax_result: tuple[bool, list[str], int] | None,
+    arch_context: str,
+    ci_coverage_output: str,
+) -> str:
+    """Apply judge-specific augmentations to a base judge prompt. Pure: no I/O.
+
+    Extracted from ``main()`` so the per-judge augmentation dispatch (syntax
+    verification, architecture context, CI coverage output) is unit-testable
+    rather than buried in the untested entrypoint body (mirrors the
+    ``entrypoint.py`` pattern of extracting logic out of ``main()``).
+
+    Args:
+        judge_key: the judge being augmented.
+        prompt: the base system prompt for that judge.
+        syntax_result: ``(passed, errors, checked)`` from
+            :func:`verify_python_syntax`, or ``None`` when not run.
+        arch_context: the loaded architecture context string (may be "").
+        ci_coverage_output: the loaded CI coverage output string (may be "").
+
+    Returns:
+        The augmented prompt. Judges with no applicable augmentation
+        (e.g. ``security``) receive the base prompt unchanged.
+    """
+    if judge_key == "syntax_lint" and syntax_result and syntax_result[2] > 0:
+        syntax_passed, syntax_errors, _ = syntax_result
+        if syntax_passed:
+            prompt += (
+                "\n\n=== DETERMINISTIC SYNTAX VERIFICATION ===\n"
+                "All modified Python files have been programmatically verified "
+                "via py_compile.\n"
+                "Q1 (Syntax Validation) is PASS — do NOT flag syntax, "
+                "indentation, or compilation issues.\n"
+                "Focus your review on Q2 (JSON Schema) and "
+                "Q3 (Naming Conventions)."
+            )
+        else:
+            error_lines = "\n".join(f"- {e}" for e in syntax_errors)
+            prompt += (
+                "\n\n=== DETERMINISTIC SYNTAX VERIFICATION ===\n"
+                "The following syntax errors were detected by py_compile:\n"
+                f"{error_lines}\n"
+                "Q1 (Syntax Validation) is FAIL based on deterministic "
+                "verification. Report these as confirmed findings."
+            )
+    if judge_key == "architecture":
+        if arch_context:
+            prompt += "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\n" + arch_context
+        else:
+            prompt += "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\nNo specific architecture documentation found. Falling back to default rules."
+    if judge_key == "test_coverage" and ci_coverage_output:
+        prompt += build_test_coverage_ci_augmentation(ci_coverage_output)
+    return prompt
+
+
 def clip_chunk(chunk: str, budget: int) -> str:
     """Clip a single file's diff chunk to *budget* chars, appending a note when
     clipped. The note instructs the judge to return NEEDS REVIEW if it cannot
@@ -1251,39 +1308,19 @@ def main():
                 f"for test_coverage judge"
             )
 
+        # Load once: architecture context is identical across judge iterations.
+        arch_context = load_architecture_context(workspace_dir)
+        syntax_result = (syntax_passed, syntax_errors, syntax_checked)
+
         for judge_key in JUDGE_KEYS:
             judge_info = judges_data[judge_key]
-            prompt = judge_info["prompt"]
-            if judge_key == "syntax_lint" and syntax_checked > 0:
-                if syntax_passed:
-                    prompt += (
-                        "\n\n=== DETERMINISTIC SYNTAX VERIFICATION ===\n"
-                        "All modified Python files have been programmatically verified "
-                        "via py_compile.\n"
-                        "Q1 (Syntax Validation) is PASS — do NOT flag syntax, "
-                        "indentation, or compilation issues.\n"
-                        "Focus your review on Q2 (JSON Schema) and "
-                        "Q3 (Naming Conventions)."
-                    )
-                else:
-                    error_lines = "\n".join(f"- {e}" for e in syntax_errors)
-                    prompt += (
-                        "\n\n=== DETERMINISTIC SYNTAX VERIFICATION ===\n"
-                        "The following syntax errors were detected by py_compile:\n"
-                        f"{error_lines}\n"
-                        "Q1 (Syntax Validation) is FAIL based on deterministic "
-                        "verification. Report these as confirmed findings."
-                    )
-            if judge_key == "architecture":
-                arch_context = load_architecture_context(workspace_dir)
-                if arch_context:
-                    prompt += (
-                        "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\n" + arch_context
-                    )
-                else:
-                    prompt += "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\nNo specific architecture documentation found. Falling back to default rules."
-            if judge_key == "test_coverage" and ci_coverage_output:
-                prompt += build_test_coverage_ci_augmentation(ci_coverage_output)
+            prompt = augment_judge_prompt(
+                judge_key,
+                judge_info["prompt"],
+                syntax_result,
+                arch_context,
+                ci_coverage_output,
+            )
 
             log(f"[INFO] Running judge: {judge_key}")
             status, reasoning, findings, error, used_fallback, final_model = run_judge(

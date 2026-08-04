@@ -36,7 +36,7 @@ We chose **Option 3**.
 ### Transport contract
 
 1. The PR-checks workflow defines a job-level env var `CI_COVERAGE_OUTPUT_PATH = ${{ github.workspace }}/ci_coverage_output.txt`.
-2. The Pytest step runs `pytest --cov=orchestrator --cov-report=term-missing --cov-fail-under=89 2>&1 | tee "$CI_COVERAGE_OUTPUT_PATH"` with `set -o pipefail` so the step still fails on test/coverage-gate failure while the file is always written. The `term-missing` report adds per-file missing-line numbers — the per-line signal the judge needs.
+2. The Pytest step runs `pytest --cov=orchestrator --cov=scripts --cov-report=term-missing --cov-fail-under=89 2>&1 | tee "$CI_COVERAGE_OUTPUT_PATH"` with `set -o pipefail` so the step still fails on test/coverage-gate failure while the file is always written. The `term-missing` report adds per-file missing-line numbers — the per-line signal the judge needs. `--cov=scripts` is added so the judge code itself (`scripts/review.py`, production code run in CI) appears in the coverage report the judge consumes — otherwise the judge would flag every PR that changes `scripts/review.py` as "absent from the coverage report" (exactly the finding that surfaced when this feature was first applied to its own PR). This matches the existing convention of measuring test files alongside production code (the prior `--cov=orchestrator` already measured `orchestrator/test_*.py`); the `--cov-fail-under=89` gate stays green.
 3. The LLM review step runs `if: always()` (unchanged), so it reads the file even when earlier steps failed. `scripts/review.py` resolves the path from the env var, reads the file, and **only** augments the Test Coverage judge.
 
 Scoping to the Pytest + coverage output (rather than the full `make verify`) is deliberate: lint/format/type-check output is the Syntax/Lint and Architecture judges' domain, not the Test Coverage judge's. Feeding it would bloat the prompt with off-domain noise. This is the right-sized capture for the judge's scope (Radical Simplicity); broadening capture later is a localized `tee` extension behind the same env var.
@@ -49,6 +49,8 @@ The base `SYSTEM_PROMPT_TEST_COVERAGE` (Q1/Q2) is unchanged. When CI output is a
 * **Q4 (Coverage of Changed Code)** — using the coverage report's missing-line information, report changed production lines that are NOT covered.
 
 These are scored under the base prompt's existing SCORING RULE (any Q3/Q4 failure ⇒ overall `FAIL`).
+
+The per-judge augmentation dispatch (syntax verification, architecture context, CI coverage output) is extracted out of the untested `main()` entrypoint into a pure, fully unit-tested `augment_judge_prompt(...)` function. This mirrors the `entrypoint.py` pattern (logic extracted into testable functions; `main()` kept thin). It keeps the changed wiring covered by passing tests — important because, with `--cov=scripts`, the Test Coverage judge now sees `scripts/review.py` in the coverage report and checks the diff's changed lines against the report's missing lines.
 
 ### Truncation
 
