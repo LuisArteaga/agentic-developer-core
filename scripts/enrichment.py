@@ -6,7 +6,7 @@ enclosing function or class method for each hunk. Appends the extracted bodies
 as a separate block after the raw diff.
 
 Usage:
-    from scripts.enrichment import enrich_diff_with_function_context
+    from enrichment import enrich_diff_with_function_context
 
     diff = sys.stdin.read()
     enriched = enrich_diff_with_function_context(diff, workspace_dir)
@@ -113,11 +113,8 @@ def _get_enclosing_function_for_line(
         return None, None
 
     node = tree.root_node
-    target_byte = _line_to_byte(source_bytes, line_number)
-    if target_byte is None:
-        return None, None
 
-    # Walk up from the deepest node at the target byte to find a function or
+    # Walk up from the deepest AST node at the target line to find a function or
     # class method definition.
     deepest = node.descendant_for_point_range(
         (line_number - 1, 0), (line_number - 1, 0)
@@ -160,20 +157,6 @@ def _get_enclosing_function_for_line(
     return None, None
 
 
-def _line_to_byte(source_bytes: bytes, line_number: int) -> int | None:
-    """Convert a 1-based line number to a byte offset in the source.
-
-    Returns None if the line number is out of range.
-    """
-    lines = source_bytes.split(b"\n")
-    if line_number < 1 or line_number > len(lines):
-        return None
-    byte_offset = 0
-    for i in range(line_number - 1):
-        byte_offset += len(lines[i]) + 1  # +1 for the newline
-    return byte_offset
-
-
 def _truncate_context_block(block: str, budget: int) -> str:
     """Truncate a single file's context block to *budget* characters.
 
@@ -214,9 +197,19 @@ def enrich_diff_with_function_context(diff: str, workspace_dir: str) -> str:
     context_blocks: list[str] = []
 
     for filename, hunk_line in hunks:
-        filepath = os.path.join(workspace_dir, filename)
+        # Anti-path-traversal: resolve the full path and verify it stays
+        # within the workspace directory (security gate).
+        filepath = os.path.normpath(os.path.join(workspace_dir, filename))
+        resolved = os.path.realpath(filepath)
+        workspace_resolved = os.path.realpath(workspace_dir)
+        if (
+            not resolved.startswith(workspace_resolved + os.sep)
+            and resolved != workspace_resolved
+        ):
+            logger.debug("Skipping path outside workspace: %s", filepath)
+            continue
 
-        if not os.path.isfile(filepath):
+        if not os.path.isfile(resolved):
             continue
 
         # Only process Python files
@@ -224,7 +217,7 @@ def enrich_diff_with_function_context(diff: str, workspace_dir: str) -> str:
             continue
 
         try:
-            with open(filepath, "rb") as f:
+            with open(resolved, "rb") as f:
                 source_bytes = f.read()
         except OSError:
             logger.debug("Could not read file %s for enrichment", filepath)

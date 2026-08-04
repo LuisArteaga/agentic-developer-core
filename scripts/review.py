@@ -33,7 +33,7 @@ from telemetry import (  # noqa: E402
 
 from orchestrator.config import resolve_model_config  # noqa: E402
 
-from scripts.enrichment import enrich_diff_with_function_context  # noqa: E402
+from enrichment import enrich_diff_with_function_context  # noqa: E402
 
 # Setup logger paths
 log_file_path = None
