@@ -239,18 +239,6 @@ class TestEnrichDiffWithFunctionContext(unittest.TestCase):
         enriched = enrich_diff_with_function_context(diff, str(self.workspace))
         self.assertNotIn("escape", enriched)
 
-    def test_no_enclosing_function_skips(self):
-        """Edge case: line number not inside any function is skipped."""
-        self._write_file(
-            "top.py",
-            "import os\nimport sys\n\nx = 1\n",
-        )
-        diff = self._diff("top.py", 1)
-        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
-        # File exists, .py extension passes, but line 1 is at module level (no function)
-        # → _get_enclosing_function_for_line returns None → skip
-        self.assertNotIn("=== ENCLOSING FUNCTION CONTEXT ===", enriched)
-
     def test_decorated_function(self):
         """Edge case: function with decorators is correctly extracted."""
         self._write_file(
@@ -276,6 +264,30 @@ class TestEnrichDiffWithFunctionContext(unittest.TestCase):
             "diff --git only_a_path\n", str(self.workspace)
         )
         self.assertEqual(enriched, "diff --git only_a_path\n")
+
+    def test_unreadable_file_skipped(self):
+        """Edge case: file exists but can't be read (OSError) is skipped."""
+        test_file = "locked.py"
+        self._write_file(test_file, "def secret():\n    pass\n")
+        abs_path = self.workspace / test_file
+        # Make file unreadable
+        abs_path.chmod(0o000)
+        diff = self._diff(test_file, 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertNotIn("=== ENCLOSING FUNCTION CONTEXT ===", enriched)
+        # Restore permissions so cleanup works
+        abs_path.chmod(0o644)
+
+    def test_no_context_blocks_returns_diff_unchanged(self):
+        """Edge case: hunks exist but no enclosing function is found."""
+        self._write_file(
+            "module.py",
+            "# Just module-level code, no functions\nimport os\nx = 1\n",
+        )
+        diff = self._diff("module.py", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        # File exists, .py passes, but line 1 has no enclosing function
+        self.assertNotIn("=== ENCLOSING FUNCTION CONTEXT ===", enriched)
 
 
 if __name__ == "__main__":
