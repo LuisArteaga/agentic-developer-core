@@ -1,3 +1,4 @@
+import base64
 import datetime
 import json
 import os
@@ -29,6 +30,15 @@ TOOL_PARAMETERS = "tool.parameters"
 _DOCKER_SENTINEL = "/.dockerenv"
 _DEFAULT_OTLP_ENDPOINT = "http://host.docker.internal:4318/v1/traces"
 
+# Langfuse Cloud OTLP endpoint — full traces path (OTLPSpanExporter uses endpoint as-is,
+# no path appending). See Langfuse OTLP docs:
+# https://langfuse.com/integrations/native/opentelemetry
+_LANGFUSE_DEFAULT_OTLP_ENDPOINT = "https://cloud.langfuse.com/api/public/otel/v1/traces"
+
+# Module-level session ID for Langfuse trace grouping ({issue_number}_{branch}).
+# Set during init_telemetry (resume) or start_orchestrator_loop (fresh claim).
+_langfuse_session_id: str | None = None
+
 
 def _is_docker() -> bool:
     """Return True when running inside a Docker container."""
@@ -52,6 +62,35 @@ def configure_otlp_endpoint() -> str:
         endpoint = _DEFAULT_OTLP_ENDPOINT
         os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
     return endpoint
+
+
+def _is_langfuse_configured() -> bool:
+    """Return True only when both Langfuse API keys are set (non-empty).
+
+    A single key without the other must NOT activate Langfuse export;
+    the code falls back to generic OTLP instead.
+    """
+    return bool(os.getenv("LANGFUSE_PUBLIC_KEY")) and bool(
+        os.getenv("LANGFUSE_SECRET_KEY")
+    )
+
+
+def _build_langfuse_auth_header() -> dict[str, str]:
+    """Build the Authorization header for Langfuse Cloud OTLP export.
+
+    Langfuse uses Basic Auth with base64(public_key:secret_key).
+    Also includes x-langfuse-ingestion-version: 4 for real-time ingestion
+    in Langfuse v4 (without it, data is delayed up to 10 minutes).
+
+    Reference: https://langfuse.com/integrations/native/opentelemetry
+    """
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY", "")
+    credentials = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
+    return {
+        "Authorization": f"Basic {credentials}",
+        "x-langfuse-ingestion-version": "4",
+    }
 
 
 # Dummy definitions for graceful failover when OTel is not installed
@@ -202,6 +241,41 @@ if HAS_OTEL:
         def force_flush(self, timeout_millis=30000):
             return True
 
+    class BaggageSpanProcessor(SpanProcessor):
+        """Copies langfuse.session.id from OTel Baggage to span attributes.
+
+        Langfuse v4 recommends OTel Baggage + a BaggageSpanProcessor so that
+        trace-level attributes (like session.id) appear on every span, enabling
+        reliable filtering and session grouping in the Langfuse UI.
+
+        Reference: https://langfuse.com/integrations/native/opentelemetry#propagating-attributes
+
+        # AGENT_DECISION: implemented as a custom processor (~8 lines) instead of
+        # installing the official opentelemetry-processor-baggage package, to
+        # honor the Radical Simplicity constraint (ADR-0009: no new heavy deps).
+        # Only the langfuse.session.id key is copied — opt-in, no sensitive data leakage.
+        """
+
+        def on_start(self, span, parent_context=None):
+            from opentelemetry.baggage import get_all
+
+            # OTel Python 1.37: baggage.get_value re-exports context.get_value,
+            # which looks up the key directly in the context — NOT through the
+            # _BAGGAGE_KEY dict. Use get_all to properly read baggage entries.
+            all_baggage = get_all(context=parent_context)
+            value = all_baggage.get("langfuse.session.id")
+            if value is not None:
+                span.set_attribute("langfuse.session.id", value)
+
+        def on_end(self, span):
+            pass
+
+        def shutdown(self):
+            pass
+
+        def force_flush(self, timeout_millis=30000):
+            return True
+
 
 # Module-level stack for active orchestrator spans (loop + phases)
 _span_stack: list[Any] = []
@@ -248,14 +322,22 @@ def _save_state():
         pass
 
 
-def init_telemetry(in_memory_exporter=None, reset_state=True):
+def init_telemetry(
+    in_memory_exporter=None, reset_state=True, issue_number=None, branch=None
+):
     """
     Initializes OpenTelemetry and OpenInference tracer provider if installed.
     Runs silently as a no-op otherwise.
+
+    issue_number and branch are used to construct the Langfuse session ID
+    ({issue_number}_{branch}) for trace grouping. On a fresh run these are
+    None (the issue hasn't been claimed yet); start_orchestrator_loop sets
+    them later. On a stateful resume, they come from the loaded state.
     """
-    global _state
+    global _state, _langfuse_session_id
     if reset_state:
         # Reset internal state
+        _langfuse_session_id = None
         _state = {
             "loop_start_time": None,
             "loop_end_time": None,
@@ -269,6 +351,9 @@ def init_telemetry(in_memory_exporter=None, reset_state=True):
                 os.remove(state_file)
             except Exception:
                 pass
+
+    if issue_number is not None and branch is not None:
+        _langfuse_session_id = f"{issue_number}_{branch}"
 
     if not HAS_OTEL:
         sys.stderr.write(
@@ -302,13 +387,25 @@ def init_telemetry(in_memory_exporter=None, reset_state=True):
     if in_memory_exporter is not None:
         provider.add_span_processor(SimpleSpanProcessor(in_memory_exporter))
     else:
-        # Read environment config for exporter
-        configure_otlp_endpoint()
-        endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-        if endpoint:
-            api_key = os.getenv("SMITHDB_API_KEY", "")
-
+        if _is_langfuse_configured():
+            # Langfuse Cloud export: explicit endpoint takes precedence over the
+            # Langfuse default; auth headers always use the Langfuse Basic credentials.
+            # AGENT_DECISION: do NOT call configure_otlp_endpoint() here — it would
+            # set the Docker default into the env var, masking the Langfuse default.
+            endpoint = (
+                os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+                or _LANGFUSE_DEFAULT_OTLP_ENDPOINT
+            )
+            headers = _build_langfuse_auth_header()
+            # Attach BaggageSpanProcessor so langfuse.session.id propagates from
+            # baggage to span attributes on every span (Langfuse v4 pattern).
+            provider.add_span_processor(BaggageSpanProcessor())
+        else:
+            # Generic OTLP export (Docker default or explicit endpoint)
+            configure_otlp_endpoint()
+            endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
             headers = {}
+            api_key = os.getenv("SMITHDB_API_KEY", "")
             if api_key:
                 headers["x-api-key"] = api_key
 
@@ -319,6 +416,7 @@ def init_telemetry(in_memory_exporter=None, reset_state=True):
                         k, v = item.split("=", 1)
                         headers[k.strip()] = v.strip()
 
+        if endpoint:
             try:
                 exporter = OTLPSpanExporter(endpoint=endpoint, headers=headers)
                 provider.add_span_processor(BatchSpanProcessor(exporter))
@@ -328,14 +426,21 @@ def init_telemetry(in_memory_exporter=None, reset_state=True):
     trace.set_tracer_provider(provider)
 
 
-def start_orchestrator_loop(issue_number=None):
+def start_orchestrator_loop(issue_number=None, branch=None):
     """Start the parent orchestrator_loop span.
+
+    issue_number and branch are used to set the Langfuse session ID
+    ({issue_number}_{branch}) for trace grouping. On a fresh claim these
+    are available immediately; init_telemetry may have received None on
+    a fresh run, so this is the authoritative setter for new cycles.
 
     <!-- AGENT_DECISION: openinference.span.kind set to CHAIN because the loop is a
     higher-level container span, not an LLM call. A future spec could require
     a different kind without changing the public API. -->
     """
-    global _state
+    global _state, _langfuse_session_id
+    if issue_number is not None and branch is not None:
+        _langfuse_session_id = f"{issue_number}_{branch}"
     # Wipe old state on new loop start
     _state = {
         "loop_start_time": None,
@@ -431,17 +536,30 @@ def _export_recorded_spans():
     loop_start_nano = int(loop_start * 1e9)
     loop_end_nano = int(loop_end * 1e9)
 
+    # Attach langfuse.session.id as OTel Baggage so the BaggageSpanProcessor
+    # copies it to span attributes on every span (loop + phases).
+    # Context is immutable — set_span_in_context preserves baggage entries.
+    from opentelemetry import baggage as otel_baggage
+    from opentelemetry.trace import set_span_in_context
+
+    ctx = None
+    if _langfuse_session_id:
+        ctx = otel_baggage.set_baggage("langfuse.session.id", _langfuse_session_id)
+
     loop_span = tracer.start_span(
         "orchestrator_loop",
         start_time=loop_start_nano,
+        context=ctx,
         attributes={OPENINFERENCE_SPAN_KIND: "CHAIN"},
     )
     if _state.get("loop_issue_number") is not None:
         loop_span.set_attribute("issue.number", _state["loop_issue_number"])
 
-    from opentelemetry.trace import set_span_in_context
-
-    loop_context = set_span_in_context(loop_span)
+    loop_context = (
+        set_span_in_context(loop_span, context=ctx)
+        if ctx
+        else set_span_in_context(loop_span)
+    )
 
     for phase_name, phase_data in _state.get("phases", {}).items():
         p_start = phase_data.get("start_time")
