@@ -25,6 +25,7 @@ DEFAULT_ROUTING: dict[str, list[str]] = {
     "plan": ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
     "test_writer": ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"],
     "execute": ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"],
+    "bin_eval": ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
 }
 
 # LLM call resilience: max retries on transient API errors and a generous

@@ -899,8 +899,9 @@ class TestVerifyNode(unittest.TestCase):
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
 
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="")
     @patch("orchestrator.nodes.subprocess.run")
-    def test_verify_node_success(self, mock_subprocess_run):
+    def test_verify_node_success(self, mock_subprocess_run, _mock_diff):
         """Test successful verification: exit code 0, clears feedback and resets attempts."""
         # Mock subprocess run to return success
         mock_res = unittest.mock.MagicMock()
@@ -1024,6 +1025,415 @@ class TestVerifyNode(unittest.TestCase):
         feedback_bytes = new_state["feedback"].encode("utf-8")
         self.assertTrue(len(feedback_bytes) <= 10240)
         self.assertIn("exceeded 10 KB limit", new_state["feedback"])
+
+
+def _make_bineval_check(check_id, dimension, description, passed, reasoning="ok"):
+    from orchestrator.nodes import BinEvalCheck
+
+    return BinEvalCheck(
+        id=check_id,
+        dimension=dimension,
+        description=description,
+        passed=passed,
+        reasoning=reasoning,
+    )
+
+
+def _all_pass_result():
+    from orchestrator.nodes import BinEvalResult
+
+    checks = [
+        _make_bineval_check("1.1", "Completeness", "Acceptance criteria", True),
+        _make_bineval_check("1.2", "Completeness", "Edge cases", True),
+        _make_bineval_check("1.3", "Completeness", "Scope discipline", True),
+        _make_bineval_check("2.1", "Simplicity", "No unnecessary abstraction", True),
+        _make_bineval_check("2.2", "Simplicity", "No dead code", True),
+        _make_bineval_check("2.3", "Simplicity", "Minimal change", True),
+        _make_bineval_check("3.1", "ADR Compliance", "Complies with ADRs", True),
+        _make_bineval_check("3.2", "ADR Compliance", "No contradictory decision", True),
+        _make_bineval_check("4.1", "Robustness", "Error paths handled", True),
+        _make_bineval_check("4.2", "Robustness", "No regression risk", True),
+    ]
+    return BinEvalResult(checks=checks, summary="all good")
+
+
+def _result_with_fail(check_id, dimension, description, reasoning):
+    result = _all_pass_result()
+    for check in result.checks:
+        if check.id == check_id:
+            check.passed = False
+            check.reasoning = reasoning
+            break
+    return result
+
+
+class TestBinEvalPhase(unittest.TestCase):
+    """Tests for the Pre-PR BinEval soft gate inside verify_node."""
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        self.original_env = {}
+        for k, v in {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+        }.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    def _state(self, attempts_verify=0):
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["attempts"] = {"verify": attempts_verify}
+        state["plan"] = '{"tasks": []}'
+        state_module.save(state)
+        return state
+
+    def _mock_make_verify_pass(self):
+        mock_res = unittest.mock.MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = b"All tests passed."
+        return mock_res
+
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch(
+        "orchestrator.nodes._get_workspace_diff",
+        return_value="diff --git a/f.py b/f.py\n+pass",
+    )
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_pass_resets_attempts(self, mock_run, _diff, mock_gh, _adrs):
+        from orchestrator.nodes import verify_node
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        mock_gh.return_value = {"body": "issue body"}
+        with patch("orchestrator.nodes._run_bineval", return_value=_all_pass_result()):
+            state = self._state(attempts_verify=2)
+            new_state = verify_node(state)
+        self.assertEqual(new_state["status"], "verifying")
+        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertIsNone(new_state["feedback"])
+
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_fail_retries_with_structured_feedback(
+        self, mock_run, _diff, mock_gh, _adrs
+    ):
+        from orchestrator.nodes import verify_node
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        mock_gh.return_value = {"body": "issue body"}
+        fail = _result_with_fail(
+            "2.1",
+            "Simplicity",
+            "No unnecessary abstraction",
+            "introduces speculative interface in f.py",
+        )
+        with patch("orchestrator.nodes._run_bineval", return_value=fail):
+            state = self._state(attempts_verify=0)
+            new_state = verify_node(state)
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["attempts"]["verify"], 1)
+        self.assertIsNotNone(new_state["feedback"])
+        assert new_state["feedback"] is not None
+        self.assertIn("[2.1]", new_state["feedback"])
+        self.assertIn("speculative interface", new_state["feedback"])
+
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_fail_exhaustion_transitions_failed(
+        self, mock_run, _diff, mock_gh, _adrs
+    ):
+        from orchestrator.nodes import verify_node
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        mock_gh.return_value = {"body": "issue body"}
+        fail = _result_with_fail(
+            "4.2", "Robustness", "No regression risk", "removes safety check"
+        )
+        with patch("orchestrator.nodes._run_bineval", return_value=fail):
+            state = self._state(attempts_verify=2)
+            new_state = verify_node(state)
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(new_state["attempts"]["verify"], 3)
+        assert new_state["feedback"] is not None
+        self.assertIn("[4.2]", new_state["feedback"])
+
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_llm_failure_treated_as_pass(self, mock_run, _diff, mock_gh, _adrs):
+        from orchestrator.nodes import verify_node
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        mock_gh.return_value = {"body": "issue body"}
+        with patch("orchestrator.nodes._run_bineval", return_value=None):
+            state = self._state(attempts_verify=1)
+            new_state = verify_node(state)
+        self.assertEqual(new_state["status"], "verifying")
+        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertIsNone(new_state["feedback"])
+
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_skipped_on_empty_diff(self, mock_run, _diff, mock_gh):
+        from orchestrator.nodes import verify_node
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        state = self._state(attempts_verify=2)
+        new_state = verify_node(state)
+        # Empty diff -> skip BinEval -> PASS path -> reset + PR transition.
+        self.assertEqual(new_state["status"], "verifying")
+        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertIsNone(new_state["feedback"])
+        # BinEval never reached the issue fetch.
+        mock_gh.assert_not_called()
+
+    def test_apply_no_adr_autopass_forces_adr_checks_pass(self):
+        from orchestrator.nodes import _apply_no_adr_autopass
+
+        result = _result_with_fail(
+            "3.1", "ADR Compliance", "Complies with ADRs", "violates ADR-0009"
+        )
+        _apply_no_adr_autopass(result)
+        for check in result.checks:
+            if check.dimension == "ADR Compliance":
+                self.assertTrue(check.passed)
+        # Non-ADR checks are untouched.
+        non_adr = [c for c in result.checks if c.dimension != "ADR Compliance"]
+        self.assertTrue(all(c.passed for c in non_adr))
+
+
+class TestBinEvalHelpers(unittest.TestCase):
+    """Direct unit tests for the BinEval helper functions that the phase-level
+    tests patch out: _load_grading_rubric, _load_adrs, _run_bineval.
+    """
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+
+    def tearDown(self):
+        self.workspace_temp.cleanup()
+
+    # -- _load_grading_rubric -------------------------------------------------
+
+    def test_load_grading_rubric_returns_file_contents(self):
+        from orchestrator import nodes
+
+        with patch.object(nodes, "_RUBRIC_PATH", self.workspace_dir / "rubric.md"):
+            (self.workspace_dir / "rubric.md").write_text(
+                "# RUBRIC BODY\n", encoding="utf-8"
+            )
+            self.assertIn("# RUBRIC BODY", nodes._load_grading_rubric())
+
+    def test_load_grading_rubric_missing_file_returns_empty(self):
+        from orchestrator import nodes
+
+        with patch.object(nodes, "_RUBRIC_PATH", self.workspace_dir / "missing.md"):
+            self.assertEqual(nodes._load_grading_rubric(), "")
+
+    # -- _load_adrs -----------------------------------------------------------
+
+    def test_load_adrs_no_adr_directory_returns_empty(self):
+        from orchestrator.nodes import _load_adrs
+
+        self.assertEqual(_load_adrs(self.workspace_dir), "")
+
+    def test_load_adrs_empty_directory_returns_empty(self):
+        from orchestrator.nodes import _load_adrs
+
+        (self.workspace_dir / "docs" / "adr").mkdir(parents=True)
+        self.assertEqual(_load_adrs(self.workspace_dir), "")
+
+    def test_load_adrs_concatenates_sorted_files(self):
+        from orchestrator.nodes import _load_adrs
+
+        adr_dir = self.workspace_dir / "docs" / "adr"
+        adr_dir.mkdir(parents=True)
+        (adr_dir / "0002-second.md").write_text("SECOND BODY", encoding="utf-8")
+        (adr_dir / "0001-first.md").write_text("FIRST BODY", encoding="utf-8")
+
+        adrs = _load_adrs(self.workspace_dir)
+        # Sorted by filename: 0001 before 0002.
+        self.assertLess(adrs.index("0001-first.md"), adrs.index("0002-second.md"))
+        self.assertIn("FIRST BODY", adrs)
+        self.assertIn("SECOND BODY", adrs)
+
+    def test_load_adrs_truncates_at_limit_with_marker(self):
+        from orchestrator import nodes
+        from orchestrator.nodes import _load_adrs
+
+        adr_dir = self.workspace_dir / "docs" / "adr"
+        adr_dir.mkdir(parents=True)
+        # Force a small limit so truncation triggers on a single large ADR.
+        with patch.object(nodes, "_BINEVAL_ADR_MAX_CHARS", 200):
+            big = "X" * 500
+            (adr_dir / "0001-big.md").write_text(big, encoding="utf-8")
+            adrs = _load_adrs(self.workspace_dir)
+            self.assertIn("[ADRs truncated: exceeded limit]", adrs)
+            # Output is bounded around the limit (not the full 500 chars).
+            self.assertLessEqual(len(adrs), 200 + 80)
+
+    def test_load_adrs_skips_unreadable_file(self):
+        from orchestrator.nodes import _load_adrs
+
+        adr_dir = self.workspace_dir / "docs" / "adr"
+        adr_dir.mkdir(parents=True)
+        good = adr_dir / "0001-good.md"
+        good.write_text("GOOD BODY", encoding="utf-8")
+        bad = adr_dir / "0002-bad.md"
+        bad.write_text("BAD BODY", encoding="utf-8")
+
+        with patch("pathlib.Path.read_text", side_effect=OSError("boom")):
+            # When every read raises, _load_adrs returns "" (all files skipped).
+            self.assertEqual(_load_adrs(self.workspace_dir), "")
+
+    # -- _run_bineval ---------------------------------------------------------
+
+    def _fake_llm(self, invoke_return):
+        """Build a fake LLM whose invoke() captures its prompt and returns the
+        configured value, mimicking with_structured_output(...).invoke(prompt).
+        """
+        captured = {}
+
+        def invoke(prompt):
+            captured["prompt"] = prompt
+            return invoke_return
+
+        llm = unittest.mock.MagicMock()
+        structured = unittest.mock.MagicMock()
+        structured.invoke.side_effect = invoke
+        llm.with_structured_output.return_value = structured
+        return llm, captured
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_returns_parsed_result_on_success(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, captured = self._fake_llm(_all_pass_result())
+        mock_get_llm.return_value = llm
+
+        result = _run_bineval("issue body", "plan text", "diff content", "ADR TEXT")
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(all(c.passed for c in result.checks))
+        # Prompt assembly: rubric, issue body, plan, adrs, diff all injected.
+        prompt = captured["prompt"]
+        self.assertIn("RUBRIC", prompt)
+        self.assertIn("issue body", prompt)
+        self.assertIn("plan text", prompt)
+        self.assertIn("ADR TEXT", prompt)
+        self.assertIn("diff content", prompt)
+        # Security preamble present.
+        self.assertIn("untrusted user input", prompt)
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_no_adrs_placeholder_in_prompt(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, captured = self._fake_llm(_all_pass_result())
+        mock_get_llm.return_value = llm
+
+        _run_bineval("issue body", "plan", "diff", "")
+        self.assertIn("checks 3.1 and 3.2 auto-pass", captured["prompt"])
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_empty_diff_renders_empty_marker(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, captured = self._fake_llm(_all_pass_result())
+        mock_get_llm.return_value = llm
+
+        _run_bineval("issue body", "plan", "", "ADR TEXT")
+        self.assertIn("=== DIFF ===\n(empty)", captured["prompt"])
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_truncates_large_diff(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator import nodes
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, captured = self._fake_llm(_all_pass_result())
+        mock_get_llm.return_value = llm
+
+        # Diff larger than the configured limit gets truncated with a marker.
+        big_diff = "D" * 50
+        with patch.object(nodes, "_BINEVAL_DIFF_MAX_CHARS", 20):
+            _run_bineval("issue body", "plan", big_diff, "ADR TEXT")
+        prompt = captured["prompt"]
+        self.assertIn("exceeded 20 char limit", prompt)
+        # The full 50-char diff is not present in its entirety.
+        self.assertNotIn(big_diff, prompt)
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_llm_exception_returns_none(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm = unittest.mock.MagicMock()
+        llm.with_structured_output.return_value.invoke.side_effect = RuntimeError(
+            "API down"
+        )
+        mock_get_llm.return_value = llm
+
+        self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_empty_checks_returns_none(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        from orchestrator.nodes import BinEvalResult, _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, _ = self._fake_llm(BinEvalResult(checks=[], summary="empty"))
+        mock_get_llm.return_value = llm
+
+        self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
 
 
 class TestPRNode(unittest.TestCase):

@@ -121,6 +121,30 @@ def commit(repo_dir: Path | str, message: str, author: str | None = None) -> boo
     return True
 
 
+def diff_cached(repo_dir: Path | str) -> str:
+    """Return the staged diff (tracked changes + newly added files) vs HEAD.
+
+    Stages all current changes first (tracked modifications and untracked
+    files) via `git add -A`, then returns `git diff --cached` output. This
+    captures the full set of candidate PR changes including new files, which a
+    bare `git diff HEAD` would miss (untracked files are not shown). Staging is
+    idempotent and never commits — the PR-Node re-stages before committing.
+
+    Returns the diff text, or an empty string if the directory is not a git
+    repository or the diff command fails. Never raises: BinEval treats an empty
+    diff as a signal to skip the soft gate (edge-case policy).
+    """
+    try:
+        _run_git(repo_dir, ["add", "-A"], check=False)
+        result = _run_git(repo_dir, ["diff", "--cached"], check=False)
+        if result.returncode != 0:
+            return ""
+        return result.stdout
+    except GitError as e:
+        logger.debug("diff_cached failed in %s: %s", repo_dir, e)
+        return ""
+
+
 def push(
     repo_dir: Path | str, branch: str, remote: str = "origin", force: bool = False
 ) -> None:

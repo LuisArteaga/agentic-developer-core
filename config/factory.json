@@ -43,5 +43,10 @@
     "model": "deepseek/deepseek-v4-flash",
     "routing": ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
     "temperature": 0.0
+  },
+  "bin_eval": {
+    "model": "deepseek/deepseek-v4-flash",
+    "routing": ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
+    "temperature": 0.0
   }
 }

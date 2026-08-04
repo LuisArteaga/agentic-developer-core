@@ -480,34 +480,50 @@ def end_orchestrator_loop(exit_code=0):
             pass
 
 
-def start_orchestrator_phase(phase_name):
+def start_orchestrator_phase(phase_name, parent=None):
     """Start a nested span for one of the orchestrator phases.
 
-    phase_name must be one of "plan", "test_writing", "execute", "verify".
+    phase_name must be one of "plan", "test_writing", "execute", "verify",
+    "bineval". The optional `parent` names another phase whose span this one
+    nests under (e.g. "bineval" nests under "verify" per ADR-0016). When parent
+    is set, the export step links this span as a child of that parent phase span
+    instead of the loop span.
     """
-    if phase_name not in ("plan", "test_writing", "execute", "verify"):
+    if phase_name not in ("plan", "test_writing", "execute", "verify", "bineval"):
         return
     _load_state()
     now = datetime.datetime.now(datetime.UTC).timestamp()
-    _state["phases"][phase_name] = {"start_time": now, "end_time": None, "exit_code": 0}
+    entry = {"start_time": now, "end_time": None, "exit_code": 0}
+    if parent:
+        entry["parent"] = parent
+    _state["phases"][phase_name] = entry
     _save_state()
     return
 
 
 def end_orchestrator_phase(
-    exit_code=0, prompt_tokens=None, completion_tokens=None, model_name=None
+    exit_code=0,
+    prompt_tokens=None,
+    completion_tokens=None,
+    model_name=None,
+    phase_name=None,
 ):
     """End the active orchestrator phase span.
 
-    Captures command exit status and OpenInference token/model attributes.
+    Captures command exit status and OpenInference token/model attributes. When
+    `phase_name` is given, ends that specific phase (required for nested phases
+    where multiple phases are simultaneously open); otherwise ends the single
+    currently-active phase (the one with end_time None) — preserving the
+    pre-existing behavior for the non-nested callers.
     """
     _load_state()
-    active_phase = None
-    for name, data in _state["phases"].items():
-        if data.get("end_time") is None:
-            active_phase = name
-
+    active_phase = phase_name
     if active_phase is None:
+        for name, data in _state["phases"].items():
+            if data.get("end_time") is None:
+                active_phase = name
+
+    if active_phase is None or active_phase not in _state["phases"]:
         return
 
     now = datetime.datetime.now(datetime.UTC).timestamp()
@@ -540,6 +556,7 @@ def _export_recorded_spans():
     # copies it to span attributes on every span (loop + phases).
     # Context is immutable — set_span_in_context preserves baggage entries.
     from opentelemetry import baggage as otel_baggage
+    from opentelemetry.context import Context
     from opentelemetry.trace import set_span_in_context
 
     ctx = None
@@ -561,6 +578,10 @@ def _export_recorded_spans():
         else set_span_in_context(loop_span)
     )
 
+    # Maps phase_name -> OTel context carrying that phase's span, so a later
+    # nested phase can link to its parent. Filled in insertion order.
+    phase_contexts: dict[str, Context] = {}
+
     for phase_name, phase_data in _state.get("phases", {}).items():
         p_start = phase_data.get("start_time")
         p_end = (
@@ -574,10 +595,21 @@ def _export_recorded_spans():
         p_end_nano = int(p_end * 1e9)
         p_exit = phase_data.get("exit_code", 0)
 
+        # Resolve parent context: a nested phase (e.g. "bineval" under
+        # "verify", per ADR-0016) links to its parent phase span instead of
+        # the loop span. Phases are stored in insertion order, so a parent
+        # is always exported before its children.
+        parent_name = phase_data.get("parent")
+        parent_ctx = (
+            phase_contexts[parent_name]
+            if parent_name and parent_name in phase_contexts
+            else loop_context
+        )
+
         phase_span = tracer.start_span(
             f"orchestrator_phase_{phase_name}",
             start_time=p_start_nano,
-            context=loop_context,
+            context=parent_ctx,
             attributes={
                 OPENINFERENCE_SPAN_KIND: "CHAIN",
                 "phase": phase_name,
@@ -604,6 +636,8 @@ def _export_recorded_spans():
             trace.Status(status_code, f"exit code {p_exit}" if p_exit != 0 else None)
         )
         phase_span.end(end_time=p_end_nano)
+
+        phase_contexts[phase_name] = set_span_in_context(phase_span)
 
     exit_code = _state.get("loop_exit_code", 0)
     loop_span.set_attribute("command.exit_code", exit_code)

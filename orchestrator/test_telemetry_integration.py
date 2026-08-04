@@ -342,6 +342,56 @@ class TestTelemetryIntegration(unittest.TestCase):
                         "langfuse.session.id must not appear without Langfuse keys",
                     )
 
+    def test_verify_bineval_nests_under_verify_phase(self):
+        """BinEval phase span must be a child of the verify phase span (ADR-0016).
+
+        Named to sort after the langfuse/telemetry tests so that the first
+        init_telemetry call in the session remains test_langfuse_endpoint_precedence
+        (which registers the BaggageSpanProcessor this file's other tests rely on).
+        """
+        if not HAS_OTEL:
+            self.skipTest("OpenTelemetry is not installed in the current environment.")
+
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        exporter = InMemorySpanExporter()
+        init_telemetry(in_memory_exporter=exporter, reset_state=True)
+
+        start_orchestrator_loop(issue_number=101)
+        start_orchestrator_phase("verify")
+        # BinEval runs as a nested sub-phase of verify (parent="verify").
+        start_orchestrator_phase("bineval", parent="verify")
+        end_orchestrator_phase(exit_code=0, phase_name="bineval")
+        end_orchestrator_phase(exit_code=0, phase_name="verify")
+        end_orchestrator_loop(exit_code=0)
+
+        spans = exporter.get_finished_spans()
+        # 1 loop + 1 verify + 1 bineval
+        self.assertEqual(len(spans), 3)
+        spans_by_name = {span.name: span for span in spans}
+        self.assertIn("orchestrator_loop", spans_by_name)
+        self.assertIn("orchestrator_phase_verify", spans_by_name)
+        self.assertIn("orchestrator_phase_bineval", spans_by_name)
+
+        verify_span = spans_by_name["orchestrator_phase_verify"]
+        bineval_span = spans_by_name["orchestrator_phase_bineval"]
+
+        # The bineval span's parent must be the verify span, not the loop span.
+        assert bineval_span.parent is not None
+        assert verify_span.context is not None
+        self.assertEqual(
+            bineval_span.parent.span_id,
+            verify_span.context.span_id,
+            "bineval span must nest under the verify phase span",
+        )
+        # And the verify span's parent is the loop span (not bineval).
+        loop_span = spans_by_name["orchestrator_loop"]
+        assert verify_span.parent is not None
+        assert loop_span.context is not None
+        self.assertEqual(verify_span.parent.span_id, loop_span.context.span_id)
+
 
 if __name__ == "__main__":
     unittest.main()
