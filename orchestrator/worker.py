@@ -1,9 +1,11 @@
+import json
 import logging
 
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
 from orchestrator import tools as codebase_tools
+from orchestrator.state import get_log_dir
 
 # Set up logging
 logger = logging.getLogger("orchestrator.worker")
@@ -86,7 +88,11 @@ SYSTEM_PROMPT = (
 
 
 def execute_worker(
-    issue_description: str, plan: str, node_name: str = "execute"
+    issue_description: str,
+    plan: str,
+    node_name: str = "execute",
+    issue_number: int | None = None,
+    attempt: int | None = None,
 ) -> str:
     """Execute the worker agent using LangGraph's prebuilt ReAct agent.
 
@@ -96,6 +102,10 @@ def execute_worker(
         node_name: The orchestrator node name whose model config to resolve
             via resolve_model_config() (default "execute"). Test-Writer callers
             pass "test_writer" to use the test-writer model.
+        issue_number: The GitHub issue number, used to name the Worker Trace
+            sidecar file. When None, no trace is written.
+        attempt: The 1-based execute/test-writer attempt index, used to name
+            the Worker Trace sidecar file. When None, no trace is written.
 
     Returns:
         The final response text from the agent.
@@ -132,6 +142,73 @@ def execute_worker(
     # LangGraph Pregel.invoke overload mismatch; config dict works at runtime.
     result = agent.invoke({"messages": [("user", user_message)]}, config=config)  # type: ignore[call-overload]
 
+    # Serialize the full ReAct trajectory to a JSONL sidecar for post-hoc
+    # debugging. This is a pure sidecar: never loaded back into the loop and
+    # never injected into retries (the retry feedback stays the truncated
+    # Verification Feedback). Failures are logged, never propagated, so
+    # observability cannot impact execution (ADR-0016).
+    _write_worker_trace(result["messages"], issue_number, attempt, node_name)
+
     # Extract the last message from the result
     final_message = result["messages"][-1]
     return final_message.content
+
+
+def _coerce_content(content) -> str:
+    """Coerce message content to a string, safely handling bytes and structured blocks."""
+    if content is None:
+        return ""
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    if isinstance(content, str):
+        return content
+    # List of content blocks or other structured content
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except Exception:
+        return str(content)
+
+
+def _serialize_message(msg) -> dict:
+    """Serialize a single LangChain message to a trace record dict."""
+    record = {
+        "role": getattr(msg, "type", "unknown"),
+        "content": _coerce_content(getattr(msg, "content", "")),
+    }
+    tool_calls = getattr(msg, "tool_calls", None)
+    if tool_calls:
+        record["tool_calls"] = [
+            {"name": tc.get("name"), "arguments": tc.get("args", {})}
+            for tc in tool_calls
+        ]
+    tool_name = getattr(msg, "name", None)
+    if tool_name:
+        record["tool_name"] = tool_name
+    tool_call_id = getattr(msg, "tool_call_id", None)
+    if tool_call_id:
+        record["tool_call_id"] = tool_call_id
+    return record
+
+
+def _write_worker_trace(messages, issue_number, attempt, node_name) -> None:
+    """Serialize the worker's full ReAct conversation to a JSONL sidecar file.
+
+    Writes one JSON object per message line under the AGENT_LOG_PATH directory.
+    The Worker (execute node) file is named ``worker_trace_<issue>_<attempt>.jsonl``;
+    other nodes (e.g. test_writer) use ``<node>_trace_<issue>_<attempt>.jsonl`` to
+    avoid collisions. Never raises: trace failures are logged as warnings so that
+    observability never impacts execution stability (ADR-0016).
+    """
+    if issue_number is None or attempt is None:
+        return
+    try:
+        log_dir = get_log_dir()
+        prefix = "worker" if node_name == "execute" else node_name
+        trace_path = log_dir / f"{prefix}_trace_{issue_number}_{attempt}.jsonl"
+        with open(trace_path, "w", encoding="utf-8") as f:
+            for msg in messages:
+                record = _serialize_message(msg)
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        logger.info("Worker trace written to: %s", trace_path)
+    except Exception as e:
+        logger.warning("Failed to write worker trace: %s", e)
