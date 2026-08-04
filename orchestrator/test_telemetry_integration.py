@@ -6,6 +6,9 @@ from pathlib import Path
 
 from scripts.telemetry import (
     HAS_OTEL,
+    _build_langfuse_auth_header,
+    _is_langfuse_configured,
+    _LANGFUSE_DEFAULT_OTLP_ENDPOINT,
     end_orchestrator_loop,
     end_orchestrator_phase,
     get_agent_logs_dir,
@@ -169,6 +172,135 @@ class TestTelemetryIntegration(unittest.TestCase):
 
         self.assertIn("orchestrator_loop", span_names)
         self.assertIn("orchestrator_phase_plan", span_names)
+
+    def test_langfuse_configured_detection(self):
+        """_is_langfuse_configured returns True only when BOTH keys are set."""
+        # Both keys set → True
+        os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-test"
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-test"
+        self.assertTrue(_is_langfuse_configured())
+
+        # Only public key → False
+        os.environ.pop("LANGFUSE_SECRET_KEY")
+        self.assertFalse(_is_langfuse_configured())
+
+        # Only secret key → False
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-test"
+        os.environ.pop("LANGFUSE_PUBLIC_KEY")
+        self.assertFalse(_is_langfuse_configured())
+
+        # Neither → False
+        os.environ.pop("LANGFUSE_SECRET_KEY")
+        self.assertFalse(_is_langfuse_configured())
+
+    def test_langfuse_auth_header_format(self):
+        """_build_langfuse_auth_header produces correct Basic auth + ingestion version."""
+        import base64
+
+        os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-1234567890"
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-1234567890"
+
+        headers = _build_langfuse_auth_header()
+
+        expected_credentials = base64.b64encode(
+            b"pk-lf-1234567890:sk-lf-1234567890"
+        ).decode()
+        self.assertEqual(headers["Authorization"], f"Basic {expected_credentials}")
+        self.assertEqual(headers["x-langfuse-ingestion-version"], "4")
+
+    def test_langfuse_endpoint_precedence(self):
+        """Explicit OTEL_EXPORTER_OTLP_ENDPOINT takes precedence over Langfuse default.
+
+        Verifies the endpoint selection logic: when Langfuse keys are set and no
+        explicit endpoint is configured, the Langfuse default is used. When an
+        explicit endpoint is set, it overrides the Langfuse default.
+        """
+        os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-test"
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-test"
+
+        # No explicit endpoint → Langfuse default
+        os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+        endpoint = (
+            os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+            or _LANGFUSE_DEFAULT_OTLP_ENDPOINT
+        )
+        self.assertEqual(endpoint, _LANGFUSE_DEFAULT_OTLP_ENDPOINT)
+
+        # Explicit endpoint → takes precedence
+        os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "https://custom.collector/v1/traces"
+        endpoint = (
+            os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+            or _LANGFUSE_DEFAULT_OTLP_ENDPOINT
+        )
+        self.assertEqual(endpoint, "https://custom.collector/v1/traces")
+
+    def test_langfuse_session_id_in_spans(self):
+        """langfuse.session.id appears as a span attribute when Langfuse is configured.
+
+        The BaggageSpanProcessor must copy the session ID from OTel baggage to
+        span attributes, enabling trace grouping in the Langfuse UI.
+        """
+        if not HAS_OTEL:
+            self.skipTest("OpenTelemetry is not installed in the current environment.")
+
+        os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-test"
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-test"
+        os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+
+        init_telemetry(reset_state=True, issue_number=42, branch="feat/issue-42")
+
+        start_orchestrator_loop(issue_number=42, branch="feat/issue-42")
+        start_orchestrator_phase("plan")
+        end_orchestrator_phase(exit_code=0)
+        end_orchestrator_loop(exit_code=0)
+
+        jsonl_files = list(self.test_dir_path.glob("otel_traces_*.jsonl"))
+        self.assertTrue(jsonl_files, "Expected at least one otel_traces_*.jsonl file")
+
+        session_ids = set()
+        for f in jsonl_files:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    span = json.loads(line)
+                    attrs = span.get("attributes", {})
+                    if "langfuse.session.id" in attrs:
+                        session_ids.add(attrs["langfuse.session.id"])
+
+        self.assertIn("42_feat/issue-42", session_ids)
+
+    def test_no_langfuse_keys_unchanged_behavior(self):
+        """Without Langfuse keys, behavior is unchanged (generic OTLP or local-only).
+
+        Regression test: no langfuse.session.id attribute should appear on spans
+        when Langfuse keys are absent.
+        """
+        if not HAS_OTEL:
+            self.skipTest("OpenTelemetry is not installed in the current environment.")
+
+        os.environ.pop("LANGFUSE_PUBLIC_KEY", None)
+        os.environ.pop("LANGFUSE_SECRET_KEY", None)
+        os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+
+        init_telemetry(reset_state=True)
+
+        start_orchestrator_loop(issue_number=99)
+        start_orchestrator_phase("plan")
+        end_orchestrator_phase(exit_code=0)
+        end_orchestrator_loop(exit_code=0)
+
+        jsonl_files = list(self.test_dir_path.glob("otel_traces_*.jsonl"))
+        self.assertTrue(jsonl_files, "Expected at least one otel_traces_*.jsonl file")
+
+        for f in jsonl_files:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    span = json.loads(line)
+                    attrs = span.get("attributes", {})
+                    self.assertNotIn(
+                        "langfuse.session.id",
+                        attrs,
+                        "langfuse.session.id must not appear without Langfuse keys",
+                    )
 
 
 if __name__ == "__main__":

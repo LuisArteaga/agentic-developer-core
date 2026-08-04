@@ -422,7 +422,9 @@ def claim_node(state: AgentState) -> AgentState:
             state["plan"] = None
             state["read_files"] = []
 
-            _safe_telemetry(start_orchestrator_loop, issue_number=issue_num)
+            _safe_telemetry(
+                start_orchestrator_loop, issue_number=issue_num, branch=branch_name
+            )
 
             try:
                 # Create and checkout the local feature branch

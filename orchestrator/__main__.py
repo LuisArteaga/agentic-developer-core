@@ -36,7 +36,11 @@ def main():
     )
 
     try:
-        init_telemetry(reset_state=not is_resume)
+        init_telemetry(
+            reset_state=not is_resume,
+            issue_number=state.get("issue_number"),
+            branch=state.get("branch"),
+        )
     except Exception as e:
         logger.debug("Non-fatal telemetry initialization error: %s", e)
 
