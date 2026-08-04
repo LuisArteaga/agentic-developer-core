@@ -1,13 +1,19 @@
 import json
+import socket
 import unittest
 from unittest.mock import MagicMock, patch
 
 from orchestrator.research_tools import (
+    MAX_FETCH_CHARS,
     MAX_SNIPPET_CHARS,
     _build_search_tool_parameters,
     _coerce_text,
     _extract_json_block,
     _parse_search_results,
+    fetch_url,
+    is_domain_allowed,
+    is_ssrf_safe_url,
+    is_url_allowed,
     web_search,
 )
 from orchestrator.sources_config import SearchParametersConfig, SourcesConfig
@@ -253,6 +259,380 @@ class TestWebSearchTool(unittest.TestCase):
             web_search.invoke({"query": "q"})
         tool_def = llm.bind.call_args.kwargs["tools"][0]
         self.assertEqual(tool_def["parameters"]["allowed_domains"], ["arxiv.org"])
+
+
+def _gaia(addr):
+    """Build a getaddrinfo-style record list for a single resolved IP."""
+    # getaddrinfo returns 5-tuples; index 4 is the sockaddr, whose [0] is the IP.
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, 0))]
+
+
+class TestIsSsrfSafeUrl(unittest.TestCase):
+    def _patch_gai(self, addrs):
+        return patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            side_effect=lambda host, port: (
+                _gaia(addrs)
+                if isinstance(addrs, str)
+                else sum((_gaia(a) for a in addrs), [])
+            ),
+        )
+
+    def test_public_ip_is_safe(self):
+        with self._patch_gai("93.184.216.34"):
+            self.assertTrue(is_ssrf_safe_url("https://example.com/"))
+
+    def test_loopback_blocked(self):
+        with self._patch_gai("127.0.0.1"):
+            self.assertFalse(is_ssrf_safe_url("http://localhost/"))
+
+    def test_ipv6_loopback_blocked(self):
+        with patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            return_value=[
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0))
+            ],
+        ):
+            self.assertFalse(is_ssrf_safe_url("http://[::1]/"))
+
+    def test_link_local_blocked(self):
+        # 169.254.169.254 — AWS / GCP cloud metadata endpoint.
+        with self._patch_gai("169.254.169.254"):
+            self.assertFalse(
+                is_ssrf_safe_url("http://169.254.169.254/latest/meta-data/")
+            )
+
+    def test_private_10_blocked(self):
+        with self._patch_gai("10.0.0.1"):
+            self.assertFalse(is_ssrf_safe_url("http://internal.corp/"))
+
+    def test_reserved_blocked(self):
+        with self._patch_gai("240.0.0.1"):
+            self.assertFalse(is_ssrf_safe_url("http://r.example/"))
+
+    def test_multicast_blocked(self):
+        with self._patch_gai("224.0.0.1"):
+            self.assertFalse(is_ssrf_safe_url("http://mcast.example/"))
+
+    def test_unspecified_blocked(self):
+        with self._patch_gai("0.0.0.0"):
+            self.assertFalse(is_ssrf_safe_url("http://0.0.0.0/"))
+
+    def test_any_resolved_ip_unsafe_blocks(self):
+        # DNS round-robin rebinding: one public, one private -> reject.
+        with patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            side_effect=lambda host, port: _gaia("93.184.216.34") + _gaia("10.0.0.1"),
+        ):
+            self.assertFalse(is_ssrf_safe_url("http://evil.example/"))
+
+    def test_obfuscated_decimal_ip_blocked(self):
+        # 2130706433 decimal form resolves to 127.0.0.1 via getaddrinfo.
+        with patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            side_effect=lambda host, port: (
+                _gaia("127.0.0.1") if host == "2130706433" else _gaia("1.1.1.1")
+            ),
+        ):
+            self.assertFalse(is_ssrf_safe_url("http://2130706433/"))
+
+    def test_bad_scheme_blocked(self):
+        with self._patch_gai("1.1.1.1"):
+            for bad in ("file:///etc/passwd", "ftp://example.com/", "gopher://x/"):
+                self.assertFalse(is_ssrf_safe_url(bad))
+
+    def test_no_hostname_blocked(self):
+        self.assertFalse(is_ssrf_safe_url("https:///path"))
+
+    def test_dns_failure_blocked(self):
+        with patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            side_effect=socket.gaierror,
+        ):
+            self.assertFalse(is_ssrf_safe_url("https://nonexistent.invalid/"))
+
+
+class TestIsDomainAllowed(unittest.TestCase):
+    def test_non_strict_allows_all(self):
+        sources = SourcesConfig(strict=False)
+        self.assertTrue(is_domain_allowed("https://anything.example/x", sources))
+
+    def test_strict_exact_url_match(self):
+        sources = SourcesConfig(strict=True, urls=["https://docs.python.org/3/"])
+        self.assertTrue(is_domain_allowed("https://docs.python.org/3/", sources))
+        self.assertFalse(is_domain_allowed("https://docs.python.org/2/", sources))
+
+    def test_strict_exact_domain_match(self):
+        sources = SourcesConfig(strict=True, domains=["arxiv.org"])
+        self.assertTrue(is_domain_allowed("https://arxiv.org/abs/1", sources))
+
+    def test_strict_subdomain_match(self):
+        sources = SourcesConfig(strict=True, domains=["python.org"])
+        self.assertTrue(is_domain_allowed("https://docs.python.org/3/", sources))
+
+    def test_strict_non_match_blocked(self):
+        sources = SourcesConfig(strict=True, domains=["python.org"])
+        self.assertFalse(is_domain_allowed("https://evil.com/", sources))
+
+    def test_strict_substring_not_a_subdomain(self):
+        # "notpython.org" must not match "python.org".
+        sources = SourcesConfig(strict=True, domains=["python.org"])
+        self.assertFalse(is_domain_allowed("https://notpython.org/", sources))
+
+
+class TestIsUrlAllowed(unittest.TestCase):
+    def test_combines_ssrf_and_strict(self):
+        sources = SourcesConfig(strict=True, domains=["example.com"])
+        with patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            return_value=_gaia("93.184.216.34"),
+        ):
+            self.assertTrue(is_url_allowed("https://example.com/", sources))
+        with patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            return_value=_gaia("10.0.0.1"),
+        ):
+            self.assertFalse(is_url_allowed("https://example.com/", sources))
+
+
+class TestFetchUrlTool(unittest.TestCase):
+    def _sources(self, strict=False, **kw):
+        # Strict mode requires at least one domain/url to pass Pydantic validation.
+        if strict and not kw.get("domains") and not kw.get("urls"):
+            kw["domains"] = ["allowed.example"]
+        return SourcesConfig(strict=strict, **kw)
+
+    def _patch_ssrf(self, safe=True):
+        return patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=safe)
+
+    def _patch_domain(self, allowed=True):
+        return patch(
+            "orchestrator.research_tools.is_domain_allowed", return_value=allowed
+        )
+
+    def test_tool_name_and_doc(self):
+        self.assertEqual(fetch_url.name, "fetch_url")
+        self.assertIn("Fetch the text content", fetch_url.description)
+
+    def test_ssrf_blocked_start_url(self):
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=False),
+        ):
+            out = fetch_url.invoke({"url": "http://169.254.169.254/"})
+        self.assertIn("blocked by SSRF protection", out)
+        self.assertIn("169.254.169.254", out)
+
+    def test_strict_mode_blocks_unlisted_url(self):
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(strict=True),
+            ),
+            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=False),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/"})
+        self.assertIn("restricted under strict mode", out)
+
+    def test_successful_fetch_returns_text(self):
+        fake_resp = MagicMock()
+        fake_resp.read.return_value = b"<html>hello</html>"
+        fake_resp.status = 200
+        fake_resp.headers.get_content_charset.return_value = "utf-8"
+        fake_resp.__enter__ = MagicMock(return_value=fake_resp)
+        fake_resp.__exit__ = MagicMock(return_value=False)
+        opener = MagicMock()
+        opener.open.return_value = fake_resp
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/"})
+        self.assertEqual(out, "<html>hello</html>")
+
+    def test_truncates_long_response(self):
+        body = "x" * (MAX_FETCH_CHARS + 500)
+        fake_resp = MagicMock()
+        fake_resp.read.return_value = body.encode()
+        fake_resp.status = 200
+        fake_resp.headers.get_content_charset.return_value = "utf-8"
+        fake_resp.__enter__ = MagicMock(return_value=fake_resp)
+        fake_resp.__exit__ = MagicMock(return_value=False)
+        opener = MagicMock()
+        opener.open.return_value = fake_resp
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/"})
+        self.assertEqual(
+            len(out), MAX_FETCH_CHARS + len("[truncated due to length]") + 1
+        )  # +1 for leading \n
+        self.assertTrue(out.endswith("[truncated due to length]"))
+
+    def test_binary_content_returns_error(self):
+        fake_resp = MagicMock()
+        fake_resp.read.return_value = b"\x00\x01\x02binary\xff"
+        fake_resp.status = 200
+        fake_resp.headers.get_content_charset.return_value = "utf-8"
+        fake_resp.__enter__ = MagicMock(return_value=fake_resp)
+        fake_resp.__exit__ = MagicMock(return_value=False)
+        opener = MagicMock()
+        opener.open.return_value = fake_resp
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/img"})
+        self.assertIn("non-text", out)
+
+    def test_redirect_to_safe_url_followed(self):
+        # First call raises _Redirect to a safe URL; second returns content.
+        from orchestrator.research_tools import _Redirect
+
+        good_resp = MagicMock()
+        good_resp.read.return_value = b"<html>final</html>"
+        good_resp.status = 200
+        good_resp.headers.get_content_charset.return_value = "utf-8"
+        good_resp.__enter__ = MagicMock(return_value=good_resp)
+        good_resp.__exit__ = MagicMock(return_value=False)
+        opener = MagicMock()
+        opener.open.side_effect = [
+            _Redirect("https://docs.example.org/page", 302),
+            good_resp,
+        ]
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/"})
+        self.assertEqual(out, "<html>final</html>")
+        # is_ssrf_safe_url called once for the start URL + once for the redirect target.
+        self.assertGreaterEqual(opener.open.call_count, 2)
+
+    def test_redirect_to_private_ip_blocked(self):
+        from orchestrator.research_tools import _Redirect
+
+        opener = MagicMock()
+        opener.open.side_effect = [_Redirect("http://169.254.169.254/", 302)]
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch(
+                "orchestrator.research_tools.is_ssrf_safe_url",
+                side_effect=[True, False],
+            ),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/"})
+        self.assertIn("redirect target", out)
+        self.assertIn("blocked by SSRF protection", out)
+
+    def test_http_error_returns_error(self):
+        import email.message
+        import urllib.error
+
+        opener = MagicMock()
+        opener.open.side_effect = urllib.error.HTTPError(
+            "https://example.com/", 404, "Not Found", email.message.Message(), None
+        )
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/missing"})
+        self.assertIn("HTTP 404", out)
+
+    def test_timeout_returns_error(self):
+        opener = MagicMock()
+        opener.open.side_effect = socket.timeout()
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/"})
+        self.assertIn("timed out", out)
+
+    def test_too_many_redirects(self):
+        from orchestrator.research_tools import MAX_REDIRECTS, _Redirect
+
+        opener = MagicMock()
+        # Every hop redirects; loops MAX_REDIRECTS+1 times then gives up.
+        opener.open.side_effect = [_Redirect("https://example.com/p", 302)] * (
+            MAX_REDIRECTS + 1
+        )
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/"})
+        self.assertIn("too many redirects", out)
 
 
 if __name__ == "__main__":

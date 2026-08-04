@@ -5,7 +5,7 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
 from orchestrator import tools as codebase_tools
-from orchestrator.research_tools import web_search
+from orchestrator.research_tools import fetch_url, web_search
 from orchestrator.state import get_log_dir
 
 # Set up logging
@@ -59,7 +59,15 @@ def run_command(command: str) -> str:
 
 def get_worker_tools() -> list:
     """Return the list of wrapped LangChain tools for the worker agent."""
-    return [read_file, list_directory, grep_search, patch_file, run_command, web_search]
+    return [
+        read_file,
+        list_directory,
+        grep_search,
+        patch_file,
+        run_command,
+        web_search,
+        fetch_url,
+    ]
 
 
 # System Prompt incorporating all behavior guardrails
@@ -90,6 +98,12 @@ SYSTEM_PROMPT = (
     "unfamiliar API signature, a library version change, or an error message you cannot diagnose. Do NOT search for "
     "things you can determine by reading the codebase with `read_file`, `list_directory`, or `grep_search`. Search "
     "results are returned as a JSON list of {title, url, snippet}; use them to inform your edits.\n\n"
+    "6. URL FETCH (DEEPER READING):\n"
+    "   The `fetch_url` tool retrieves the full text content of a specific URL — typically a documentation page, API "
+    "reference, or article surfaced by `web_search`. Use it AFTER `web_search` when a search snippet is too short to "
+    "resolve your question and you need the page's full content. It is SSRF-protected (internal addresses are blocked) "
+    "and truncates responses beyond 50,000 characters. Do NOT use it for URLs you could find yourself in the codebase; "
+    "reserve it for external documentation.\n\n"
     "Work carefully, keep your changes minimal, and ensure the test suite passes before concluding your work."
 )
 

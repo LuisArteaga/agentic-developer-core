@@ -1,26 +1,37 @@
-"""Web Search Worker Tool.
+"""Web Search & URL Fetch Worker Tools.
 
-A LangChain ``@tool`` that lets the ReAct Worker research library APIs, error
-messages, or unfamiliar patterns inline during the Execute phase. The tool is a
-structured-output wrapper around OpenRouter's server-side ``web_search`` tool:
-it binds ``openrouter:web_search`` to a cheap flash model (resolved via
-``resolve_model_config("web_search")``), forces ``tool_choice`` to guarantee
-search execution, instructs the model to append a JSON block of results, and
-parses that block into ``[{title, url, snippet}]`` with snippets truncated to
-300 chars.
+Two on-demand Worker Tools (ADR-0011 ReAct pattern) for inline research during
+the Execute phase, both sharing ``config/sources.toml`` (issues #38, #40):
 
-Search runs server-side at OpenRouter, so SSRF risk is near-zero (the tool
-makes no direct outbound HTTP to retrieved URLs — that is the URL Fetch tool's
-job, issue #39). This is the proven pattern ported from agentic-planner-core's
-``planner/nodes/web_search.py`` and ``planner/tools/research.py`` (ADR-0009
-Radical Simplicity), wrapped as an on-demand Worker Tool rather than a static
-graph node (ADR-0011 ReAct pattern).
+* ``web_search`` — a structured-output wrapper around OpenRouter's server-side
+  ``openrouter:web_search`` tool. Binds the tool to a cheap flash model
+  (resolved via ``resolve_model_config("web_search")``), forces ``tool_choice``
+  to guarantee search execution, instructs the model to append a JSON block of
+  results, and parses it into ``[{title, url, snippet}]`` with snippets
+  truncated to 300 chars. Search runs server-side at OpenRouter, so SSRF risk is
+  near-zero (the tool makes no direct outbound HTTP to retrieved URLs — that is
+  the URL Fetch tool's job). Ported from agentic-planner-core's
+  ``planner/nodes/web_search.py`` and ``planner/tools/research.py``
+  (ADR-0009 Radical Simplicity).
+
+* ``fetch_url`` — retrieves the text content of a specific URL (e.g. a doc page
+  found via web_search). Enforces SSRF protection via a manual redirect loop
+  with per-hop resolved-IP validation (porting planner-core's
+  ``is_ssrf_safe_url`` / ``is_url_allowed`` / ``is_domain_allowed``), and
+  optional strict-mode domain allowlisting from ``sources.toml``. Uses stdlib
+  ``urllib`` (not requests/httpx) per ADR-0017's minimal-dependency stance.
+  See ADR-0028 for the SSRF validation strategy.
 """
 
+import ipaddress
 import json
 import logging
 import re
+import socket
+import urllib.error
+import urllib.request
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
@@ -187,3 +198,226 @@ def web_search(query: str) -> str:
     if not results:
         return f"No search results found for query: {query}"
     return json.dumps(results, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# URL Fetch Worker Tool (issue #40) — SSRF-safe retrieval of a URL's text.
+#
+# SSRF protection is implemented as a manual redirect loop with per-hop
+# resolved-IP validation, porting planner-core's URL-level pattern. See
+# ADR-0028 for the rationale (manual per-hop vs. transport-level IP pinning)
+# and the external references.
+# ---------------------------------------------------------------------------
+
+# Schemes permitted by fetch_url. file://, gopher://, ftp://, etc. are SSRF
+# vectors and are rejected.
+ALLOWED_SCHEMES = {"http", "https"}
+
+# Response truncation bound (matches planner-core's fetch_url_content).
+MAX_FETCH_CHARS = 50_000
+# Byte read budget: large enough to decode up to MAX_FETCH_CHARS of 4-byte
+# UTF-8 and still detect whether the body exceeds the cap.
+MAX_FETCH_BYTES = (MAX_FETCH_CHARS * 4) + 1
+TRUNCATION_NOTE = "\n[truncated due to length]"
+
+# Per-hop and overall fetch budgets.
+FETCH_TIMEOUT = 15.0
+MAX_REDIRECTS = 5
+
+# Plain User-Agent — deliberately NOT the GitHub auth token, to avoid leaking
+# credentials to third-party domains (issue #40 constraint).
+USER_AGENT = "agentic-developer-core/worker fetch_url tool"
+
+# SSRF error prefixes surfaced to the Worker.
+_SSRF_BLOCKED_MSG = (
+    "Error: URL '{url}' is blocked by SSRF protection "
+    "(private/loopback/link-local/reserved/multicast/unspecified address)."
+)
+_STRICT_BLOCKED_MSG = "Error: Access to URL '{url}' restricted under strict mode."
+_SSRF_REDIRECT_BLOCKED_MSG = (
+    "Error: redirect target '{url}' is blocked by SSRF protection."
+)
+_STRICT_REDIRECT_BLOCKED_MSG = (
+    "Error: redirect target '{url}' restricted under strict mode."
+)
+
+
+class _Redirect(Exception):
+    """Raised by the no-redirect handler to surface a 3xx Location to the
+    fetch loop, which validates the new URL before following it."""
+
+    def __init__(self, new_url: str, code: int) -> None:
+        super().__init__(new_url)
+        self.new_url = new_url
+        self.code = code
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Replace urllib's default redirect-following handler so the fetch loop
+    owns redirect traversal and can validate each hop's resolved IP."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        raise _Redirect(newurl, code)
+
+
+def is_ssrf_safe_url(url: str) -> bool:
+    """Return True iff ``url`` has an http/https scheme and *every* resolved
+    IP address of its host is non-private / non-loopback / non-link-local /
+    non-reserved / non-multicast / non-unspecified.
+
+    Resolving all addresses (not just the first) defends against DNS
+    round-robin rebinding where a host resolves to both a public and a
+    private address (drawbridge / Stytch). Obfuscated IP forms
+    (e.g. ``http://2130706433/``) are normalized by ``getaddrinfo`` before
+    the ``ipaddress`` check, so they cannot bypass validation.
+    """
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ALLOWED_SCHEMES:
+        return False
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    # No resolved addresses at all is treated as unsafe (cannot validate).
+    if not infos:
+        return False
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            # Unparseable address record — fail closed.
+            return False
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return False
+    return True
+
+
+def is_domain_allowed(url: str, sources: SourcesConfig) -> bool:
+    """Return True iff ``url`` passes the optional strict-mode allowlist.
+
+    Under strict mode, a URL is allowed when it exactly matches an entry in
+    ``sources.urls`` (scheme/host/path comparison) or when its hostname is an
+    exact or subdomain match of an entry in ``sources.domains``. In
+    non-strict mode the allowlist is bypassed (SSRF protection still applies
+    in ``is_url_allowed``).
+    """
+    if not sources.strict:
+        return True
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    url_norm = url.strip().lower()
+    for allowed_url in sources.urls:
+        if url_norm == allowed_url.strip().lower():
+            return True
+    for domain in sources.domains:
+        d = domain.strip().lower()
+        if not d:
+            continue
+        if host == d or host.endswith("." + d):
+            return True
+    return False
+
+
+def is_url_allowed(url: str, sources: SourcesConfig) -> bool:
+    """Combine SSRF safety and strict-mode allowlisting.
+
+    SSRF protection is always enforced; the domain allowlist is an additional
+    restriction applied only under strict mode.
+    """
+    return is_ssrf_safe_url(url) and is_domain_allowed(url, sources)
+
+
+def _fetch_once(url: str, opener: urllib.request.OpenerDirector):
+    """Issue a single non-redirecting GET and return ``(status, headers, text)``.
+
+    Reads at most ``MAX_FETCH_BYTES`` so a large body cannot exhaust memory.
+    Decodes using the response's declared charset (UTF-8 fallback) with
+    ``errors="replace"`` so exotic encodings never crash the Worker.
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with opener.open(req, timeout=FETCH_TIMEOUT) as resp:
+        raw = resp.read(MAX_FETCH_BYTES)
+        status = resp.status
+        headers = resp.headers
+    charset = headers.get_content_charset() or "utf-8"
+    text = raw.decode(charset, errors="replace")
+    return status, headers, text
+
+
+def _truncate(text: str) -> str:
+    """Truncate to ``MAX_FETCH_CHARS`` characters, appending a note when the
+    body exceeded the cap (i.e. the byte read budget was saturated)."""
+    if len(text) > MAX_FETCH_CHARS:
+        return text[:MAX_FETCH_CHARS] + TRUNCATION_NOTE
+    return text
+
+
+@tool
+def fetch_url(url: str) -> str:
+    """Fetch the text content of a URL (e.g. a documentation page found via web_search).
+
+    Use this AFTER `web_search` when you need the full content of a documentation page,
+    API reference, or article referenced in the search results. The fetch is SSRF-protected
+    (private/internal addresses are blocked) and responses over 50,000 characters are
+    truncated. Returns the page text, or an error message beginning with 'Error:'.
+    """
+    sources = load_sources_config()
+
+    # Pre-flight: enforce SSRF + optional strict-mode allowlist on the start URL.
+    if not is_ssrf_safe_url(url):
+        return _SSRF_BLOCKED_MSG.format(url=url)
+    if not is_domain_allowed(url, sources):
+        return _STRICT_BLOCKED_MSG.format(url=url)
+
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        try:
+            status, headers, text = _fetch_once(current, opener)
+        except _Redirect as r:
+            new_url = urljoin(current, r.new_url)
+            # Re-validate every redirect hop before following it (issue #40
+            # edge case: redirect to a private/internal IP).
+            if not is_ssrf_safe_url(new_url):
+                return _SSRF_REDIRECT_BLOCKED_MSG.format(url=new_url)
+            if not is_domain_allowed(new_url, sources):
+                return _STRICT_REDIRECT_BLOCKED_MSG.format(url=new_url)
+            current = new_url
+            continue
+        except urllib.error.HTTPError as e:
+            return f"Error: HTTP {e.code} fetching '{current}'."
+        except socket.timeout:
+            return f"Error: request to '{current}' timed out."
+        except urllib.error.URLError as e:
+            return f"Error fetching URL '{current}': {e.reason}"
+        except Exception as e:  # noqa: BLE001 — never crash the Worker
+            return f"Error fetching URL '{current}': {e}"
+
+        # Non-text (binary) detection: a null byte in the leading content
+        # indicates the body is not decodable text the Worker can reason over.
+        if "\0" in text[:1024]:
+            return f"Error: URL '{current}' returned non-text (binary) content."
+
+        logger.info(
+            "fetch_url retrieved '%s' (status=%s, chars=%d)", current, status, len(text)
+        )
+        return _truncate(text)
+
+    return f"Error: too many redirects (>{MAX_REDIRECTS}) when fetching '{url}'."
