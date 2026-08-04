@@ -63,8 +63,13 @@ VALID_STATUSES = {
 }
 
 
-def get_state_filepath() -> Path:
-    """Resolve and return the path to the state.json file, honoring the AGENT_LOG_PATH env var."""
+def get_log_dir() -> Path:
+    """Resolve and return the agent log directory, honoring the AGENT_LOG_PATH env var.
+
+    Relative paths are resolved against the project root. The directory is created
+    if missing. This is the single source of truth for the AGENT_LOG_PATH location
+    shared by state persistence, telemetry, and worker trace sidecars (ADR-0016).
+    """
     log_dir_name = os.getenv("AGENT_LOG_PATH", ".agent_logs")
     log_dir = Path(log_dir_name)
 
@@ -77,7 +82,12 @@ def get_state_filepath() -> Path:
         log_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
-    return log_dir / "state.json"
+    return log_dir
+
+
+def get_state_filepath() -> Path:
+    """Resolve and return the path to the state.json file, honoring the AGENT_LOG_PATH env var."""
+    return get_log_dir() / "state.json"
 
 
 def save(state: AgentState, filepath: str | Path | None = None) -> None:

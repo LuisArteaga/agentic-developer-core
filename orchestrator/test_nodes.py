@@ -801,6 +801,8 @@ class TestExecuteNode(unittest.TestCase):
         mock_execute_worker.assert_called_once_with(
             "Title: Fix a bug\n\nThere is a bug in main.py.",
             '{"rationale": "...", "tasks": []}',
+            issue_number=10,
+            attempt=1,
         )
 
         # Verify state file was saved
@@ -835,7 +837,10 @@ class TestExecuteNode(unittest.TestCase):
             "AssertionError: 2 != 3 in test_main.py"
         )
         mock_execute_worker.assert_called_once_with(
-            expected_issue_description, '{"rationale": "...", "tasks": []}'
+            expected_issue_description,
+            '{"rationale": "...", "tasks": []}',
+            issue_number=10,
+            attempt=1,
         )
 
     @patch("orchestrator.nodes._github_api_request")

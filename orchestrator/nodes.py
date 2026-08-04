@@ -737,7 +737,16 @@ def execute_node(state: AgentState) -> AgentState:
         logger.info("Invoking worker agent...")
         from orchestrator.worker import execute_worker
 
-        execute_worker(issue_description, plan)
+        # Derive the 1-based execute attempt index from the verify retry counter
+        # (first execute = 1, after a failed verify = 2, ...). Used only to name
+        # the Worker Trace sidecar file.
+        attempt = state.get("attempts", {}).get("verify", 0) + 1
+        execute_worker(
+            issue_description,
+            plan,
+            issue_number=issue_num,
+            attempt=attempt,
+        )
         logger.info("Worker agent execution completed successfully.")
         _safe_telemetry(end_orchestrator_phase, exit_code=0)
 
@@ -1279,7 +1288,13 @@ def test_writer_node(state: AgentState) -> AgentState:
 
             from orchestrator.worker import execute_worker
 
-            execute_worker(instructions, plan, node_name="test_writer")
+            execute_worker(
+                instructions,
+                plan,
+                node_name="test_writer",
+                issue_number=issue_num,
+                attempt=attempt,
+            )
 
             # Run programmatic pre-verification check
             logger.info("Running pre-verification check on generated tests...")
