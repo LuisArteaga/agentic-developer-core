@@ -222,3 +222,7 @@ __marimo__/
 # Antigravity Agents
 .agents/
 .teaching-checklist.md
+
+# Agent logs (otel_traces, debug logs, etc.)
+agent_logs/
+.agent_logs/
