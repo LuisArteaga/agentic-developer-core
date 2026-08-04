@@ -170,6 +170,99 @@ class TestGitSubprocessHelper(unittest.TestCase):
         with tempfile.TemporaryDirectory() as non_repo:
             self.assertEqual(diff_cached(Path(non_repo)), "")
 
+    def test_diff_name_only_local_base_lists_changed_files(self):
+        """diff_name_only lists files changed between a local base and HEAD."""
+        from orchestrator.git import diff_name_only
+
+        # Create and checkout a feature branch off main, then add changes.
+        subprocess.run(
+            ["git", "checkout", "-b", "feat-x"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+        (self.repo_path / "initial.txt").write_text("changed", encoding="utf-8")
+        (self.repo_path / "new_file.txt").write_text("brand new", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(self.repo_path), check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "branch work"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+
+        names = diff_name_only(self.repo_path, base="main...HEAD")
+        changed = {line for line in names.splitlines() if line.strip()}
+        self.assertEqual(changed, {"initial.txt", "new_file.txt"})
+
+    def test_diff_name_only_origin_main_path(self):
+        """diff_name_only resolves origin/main...HEAD when an origin remote exists."""
+        from orchestrator.git import diff_name_only
+
+        # Set up a bare repo as origin, push main, and fetch so the
+        # refs/remotes/origin/main ref exists locally (mirrors production clone).
+        origin_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(origin_temp.cleanup)
+        origin_path = Path(origin_temp.name).resolve() / "origin.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(origin_path)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(origin_path)],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "push", "origin", "main"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+
+        # Branch off main and commit changes.
+        subprocess.run(
+            ["git", "checkout", "-b", "feat-obs"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+        (self.repo_path / "added.py").write_text("x = 1", encoding="utf-8")
+        subprocess.run(["git", "add", "added.py"], cwd=str(self.repo_path), check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add file"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+
+        names = diff_name_only(self.repo_path, base="origin/main...HEAD")
+        changed = {line for line in names.splitlines() if line.strip()}
+        self.assertEqual(changed, {"added.py"})
+
+    def test_diff_name_only_empty_on_missing_ref(self):
+        """diff_name_only returns '' (never raises) when the base ref is absent."""
+        from orchestrator.git import diff_name_only
+
+        self.assertEqual(
+            diff_name_only(self.repo_path, base="origin/nonexistent...HEAD"), ""
+        )
+
+    def test_diff_name_only_empty_in_non_repository(self):
+        """diff_name_only never raises on a non-repo dir."""
+        from orchestrator.git import diff_name_only
+
+        with tempfile.TemporaryDirectory() as non_repo:
+            self.assertEqual(diff_name_only(Path(non_repo)), "")
+
     def test_clean_and_reset_hard(self):
         """Test workspace hygiene commands: clean and reset_hard."""
         # Modify an existing tracked file

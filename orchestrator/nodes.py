@@ -23,6 +23,7 @@ from orchestrator.git import (
     clone,
     commit,
     diff_cached,
+    diff_name_only,
     get_commit_time,
     get_remote_url,
     is_git_repository,
@@ -587,6 +588,21 @@ def plan_node(state: AgentState) -> AgentState:
 
         structured_llm = llm.with_structured_output(DevelopmentPlan)
 
+        # Run Observability (ADR-0029): capture planning tokens from the
+        # structured-output invoke. ``.with_structured_output()`` returns a
+        # Pydantic model, not an AIMessage, so usage_metadata is not directly
+        # accessible on the return value. A custom TokenUsageCallbackHandler
+        # attached to the invoke() call reads AIMessage.usage_metadata from the
+        # on_llm_end event instead. The canonical UsageMetadataCallbackHandler is
+        # not used because it keys on response_metadata["model_name"], which the
+        # chat-completions path does not populate for OpenRouter — see ADR-0029.
+        from langchain_core.runnables import RunnableConfig
+
+        from orchestrator.metrics import TokenUsageCallbackHandler, get_collector
+
+        token_handler = TokenUsageCallbackHandler()
+        invoke_config: RunnableConfig = {"callbacks": [token_handler]}
+
         # 6. Call the LLM with prompt injection safeguards and strict delimiters
         prompt = (
             f"You are a principal software architect. Your goal is to analyze the claimed issue and the current "
@@ -606,7 +622,9 @@ def plan_node(state: AgentState) -> AgentState:
         )
 
         logger.info("Invoking LLM for structured planning...")
-        plan_obj = cast(DevelopmentPlan, structured_llm.invoke(prompt))
+        plan_obj = cast(
+            DevelopmentPlan, structured_llm.invoke(prompt, config=invoke_config)
+        )
 
         if not plan_obj or not getattr(plan_obj, "tasks", None):
             raise ValueError("LLM returned an empty or invalid plan.")
@@ -630,7 +648,10 @@ def plan_node(state: AgentState) -> AgentState:
                     f"Using the additional outlines above, revise your plan with improved accuracy."
                 )
                 logger.info("Re-invoking LLM with enriched context...")
-                plan_obj = cast(DevelopmentPlan, structured_llm.invoke(prompt))
+                plan_obj = cast(
+                    DevelopmentPlan,
+                    structured_llm.invoke(prompt, config=invoke_config),
+                )
 
                 if not plan_obj or not getattr(plan_obj, "tasks", None):
                     raise ValueError(
@@ -650,6 +671,11 @@ def plan_node(state: AgentState) -> AgentState:
         state["plan"] = plan_json
 
         logger.info("Successfully generated and saved structured plan.")
+        # Run Observability (ADR-0029): record planning tokens accumulated by
+        # the TokenUsageCallbackHandler across the initial invoke and any
+        # Plan-Detail-Request re-invoke. Recorded only on success so a failed
+        # plan (which transitions to recovery) contributes no metrics.
+        get_collector().add_planning_tokens(token_handler.total_tokens)
         _safe_telemetry(end_orchestrator_phase, exit_code=0)
 
     except Exception as e:
@@ -1213,6 +1239,38 @@ def _parse_iso_datetime(dt_str: str) -> datetime.datetime:
     return datetime.datetime.fromisoformat(dt_str)
 
 
+def _record_plan_alignment(state: AgentState, workspace_path: Path) -> None:
+    """Compute and record Plan Alignment (PA) for the current cycle (ADR-0029).
+
+    ``Files Planned`` are extracted from the serialized ``DevelopmentPlan`` in
+    state (the union of every task's ``target_files``); ``Files Modified`` are
+    obtained from ``git diff --name-only origin/main...HEAD``. PA is the overlap
+    ratio ``|planned ∩ modified| / |modified|``, or ``None`` when no files were
+    modified. Never raises: a git/parse failure leaves PA unset (None) and an
+    empty file list, so the PR phase is unaffected.
+    """
+    try:
+        from orchestrator.metrics import (
+            compute_plan_alignment,
+            extract_planned_files,
+            get_collector,
+        )
+
+        planned = extract_planned_files(state.get("plan"))
+        modified_raw = diff_name_only(workspace_path, "origin/main...HEAD")
+        modified = [line for line in modified_raw.splitlines() if line.strip()]
+        alignment = compute_plan_alignment(planned, modified)
+        get_collector().set_plan_alignment(alignment, planned, modified)
+        logger.info(
+            "Plan Alignment recorded: %s (planned=%d, modified=%d)",
+            alignment,
+            len(planned),
+            len(modified),
+        )
+    except Exception as e:  # noqa: BLE001 - graceful degradation
+        logger.debug("Plan Alignment collection failed: %s", e)
+
+
 def pr_node(state: AgentState) -> AgentState:
     """Stages, commits, and pushes local changes, then creates a Pull Request via GitHub REST API if not already present."""
     issue_num = state.get("issue_number")
@@ -1238,6 +1296,15 @@ def pr_node(state: AgentState) -> AgentState:
         commit_message = f"feat: resolve issue #{issue_num}"
         logger.info("Committing changes with message: '%s'", commit_message)
         commit(workspace_path, commit_message)
+
+        # 2b. Run Observability — Plan Alignment (ADR-0029)
+        # Computed right after the commit, before the push, so HEAD carries the
+        # committed work and `origin/main...HEAD` resolves to every file changed
+        # across the branch (all Verify retries already reflected in the diff).
+        # Files Planned come from the serialized DevelopmentPlan in state; both
+        # inputs are guaranteed present here. Computation is best-effort: a git
+        # or parse failure degrades PA to None rather than breaking the PR phase.
+        _record_plan_alignment(state, workspace_path)
 
         # 3. Push branch to remote
         branch_name = state["branch"]

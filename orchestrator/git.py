@@ -145,6 +145,35 @@ def diff_cached(repo_dir: Path | str) -> str:
         return ""
 
 
+def diff_name_only(repo_dir: Path | str, base: str = "origin/main...HEAD") -> str:
+    """Return the ``--name-only`` diff of changed files between ``base`` and HEAD.
+
+    Uses the three-dot range ``origin/main...HEAD`` by default to capture every
+    file changed on the feature branch since it diverged from the default
+    branch — all changes across the branch, not just the latest commit. This is
+    the input for Plan Alignment (Run Observability, ADR-0029), called from the
+    PR-Node right after the branch commit so HEAD carries the committed work.
+
+    Returns the raw stdout (one path per line), or an empty string if the
+    directory is not a git repository or the range ref is unavailable. Never
+    raises: a failed diff degrades Plan Alignment to ``None``.
+    """
+    try:
+        result = _run_git(repo_dir, ["diff", "--name-only", base], check=False)
+        if result.returncode != 0:
+            logger.debug(
+                "diff_name_only(%s) failed (rc=%d): %s",
+                base,
+                result.returncode,
+                result.stderr.strip(),
+            )
+            return ""
+        return result.stdout
+    except GitError as e:
+        logger.debug("diff_name_only failed in %s: %s", repo_dir, e)
+        return ""
+
+
 def push(
     repo_dir: Path | str, branch: str, remote: str = "origin", force: bool = False
 ) -> None:

@@ -170,9 +170,38 @@ def execute_worker(
     # observability cannot impact execution (ADR-0016).
     _write_worker_trace(result["messages"], issue_number, attempt, node_name)
 
+    # Run Observability (ADR-0029): record Trajectory Length (TL) and token
+    # consumption from the ReAct message list. Execution tokens are recorded
+    # for every caller (Execute-Node and Test-Writer-Node both feed
+    # tokens_execution); TL is recorded only for the Execute-Node worker
+    # (node_name == "execute"), since TL measures Worker exploration efficiency
+    # per Execute attempt. All collection degrades gracefully.
+    _record_run_metrics(result["messages"], node_name)
+
     # Extract the last message from the result
     final_message = result["messages"][-1]
     return final_message.content
+
+
+def _record_run_metrics(messages, node_name: str) -> None:
+    """Record TL and execution tokens for this ReAct run (ADR-0029).
+
+    Never raises: metric collection must not break execution. Both inputs are
+    derived directly from the message list, which is guaranteed present here.
+    """
+    try:
+        from orchestrator.metrics import (
+            count_tool_invocations,
+            get_collector,
+            sum_message_tokens,
+        )
+
+        collector = get_collector()
+        collector.add_execution_tokens(sum_message_tokens(messages))
+        if node_name == "execute":
+            collector.add_trajectory_length(count_tool_invocations(messages))
+    except Exception as e:  # noqa: BLE001 - graceful degradation
+        logger.debug("Run metrics collection failed: %s", e)
 
 
 def _coerce_content(content) -> str:
