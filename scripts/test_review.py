@@ -933,5 +933,159 @@ class FallbackIndicatorTests(unittest.TestCase):
         self.assertEqual(body.count("Fallback Model Used"), 1)
 
 
+class CiCoverageOutputTests(unittest.TestCase):
+    """Tests for the CI coverage output loading + Test Coverage prompt
+    augmentation (issue #45 / ADR-0030)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self._tmp.name).resolve()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_output(self, name: str, content: str) -> str:
+        path = self.workspace / name
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+
+    # --- _tail_clip ---
+
+    def test_tail_clip_under_budget_unchanged(self):
+        """AC: text under budget is returned unchanged."""
+        self.assertEqual(review._tail_clip("short", 100), "short")
+
+    def test_tail_clip_over_budget_keeps_tail_with_note(self):
+        """AC: text over budget keeps the last budget chars and prefixes a note."""
+        budget = 50
+        text = "H" * 30 + "T" * 80  # head=H..., tail=T...
+        result = review._tail_clip(text, budget)
+        self.assertIn("[NOTE: CI output truncated to last 50 chars", result)
+        # The tail (T chars) is preserved.
+        self.assertTrue(result.endswith("T" * 50))
+        # The head (H chars) is dropped.
+        self.assertNotIn("H", result)
+
+    def test_tail_clip_exact_budget_unchanged(self):
+        """AC: text exactly at budget is returned unchanged (no note)."""
+        budget = 10
+        text = "x" * budget
+        self.assertEqual(review._tail_clip(text, budget), text)
+
+    # --- _get_ci_coverage_output_budget ---
+
+    def test_budget_env_override(self):
+        """AC: CI_COVERAGE_OUTPUT_MAX_CHARS env overrides the default."""
+        with patch.dict(os.environ, {"CI_COVERAGE_OUTPUT_MAX_CHARS": "12345"}):
+            self.assertEqual(review._get_ci_coverage_output_budget(), 12345)
+
+    def test_budget_default_when_env_unset(self):
+        """AC: default budget used when env unset."""
+        env = {
+            k: v for k, v in os.environ.items() if k != "CI_COVERAGE_OUTPUT_MAX_CHARS"
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                review._get_ci_coverage_output_budget(),
+                review.CI_COVERAGE_OUTPUT_MAX_CHARS,
+            )
+
+    # --- load_ci_coverage_output ---
+
+    def test_load_unset_env_returns_empty(self):
+        """AC: env var unset -> empty string (graceful degradation)."""
+        env = {k: v for k, v in os.environ.items() if k != "CI_COVERAGE_OUTPUT_PATH"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(review.load_ci_coverage_output(), "")
+
+    def test_load_missing_file_returns_empty(self):
+        """AC: path set but file missing -> empty string."""
+        with patch.dict(
+            os.environ,
+            {"CI_COVERAGE_OUTPUT_PATH": str(self.workspace / "nope.txt")},
+        ):
+            self.assertEqual(review.load_ci_coverage_output(), "")
+
+    def test_load_empty_file_returns_empty(self):
+        """AC: file present but empty/whitespace -> empty string."""
+        path = self._write_output("empty.txt", "   \n  ")
+        with patch.dict(os.environ, {"CI_COVERAGE_OUTPUT_PATH": path}):
+            self.assertEqual(review.load_ci_coverage_output(), "")
+
+    def test_load_present_file_returns_content(self):
+        """AC: file with real coverage output -> its content returned."""
+        content = (
+            "test_nodes.py ....\n"
+            "---- coverage: ----\n"
+            "Name                 Stmts   Miss  Cover   Missing\n"
+            "orchestrator/nodes.py   120      4    97%   45-48\n"
+            "===== 10 passed in 1.20s =====\n"
+        )
+        path = self._write_output("cov.txt", content)
+        with patch.dict(os.environ, {"CI_COVERAGE_OUTPUT_PATH": path}):
+            self.assertEqual(review.load_ci_coverage_output(), content)
+
+    def test_load_truncates_tail_when_over_budget(self):
+        """AC: content over budget is tail-clipped with note, preserving tail."""
+        tail_marker = "COVERAGE_TABLE_END_MARKER"
+        head = "H" * 200
+        content = head + "\n" + tail_marker
+        path = self._write_output("big.txt", content)
+        with patch.dict(
+            os.environ,
+            {
+                "CI_COVERAGE_OUTPUT_PATH": path,
+                "CI_COVERAGE_OUTPUT_MAX_CHARS": "60",
+            },
+        ):
+            result = review.load_ci_coverage_output()
+        self.assertIn("[NOTE: CI output truncated to last 60 chars", result)
+        # The tail marker is preserved; the head of H's is dropped.
+        self.assertIn(tail_marker, result)
+        self.assertNotIn("H" * 200, result)
+
+    def test_load_unreadable_file_returns_empty(self):
+        """AC: OSError reading the file -> empty string, no raise."""
+        path = str(self.workspace / "unreadable.txt")
+        with patch.dict(os.environ, {"CI_COVERAGE_OUTPUT_PATH": path}):
+            # Point at a directory path to trigger an OSError on read.
+            dir_path = str(self.workspace)
+            with patch.dict(os.environ, {"CI_COVERAGE_OUTPUT_PATH": dir_path}):
+                # isfile() is False for a directory -> returns empty before read.
+                self.assertEqual(review.load_ci_coverage_output(), "")
+
+    # --- build_test_coverage_ci_augmentation ---
+
+    def test_augmentation_empty_input_returns_empty(self):
+        """AC: empty/whitespace CI output -> empty augmentation (no prompt change)."""
+        self.assertEqual(review.build_test_coverage_ci_augmentation(""), "")
+        self.assertEqual(review.build_test_coverage_ci_augmentation("   \n "), "")
+
+    def test_augmentation_contains_section_markers_and_criteria(self):
+        """AC: non-empty input -> augmentation with CI output, Q3, Q4, language-agnostic note."""
+        ci_output = "===== 5 passed in 1.0s =====\norchestrator/x.py 10 2 80% 7-8\n"
+        aug = review.build_test_coverage_ci_augmentation(ci_output)
+        self.assertIn("=== CI VERIFICATION & COVERAGE OUTPUT ===", aug)
+        self.assertIn("--- BEGIN CI OUTPUT ---", aug)
+        self.assertIn("--- END CI OUTPUT ---", aug)
+        self.assertIn(ci_output, aug)
+        self.assertIn("Q3 (Test Execution)", aug)
+        self.assertIn("Q4 (Coverage of Changed Code)", aug)
+        self.assertIn("Language Agnosticism", aug)
+        # References the shared scoring rule from the base prompt.
+        self.assertIn("SCORING RULE", aug)
+
+    def test_augmentation_preserves_base_prompt_unaffected(self):
+        """AC: base SYSTEM_PROMPT_TEST_COVERAGE keeps only Q1/Q2 (no Q3/Q4 baked in)."""
+        self.assertIn("Q1 (Test Presence)", review.SYSTEM_PROMPT_TEST_COVERAGE)
+        self.assertIn(
+            "Q2 (Test Quality/Assertions)", review.SYSTEM_PROMPT_TEST_COVERAGE
+        )
+        self.assertNotIn("Q3 (Test Execution)", review.SYSTEM_PROMPT_TEST_COVERAGE)
+        self.assertNotIn(
+            "Q4 (Coverage of Changed Code)", review.SYSTEM_PROMPT_TEST_COVERAGE
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

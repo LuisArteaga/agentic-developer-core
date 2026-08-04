@@ -9,6 +9,10 @@ env:
   OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
   GH_PAT: ${{ secrets.GH_PAT }}
   PR_NUMBER: ${{ github.event.pull_request.number }}
+  # Path to the CI test + coverage output consumed by the Test Coverage
+  # PR Review Judge (scripts/review.py). Written by the pytest step below,
+  # read by the LLM review step. See ADR-0030.
+  CI_COVERAGE_OUTPUT_PATH: ${{ github.workspace }}/ci_coverage_output.txt
 
 jobs:
   pr-checks:
@@ -49,7 +53,9 @@ jobs:
         run: mypy orchestrator scripts
 
       - name: Run Pytest Coverage Check
-        run: pytest --cov=orchestrator --cov-fail-under=89
+        run: |
+          set -o pipefail
+          pytest --cov=orchestrator --cov-report=term-missing --cov-fail-under=89 2>&1 | tee "$CI_COVERAGE_OUTPUT_PATH"
 
       - name: Run Semgrep Security Scan
         run: semgrep scan orchestrator scripts --config=auto --error
