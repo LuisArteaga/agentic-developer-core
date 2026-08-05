@@ -105,12 +105,8 @@ def _get_enclosing_function_for_line(
         (function_name, function_body) tuple, or (None, None) if no enclosing
         function/method is found.
     """
-    try:
-        parser = get_parser("python")
-        tree = parser.parse(source_bytes)
-    except Exception:
-        logger.debug("Tree-sitter parse failed for Python source", exc_info=True)
-        return None, None
+    parser = get_parser("python")
+    tree = parser.parse(source_bytes)
 
     node = tree.root_node
 
@@ -119,8 +115,6 @@ def _get_enclosing_function_for_line(
     deepest = node.descendant_for_point_range(
         (line_number - 1, 0), (line_number - 1, 0)
     )
-    if deepest is None:
-        return None, None
 
     # Traverse ancestors to find enclosing function_definition or
     # decorated_definition (which wraps decorated functions).
@@ -129,12 +123,14 @@ def _get_enclosing_function_for_line(
         if current.type in ("function_definition", "decorated_definition"):
             # For decorated_definition, the actual function node is the last child
             if current.type == "decorated_definition":
-                for child in current.children:
-                    if child.type == "function_definition":
-                        fn_node = child
-                        break
-                else:
-                    fn_node = current
+                fn_node = next(
+                    (
+                        child
+                        for child in current.children
+                        if child.type == "function_definition"
+                    ),
+                    current,
+                )
                 # Use the decorated_definition's byte range to include decorators
                 body_node = current
             else:
@@ -146,10 +142,9 @@ def _get_enclosing_function_for_line(
                 else:
                     body_node = current
 
-            # Extract function name
+            # Extract function name (function_definition always has a name field)
             name_node = fn_node.child_by_field_name("name")
-            if name_node is None:
-                return None, None
+            assert name_node is not None
             fn_name = source_bytes[name_node.start_byte : name_node.end_byte].decode(
                 "utf-8", errors="replace"
             )

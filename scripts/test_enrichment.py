@@ -258,6 +258,25 @@ class TestEnrichDiffWithFunctionContext(unittest.TestCase):
         self.assertIn("return 'hello'", enriched)
         self.assertNotIn("other", enriched)
 
+    def test_decorated_function_hunk_at_decorator_line(self):
+        """Edge case: hunk line points at the decorator line, not the def line.
+
+        Covers the decorated_definition branch where the walker encounters the
+        decorated_definition node first (when the hunk start is on a decorator).
+        """
+        self._write_file(
+            "decorated.py",
+            "@app.route('/test')\n"
+            "@login_required\n"
+            "def my_view():\n"
+            "    return 'hello'\n",
+        )
+        # Hunk line 1 = the @app.route decorator line
+        diff = self._diff("decorated.py", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertIn("--- decorated.py :: my_view ---", enriched)
+        self.assertIn("@app.route('/test')", enriched)
+
     def test_parse_diff_without_b_path(self):
         """Edge case: diff header with fewer than 4 tokens produces no hunks."""
         enriched = enrich_diff_with_function_context(
