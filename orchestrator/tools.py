@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from orchestrator import state
+from orchestrator.path_safety import is_safe_path
 
 # Can be overridden for testing purposes
 _PROJECT_ROOT: Path | None = None
@@ -114,6 +115,14 @@ def read_file(
         abs_path, rel_str = _normalize_path(path)
     except ValueError as e:
         return f"Error: {e}"
+
+    # Runtime Path-Safety Validation (ADR-0035): re-validate against the shared
+    # sensitive-path blocklist at tool-call time, on the normalized relative
+    # path. Gates reads so secrets never enter the agent's context and so a
+    # blocked path is never registered in read_files (closing the
+    # read-then-patch bypass of ADR-0012's pre-flight-only validation).
+    if not is_safe_path(rel_str):
+        return f"Error: Path '{path}' is blocked by the path-safety policy and cannot be read."
 
     if not abs_path.exists():
         return f"Error: File '{path}' does not exist."
@@ -297,6 +306,14 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
         abs_path, rel_str = _normalize_path(path)
     except ValueError as e:
         return f"Error: {e}"
+
+    # 0. Runtime Path-Safety Validation (ADR-0035): re-validate against the
+    #    shared sensitive-path blocklist at tool-call time, on the normalized
+    #    relative path, BEFORE the Read-Before-Edit gate. A blocked path is a
+    #    hard stop even if it was somehow registered in read_files, closing the
+    #    bypass of ADR-0012's pre-flight-only validation (defense in depth).
+    if not is_safe_path(rel_str):
+        return f"Error: Path '{path}' is blocked by the path-safety policy and cannot be modified."
 
     # 1. Read-Before-Edit Constraint (path-level): the file must have been read at least
     #    once in this cycle (its path is a key in read_files). Whether the *lines* targeted
