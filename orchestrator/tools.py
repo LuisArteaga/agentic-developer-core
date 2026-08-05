@@ -69,8 +69,6 @@ def _merge_ranges(ranges: list[list[int]]) -> list[list[int]]:
 
 def _ranges_contain(ranges: list[list[int]], lo: int, hi: int) -> bool:
     """Return True if the inclusive interval [lo, hi] is fully covered by the union of ranges."""
-    if lo > hi:
-        return False
     merged = _merge_ranges(ranges)
     return any(s <= lo and hi <= e for s, e in merged)
 
@@ -174,24 +172,20 @@ def read_file(
     else:
         read_range = [read_lo, read_hi]
 
-    # Register the read range in orchestrator state (range-scoped Read-Before-Edit, ADR-0033)
+    # Register the read range in orchestrator state (range-scoped Read-Before-Edit, ADR-0033).
+    # state.load() normalizes legacy list read_files to {}, so curr_state["read_files"] is a dict.
     try:
         curr_state = state.load()
-        if "read_files" not in curr_state or isinstance(curr_state["read_files"], list):
-            curr_state["read_files"] = {}
-        read_ranges = curr_state["read_files"]
-        if not isinstance(read_ranges, dict):
-            read_ranges = {}
+        read_ranges: dict = curr_state["read_files"]
         existing = read_ranges.get(rel_str, [])
         if read_range is not None:
             existing = _merge_ranges(existing + [read_range])
         else:
             existing = _merge_ranges(existing)
         read_ranges[rel_str] = existing
-        curr_state["read_files"] = read_ranges
         state.save(curr_state)
     except Exception:
-        # Log state update warnings, but do not fail the file read if the state is not available
+        # Do not fail the file read if state persistence is unavailable
         pass
 
     return "\n".join(sliced_lines)
@@ -306,17 +300,16 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
 
     # 1. Read-Before-Edit Constraint (path-level): the file must have been read at least
     #    once in this cycle (its path is a key in read_files). Whether the *lines* targeted
-    #    by old_string were read is checked later by the range gate.
+    #    by old_string were read is checked later by the range gate. state.load() normalizes
+    #    legacy list read_files to {}, so read_files is a dict here.
     try:
         curr_state = state.load()
-        read_files = curr_state.get("read_files", {})
-        if isinstance(read_files, list):
-            read_files = {}
+        read_files: dict = curr_state["read_files"]
     except Exception:
         read_files = {}
 
-    file_ranges = read_files.get(rel_str, []) if isinstance(read_files, dict) else []
-    if rel_str not in (read_files if isinstance(read_files, dict) else {}):
+    file_ranges = read_files.get(rel_str, [])
+    if rel_str not in read_files:
         return f"Error: Read-Before-Edit validation failed. File '{path}' has not been read in the current execution cycle. Please call 'read_file' first."
 
     # 2. Path Validation & Existence
@@ -379,19 +372,9 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
     delta = len(new_content.splitlines()) - len(content.splitlines())
     try:
         post_state = state.load()
-        post_ranges = post_state.get("read_files", {})
-        if isinstance(post_ranges, list):
-            post_ranges = {}
-        existing = (
-            post_ranges.get(rel_str, file_ranges)
-            if isinstance(post_ranges, dict)
-            else file_ranges
-        )
-        recomputed = _recompute_ranges(existing, edit_start, edit_end, delta)
-        if not isinstance(post_ranges, dict):
-            post_ranges = {}
-        post_ranges[rel_str] = recomputed
-        post_state["read_files"] = post_ranges
+        post_ranges: dict = post_state["read_files"]
+        existing = post_ranges.get(rel_str, file_ranges)
+        post_ranges[rel_str] = _recompute_ranges(existing, edit_start, edit_end, delta)
         state.save(post_state)
     except Exception:
         pass

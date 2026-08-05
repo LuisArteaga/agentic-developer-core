@@ -406,6 +406,90 @@ class TestCodebaseTools(unittest.TestCase):
         self.assertIn("was not found", res)
         self.assertNotIn("has not been read", res)
 
+    def test_read_file_state_save_failure_is_swallowed(self):
+        """A failing state.save during read_file registration is swallowed (read still succeeds)."""
+        with unittest.mock.patch(
+            "orchestrator.tools.state.save", side_effect=RuntimeError("boom")
+        ):
+            content = read_file(str(self.text_file))
+        self.assertEqual(content, "line one\nline two\nline three\nline four")
+
+    def test_read_file_generic_read_failure(self):
+        """A generic OS-level read failure surfaces a 'Failed to read file' error."""
+        with unittest.mock.patch("builtins.open", side_effect=OSError("boom")):
+            res = read_file(str(self.text_file))
+        self.assertIn("Failed to read file", res)
+
+    def test_patch_file_state_load_failure_reports_unread(self):
+        """If state.load fails in patch_file, the file is treated as unread."""
+        with unittest.mock.patch(
+            "orchestrator.tools.state.load", side_effect=RuntimeError("boom")
+        ):
+            res = patch_file(str(self.text_file), "line two", "x")
+        self.assertIn("has not been read", res)
+
+    def test_patch_file_target_is_directory(self):
+        """patch_file on a path that is a directory (but registered) reports 'is a directory'."""
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(self.temp_dir_path))
+        loaded["read_files"][rel_str] = [[1, 10]]
+        state.save(loaded, self.state_file_path)
+
+        res = patch_file(str(self.temp_dir_path), "anything", "x")
+        self.assertIn("is a directory, not a file", res)
+
+    def test_patch_file_non_utf8_registered(self):
+        """patch_file on a registered non-UTF-8 file reports a decode error (not unread)."""
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(self.non_utf8_file))
+        loaded["read_files"][rel_str] = [[1, 10]]
+        state.save(loaded, self.state_file_path)
+
+        res = patch_file(str(self.non_utf8_file), "Hello", "Hi")
+        self.assertIn("cannot be decoded", res)
+
+    def test_patch_file_generic_read_failure(self):
+        """A generic OS-level read failure in patch_file's read block surfaces an error."""
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(self.text_file))
+        loaded["read_files"][rel_str] = [[1, 10]]
+        state.save(loaded, self.state_file_path)
+
+        real_open = open
+        target = str(self.text_file)
+
+        def selective_open(path, *a, **k):
+            if str(path) == target:
+                raise OSError("boom")
+            return real_open(path, *a, **k)
+
+        with unittest.mock.patch("builtins.open", side_effect=selective_open):
+            res = patch_file(str(self.text_file), "line two", "x")
+        self.assertIn("Failed to read file", res)
+
+    def test_patch_file_write_failure(self):
+        """A write failure (e.g. read-only file) surfaces a 'Failed to write' error."""
+        read_file(str(self.text_file))
+        os.chmod(self.text_file, 0o444)  # read-only
+        try:
+            res = patch_file(str(self.text_file), "line one", "changed")
+            # If running as root chmod is ignored; assert accordingly
+            if os.geteuid() == 0:
+                self.assertIn("patched successfully", res)
+            else:
+                self.assertIn("Failed to write to file", res)
+        finally:
+            os.chmod(self.text_file, 0o644)
+
+    def test_patch_file_recompute_state_save_failure_is_swallowed(self):
+        """If state.save fails during the post-edit range recompute, the patch still succeeds."""
+        read_file(str(self.text_file))
+        with unittest.mock.patch(
+            "orchestrator.tools.state.save", side_effect=RuntimeError("boom")
+        ):
+            res = patch_file(str(self.text_file), "line two", "line modified")
+        self.assertIn("patched successfully", res)
+
     def test_path_traversal_protection(self):
         """Test that paths outside the project root are rejected with Access denied."""
         res = read_file("/etc/passwd")
