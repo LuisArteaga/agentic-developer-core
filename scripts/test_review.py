@@ -102,6 +102,52 @@ class SystemPromptTests(unittest.TestCase):
         self.assertIn("<reasoning>", review.SYSTEM_PROMPT_TEST_COVERAGE)
 
 
+class JudgeNeutralityTests(unittest.TestCase):
+    """Tests for the shared Judge Neutrality preamble (issue #61, ADR-0014
+    enhancement). Verifies the neutrality frame is prepended to every judge
+    prompt that reaches the LLM, without coupling it to the judge-specific
+    ``augment_judge_prompt`` dispatch."""
+
+    def test_neutrality_constant_has_judge_neutrality_header(self):
+        """AC: the shared preamble carries the labeled neutrality section."""
+        self.assertIn(
+            "=== 0. JUDGE NEUTRALITY ===", review.JUDGE_NEUTRALITY_INSTRUCTIONS
+        )
+
+    def test_every_judge_prompt_prepends_neutrality(self):
+        """AC: each JUDGE_PROMPTS entry starts with the neutrality preamble,
+        so the frame precedes the judge-specific criteria for every judge."""
+        for key in review.JUDGE_KEYS:
+            self.assertTrue(
+                review.JUDGE_PROMPTS[key].startswith(
+                    review.JUDGE_NEUTRALITY_INSTRUCTIONS
+                ),
+                f"judge {key} prompt is missing the neutrality preamble",
+            )
+
+    def test_base_criteria_constants_untouched_by_neutrality(self):
+        """AC: the raw criteria constants remain the judge-specific criteria
+        (neutrality is layered on via JUDGE_PROMPTS, not baked into the
+        constants) — keeps augment_judge_prompt's contract intact."""
+        for base_prompt in (
+            review.SYSTEM_PROMPT_SYNTAX_LINT,
+            review.SYSTEM_PROMPT_TEST_COVERAGE,
+            review.SYSTEM_PROMPT_ARCH,
+            review.SYSTEM_PROMPT_SECURITY,
+        ):
+            self.assertNotIn("=== 0. JUDGE NEUTRALITY ===", base_prompt)
+
+    def test_neutrality_covers_each_named_bias(self):
+        """AC: the preamble names every bias it mitigates (metadata/ID,
+        anchoring, ADR over-weighting, position-within-findings)."""
+        text = review.JUDGE_NEUTRALITY_INSTRUCTIONS
+        self.assertIn("author", text.lower())
+        self.assertIn("automated agent", text.lower())
+        self.assertIn("intended", text.lower())
+        self.assertIn("compliance", text.lower())
+        self.assertIn("position", text.lower())
+
+
 def _build_judges_data(
     statuses,
     findings=None,
