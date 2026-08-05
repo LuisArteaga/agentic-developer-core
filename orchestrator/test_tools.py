@@ -152,6 +152,46 @@ class TestCodebaseTools(unittest.TestCase):
         # Encoding error
         self.assertIn("cannot be decoded", read_file(str(self.non_utf8_file)))
 
+    def test_read_file_blocked_sensitive_filename(self):
+        """Runtime path-safety blocks reading sensitive files (e.g. .env) even when they exist."""
+        env_file = self.temp_dir_path / ".env"
+        env_file.write_text("SECRET=leak", encoding="utf-8")
+        res = read_file(str(env_file))
+        self.assertIn("blocked by the path-safety policy", res)
+        # Content must not be returned
+        self.assertNotIn("leak", res)
+        # The blocked path must NOT be registered in read_files (closes the
+        # read-then-patch bypass: no membership gained from a blocked read).
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(env_file))
+        self.assertNotIn(rel_str, loaded["read_files"])
+
+    def test_read_file_blocked_sensitive_directory(self):
+        """Runtime path-safety blocks reading files inside forbidden directories (.git)."""
+        git_dir = self.temp_dir_path / ".git"
+        git_dir.mkdir()
+        cfg = git_dir / "config"
+        cfg.write_text("contents", encoding="utf-8")
+        res = read_file(str(cfg))
+        self.assertIn("blocked by the path-safety policy", res)
+
+    def test_read_file_blocked_sensitive_extension(self):
+        """Runtime path-safety blocks reading certificate/key files (.pem, .key)."""
+        for name in ("token.pem", "private.key", "cert.pfx"):
+            f = self.temp_dir_path / name
+            f.write_text("secret material", encoding="utf-8")
+            self.assertIn(
+                "blocked by the path-safety policy", read_file(str(f)), msg=name
+            )
+
+    def test_read_file_safe_path_unaffected(self):
+        """Legitimate (non-sensitive) absolute paths within the project root still read fine."""
+        # Absolute path to a normal file must still work after the safety gate.
+        self.assertEqual(
+            read_file(str(self.text_file)),
+            "line one\nline two\nline three\nline four",
+        )
+
     def test_list_directory_success(self):
         """Test list_directory outputs sorted list with classification and sizes."""
         output = list_directory(str(self.temp_dir_path))
@@ -236,6 +276,54 @@ class TestCodebaseTools(unittest.TestCase):
         # Do NOT call read_file
         res = patch_file(str(self.text_file), "line two", "line modified")
         self.assertIn("Read-Before-Edit validation failed", res)
+
+    def test_patch_file_blocked_sensitive_path_even_after_read(self):
+        """Runtime path-safety blocks patching sensitive files even when hand-registered in read_files.
+
+        Proves the safety gate runs BEFORE the Read-Before-Edit check, so read_files
+        membership (the exact bypass described in issue #60) cannot override the block.
+        """
+        env_file = self.temp_dir_path / ".env"
+        env_file.write_text("SECRET=leak", encoding="utf-8")
+        # Hand-register the blocked path to simulate the agent having "read" it,
+        # bypassing read_file's own safety gate.
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(env_file))
+        loaded["read_files"][rel_str] = [[1, 100]]
+        state.save(loaded, self.state_file_path)
+
+        res = patch_file(str(env_file), "SECRET=leak", "SECRET=pwned")
+        self.assertIn("blocked by the path-safety policy", res)
+        # The file must be untouched.
+        self.assertEqual(env_file.read_text(encoding="utf-8"), "SECRET=leak")
+
+    def test_patch_file_blocked_sensitive_path_after_attempted_read(self):
+        """End-to-end: read_file refuses a sensitive file, so patch_file has no membership and is blocked twice over."""
+        env_file = self.temp_dir_path / ".env"
+        env_file.write_text("SECRET=leak", encoding="utf-8")
+        # read_file itself blocks the sensitive path -> no read_files membership
+        self.assertIn("blocked by the path-safety policy", read_file(str(env_file)))
+        # patch_file is blocked regardless (path-safety first), not the read error
+        res = patch_file(str(env_file), "SECRET=leak", "SECRET=pwned")
+        self.assertIn("blocked by the path-safety policy", res)
+        self.assertEqual(env_file.read_text(encoding="utf-8"), "SECRET=leak")
+
+    def test_patch_file_blocked_sensitive_directory(self):
+        """Runtime path-safety blocks patching files in forbidden directories (.git)."""
+        git_dir = self.temp_dir_path / ".git"
+        git_dir.mkdir()
+        cfg = git_dir / "config"
+        cfg.write_text("[core]", encoding="utf-8")
+        res = patch_file(str(cfg), "[core]", "[core]\nmalicious = true")
+        self.assertIn("blocked by the path-safety policy", res)
+        self.assertEqual(cfg.read_text(encoding="utf-8"), "[core]")
+
+    def test_patch_file_safe_path_unaffected(self):
+        """Legitimate absolute paths within the project root still patch after the safety gate."""
+        read_file(str(self.text_file))
+        res = patch_file(str(self.text_file), "line two", "line modified")
+        self.assertIn("patched successfully", res)
+        self.assertIn("line modified", self.text_file.read_text(encoding="utf-8"))
 
     def test_patch_file_zero_matches(self):
         """Test that patch_file aborts if old_string is not found."""
