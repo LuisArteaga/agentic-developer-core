@@ -279,6 +279,12 @@ class TestTelemetryIntegration(unittest.TestCase):
 
         The BaggageSpanProcessor must copy the session ID from OTel baggage to
         span attributes, enabling trace grouping in the Langfuse UI.
+
+        Only OTLPSpanExporter is mocked — the real TracerProvider (with the
+        LocalJSONLFileSpanProcessor and BaggageSpanProcessor) is still installed
+        so spans are written to local JSONL, where the session-id is asserted.
+        Mocking the exporter prevents a real flush to Langfuse Cloud, which 401s
+        on the test credentials and pollutes the test output.
         """
         if not HAS_OTEL:
             self.skipTest("OpenTelemetry is not installed in the current environment.")
@@ -287,12 +293,14 @@ class TestTelemetryIntegration(unittest.TestCase):
         os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-test"
         os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
 
-        init_telemetry(reset_state=True, issue_number=42, branch="feat/issue-42")
+        with patch("scripts.telemetry.OTLPSpanExporter") as mock_exporter_cls:
+            mock_exporter_cls.return_value = MagicMock()
+            init_telemetry(reset_state=True, issue_number=42, branch="feat/issue-42")
 
-        start_orchestrator_loop(issue_number=42, branch="feat/issue-42")
-        start_orchestrator_phase("plan")
-        end_orchestrator_phase(exit_code=0)
-        end_orchestrator_loop(exit_code=0)
+            start_orchestrator_loop(issue_number=42, branch="feat/issue-42")
+            start_orchestrator_phase("plan")
+            end_orchestrator_phase(exit_code=0)
+            end_orchestrator_loop(exit_code=0)
 
         jsonl_files = list(self.test_dir_path.glob("otel_traces_*.jsonl"))
         self.assertTrue(jsonl_files, "Expected at least one otel_traces_*.jsonl file")
