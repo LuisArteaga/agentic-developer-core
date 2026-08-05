@@ -1436,5 +1436,70 @@ class LayeredRetryPolicyTests(unittest.TestCase):
         self.assertEqual(mock_retry.call_count, 2)
 
 
+class EnrichChunkIntegrationTests(unittest.TestCase):
+    """Integration tests verifying enrichment is wired into run_judge."""
+
+    def _build_llm_response(self, content: str) -> str:
+        return json.dumps({"choices": [{"message": {"content": content}}]})
+
+    def test_enrich_chunk_appends_function_context(self):
+        """AC: _enrich_chunk enriches a diff with enclosing function context."""
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            (workspace_path / "foo.py").write_text(
+                "def bar():\n    return 1\n", encoding="utf-8"
+            )
+            diff = (
+                "diff --git a/foo.py b/foo.py\n"
+                "--- a/foo.py\n"
+                "+++ b/foo.py\n"
+                "@@ -1,1 +1,1 @@\n"
+            )
+            enriched = review._enrich_chunk(diff, str(workspace_path))
+            self.assertIn("=== ENCLOSING FUNCTION CONTEXT ===", enriched)
+            self.assertIn("--- foo.py :: bar ---", enriched)
+            self.assertIn("def bar():", enriched)
+
+    def test_enrich_chunk_no_workspace_returns_unchanged(self):
+        """AC: _enrich_chunk with empty/nonexistent workspace returns diff."""
+        diff = "diff --git a/missing.py b/missing.py\n@@ -1 +1 @@\n"
+        enriched = review._enrich_chunk(diff, "/nonexistent/path")
+        self.assertEqual(enriched, diff)
+
+    def test_run_judge_fast_path_enriches_before_llm(self):
+        """AC: run_judge enriches the diff before passing to llm_caller."""
+        captured_diffs: list[str] = []
+
+        def capturing_caller(judge_key, prompt, diff, api_key):
+            captured_diffs.append(diff)
+            return self._build_llm_response(
+                "<reasoning>r</reasoning><findings></findings>"
+            ), {"used_fallback": False, "final_model": "m", "attempt_count": 1}
+
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            (workspace_path / "app.py").write_text(
+                "def greet():\n    return 'hi'\n", encoding="utf-8"
+            )
+            with patch.dict(os.environ, {"GITHUB_WORKSPACE": str(workspace_path)}):
+                diff = (
+                    "diff --git a/app.py b/app.py\n"
+                    "--- a/app.py\n"
+                    "+++ b/app.py\n"
+                    "@@ -1,1 +1,1 @@\n"
+                )
+                review.run_judge(
+                    "syntax_lint",
+                    review.SYSTEM_PROMPT_SYNTAX_LINT,
+                    diff,
+                    "key",
+                    llm_caller=capturing_caller,
+                )
+
+        self.assertEqual(len(captured_diffs), 1)
+        self.assertIn("=== ENCLOSING FUNCTION CONTEXT ===", captured_diffs[0])
+        self.assertIn("--- app.py :: greet ---", captured_diffs[0])
+
+
 if __name__ == "__main__":
     unittest.main()

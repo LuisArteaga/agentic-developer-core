@@ -1208,6 +1208,47 @@ class TestBinEvalPhase(unittest.TestCase):
         # BinEval never reached the issue fetch.
         mock_gh.assert_not_called()
 
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_phase_enriches_diff_before_grading(self, mock_run, mock_gh, _adrs):
+        """AC: _run_bineval_phase enriches the diff with function context."""
+        from orchestrator.nodes import verify_node
+
+        # Write a Python file in the workspace so enrichment can find it
+        (self.workspace_dir / "target.py").write_text(
+            "def my_func():\n    return 42\n", encoding="utf-8"
+        )
+
+        mock_run.return_value = self._mock_make_verify_pass()
+        mock_gh.return_value = {"body": "issue body"}
+
+        # Return a diff that references the workspace file
+        diff_with_hunk = (
+            "diff --git a/target.py b/target.py\n"
+            "--- a/target.py\n"
+            "+++ b/target.py\n"
+            "@@ -1,1 +1,1 @@\n"
+        )
+        with patch(
+            "orchestrator.nodes._get_workspace_diff", return_value=diff_with_hunk
+        ):
+            captured_diffs: list[str] = []
+
+            def capture_bineval(issue_body, plan, diff, adrs):
+                captured_diffs.append(diff)
+                return _all_pass_result()
+
+            with patch("orchestrator.nodes._run_bineval", side_effect=capture_bineval):
+                state = self._state(attempts_verify=0)
+                new_state = verify_node(state)
+
+        # The diff passed to _run_bineval must be enriched
+        self.assertEqual(len(captured_diffs), 1)
+        self.assertIn("=== ENCLOSING FUNCTION CONTEXT ===", captured_diffs[0])
+        self.assertIn("--- target.py :: my_func ---", captured_diffs[0])
+        self.assertEqual(new_state["status"], "verifying")
+
     def test_apply_no_adr_autopass_forces_adr_checks_pass(self):
         from orchestrator.nodes import _apply_no_adr_autopass
 
