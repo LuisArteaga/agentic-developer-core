@@ -20,6 +20,9 @@ def read_file(
     """Read contents of a file, with optional 1-based start_line and end_line bounds (inclusive).
 
     You MUST call read_file to inspect a file's contents before you can modify it using patch_file.
+    Reading only a line range authorizes edits ONLY within that range; reading the whole file
+    (no bounds) authorizes edits anywhere in it. Call read_file with no bounds for the lines you
+    intend to patch if you are unsure of the exact range.
     """
     return codebase_tools.read_file(path, start_line=start_line, end_line=end_line)
 
@@ -41,8 +44,11 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
     """Perform exact search-and-replace of old_string with new_string.
 
     You can only call patch_file on a file after you have read it using read_file in the current cycle.
-    The old_string MUST match exactly once in the file (Ambiguity Abort rule). Include enough surrounding
-    context lines in old_string to make it unique. Do not attempt to rewrite the entire file.
+    The edit is authorized only for line ranges you have read: the old_string's line span must fall
+    within a previously read range, otherwise the tool returns a range validation error telling you
+    which lines to read. The old_string MUST match exactly once in the file (Ambiguity Abort rule).
+    Include enough surrounding context lines in old_string to make it unique. Do not attempt to
+    rewrite the entire file.
     """
     return codebase_tools.patch_file(path, old_string=old_string, new_string=new_string)
 
@@ -75,10 +81,13 @@ SYSTEM_PROMPT = (
     "You are a professional autonomous software engineer worker agent. "
     "Your objective is to solve the claimed codebase issue by following the provided step-by-step plan. "
     "To do this safely and correctly, you must strictly adhere to the following rules:\n\n"
-    "1. READ-BEFORE-EDIT CONSTRAINT:\n"
+    "1. READ-BEFORE-EDIT CONSTRAINT (RANGE-SCOPED):\n"
     "   You must programmatically read a file's contents using the `read_file` tool *before* you make any "
-    "modifications to it using `patch_file`. If you attempt to edit a file without reading it first in this "
-    "execution cycle, the tool will return a validation error. Do not guess file contents or rely on stale context.\n\n"
+    "modifications to it using `patch_file`. The edit is authorized only for the line ranges you actually read: "
+    "if you read a partial range (start_line/end_line), `patch_file` will reject edits whose `old_string` falls "
+    "outside that range. Reading the whole file (no bounds) authorizes edits anywhere in it. If you get a range "
+    "validation error, call `read_file` on the indicated line range (or the whole file) and retry. Do not guess "
+    "file contents or rely on stale context.\n\n"
     "2. EXACT BLOCK-BASED PATCHING:\n"
     "   To modify a file, use the `patch_file` tool. It performs an exact search-and-replace of `old_string` with `new_string`.\n"
     "   - The `old_string` must match EXACTLY ONE occurrence in the file. If it matches zero or multiple times, "

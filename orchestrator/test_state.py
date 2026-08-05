@@ -32,7 +32,7 @@ class TestStatePersistence(unittest.TestCase):
         self.assertIsNone(DEFAULT_STATE["branch"])
         self.assertEqual(DEFAULT_STATE["model"], "")
         self.assertIsNone(DEFAULT_STATE["plan"])
-        self.assertEqual(DEFAULT_STATE["read_files"], [])
+        self.assertEqual(DEFAULT_STATE["read_files"], {})
         self.assertEqual(DEFAULT_STATE["updated_at"], "")
 
     def test_save_and_load_normal(self):
@@ -45,7 +45,10 @@ class TestStatePersistence(unittest.TestCase):
         test_state["branch"] = "feat/issue-42-test"
         test_state["model"] = "gemini-2.5-pro"
         test_state["plan"] = "1. test\n2. verify"
-        test_state["read_files"] = ["orchestrator/state.py", "main.py"]
+        test_state["read_files"] = {
+            "orchestrator/state.py": [[1, 10]],
+            "main.py": [[1, 5]],
+        }
 
         save(test_state, self.state_file)
 
@@ -62,7 +65,8 @@ class TestStatePersistence(unittest.TestCase):
         self.assertEqual(loaded_state["model"], "gemini-2.5-pro")
         self.assertEqual(loaded_state["plan"], "1. test\n2. verify")
         self.assertEqual(
-            loaded_state["read_files"], ["orchestrator/state.py", "main.py"]
+            loaded_state["read_files"],
+            {"orchestrator/state.py": [[1, 10]], "main.py": [[1, 5]]},
         )
         # updated_at should have been populated
         self.assertTrue(loaded_state["updated_at"])
@@ -132,15 +136,26 @@ class TestStatePersistence(unittest.TestCase):
         self.assertEqual(loaded_state, DEFAULT_STATE)
 
     def test_invalid_read_files_type_fallback(self):
-        """Verify that loading state with read_files not as list falls back to DEFAULT_STATE."""
+        """Verify that loading state with read_files not as dict falls back to DEFAULT_STATE."""
         bad_state = copy.deepcopy(DEFAULT_STATE)
-        bad_state["read_files"] = "not a list"  # type: ignore
+        bad_state["read_files"] = "not a dict"  # type: ignore
 
         with open(self.state_file, "w", encoding="utf-8") as f:
             json.dump(bad_state, f)
 
         loaded_state = load(self.state_file)
         self.assertEqual(loaded_state, DEFAULT_STATE)
+
+    def test_legacy_read_files_list_migration(self):
+        """Legacy path-list read_files is migrated to an empty dict (forces fresh reads)."""
+        legacy_state = copy.deepcopy(DEFAULT_STATE)
+        legacy_state["read_files"] = ["orchestrator/state.py", "main.py"]  # type: ignore
+
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump(legacy_state, f)
+
+        loaded_state = load(self.state_file)
+        self.assertEqual(loaded_state["read_files"], {})
 
 
 class TestGetStateFilepath(unittest.TestCase):

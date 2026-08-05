@@ -1,7 +1,7 @@
 # ADR 0006: Block-Based Patching with Programmatic Read-Before-Edit Constraint
 
 ## Status
-Accepted
+Accepted — the Read-Before-Edit scope (point 3) is refined by [ADR 0033: Line-Range-Scoped Read-Before-Edit](./0033-line-range-scoped-read-before-edit.md). Points 1 (block-based search-and-replace) and 2 (ambiguity abort) remain unchanged.
 
 ## Context
 Code-editing models (like Claude 3.7 Sonnet) perform best when modifying files via exact search-and-replace strings (`old_string` -> `new_string`). However, this is prone to two primary failure modes:

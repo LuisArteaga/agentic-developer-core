@@ -82,12 +82,12 @@ class TestCodebaseTools(unittest.TestCase):
         content = read_file(str(self.text_file))
         self.assertEqual(content, "line one\nline two\nline three\nline four")
 
-        # Check that path was registered in state.json
+        # Check that the full-file read range was registered in state.json
         loaded = state.load(self.state_file_path)
-        resolved_read_files = [
-            str((self.temp_dir_path / p).resolve()) for p in loaded["read_files"]
-        ]
-        self.assertIn(str(self.text_file.resolve()), resolved_read_files)
+        _, rel_str = tools._normalize_path(str(self.text_file))
+        self.assertIn(rel_str, loaded["read_files"])
+        # Full read (no bounds) authorizes the whole file: [1, total_lines]
+        self.assertEqual(loaded["read_files"][rel_str], [[1, 4]])
 
     def test_read_file_success_slice(self):
         """Test read_file with line boundaries."""
@@ -258,7 +258,7 @@ class TestCodebaseTools(unittest.TestCase):
         # Hand-register the binary file to bypass Read-Before-Edit check
         loaded = state.load(self.state_file_path)
         _, rel_str = tools._normalize_path(str(self.binary_file))
-        loaded["read_files"].append(rel_str)
+        loaded["read_files"][rel_str] = [[1, 100]]
         state.save(loaded, self.state_file_path)
 
         res = patch_file(str(self.binary_file), "hello", "world")
@@ -268,11 +268,227 @@ class TestCodebaseTools(unittest.TestCase):
         """Test that patch_file aborts for nonexistent files even if registered in state."""
         # Hand-register a nonexistent file to bypass Read-Before-Edit check
         loaded = state.load(self.state_file_path)
-        loaded["read_files"].append("ghost.txt")
+        loaded["read_files"]["ghost.txt"] = [[1, 100]]
         state.save(loaded, self.state_file_path)
 
         res = patch_file("ghost.txt", "something", "else")
         self.assertIn("does not exist", res)
+
+    def test_read_file_partial_registers_partial_range(self):
+        """A partial read registers only the requested line range, not the whole file."""
+        read_file(str(self.text_file), start_line=2, end_line=3)
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(self.text_file))
+        self.assertEqual(loaded["read_files"][rel_str], [[2, 3]])
+
+    def test_patch_file_full_read_authorizes_anywhere(self):
+        """Reading the whole file authorizes a patch on any line of it."""
+        read_file(str(self.text_file))  # full read -> [[1, 4]]
+        res = patch_file(str(self.text_file), "line four", "line four edited")
+        self.assertIn("patched successfully", res)
+
+    def test_patch_file_range_scoped_within_read_range(self):
+        """A patch whose old_string lies within a partial read range succeeds."""
+        read_file(
+            str(self.text_file), start_line=2, end_line=3
+        )  # reads "line two\nline three"
+        res = patch_file(str(self.text_file), "line three", "line three edited")
+        self.assertIn("patched successfully", res)
+
+    def test_patch_file_range_scoped_outside_read_range_blocked(self):
+        """A patch whose old_string lies outside the partial read range is rejected."""
+        read_file(
+            str(self.text_file), start_line=2, end_line=3
+        )  # only lines 2-3 authorized
+        res = patch_file(str(self.text_file), "line four", "line four edited")
+        self.assertIn("range validation failed", res)
+        self.assertIn("lines 4-4", res)
+
+    def test_patch_file_range_scoped_straddling_read_boundary_blocked(self):
+        """An edit spanning the edge of a read range (partly unread) is rejected."""
+        read_file(str(self.text_file), start_line=1, end_line=2)  # lines 1-2 authorized
+        # old_string spans lines 2-3 (partly outside the read range)
+        res = patch_file(str(self.text_file), "line two\nline three", "x\ny")
+        self.assertIn("range validation failed", res)
+
+    def test_patch_file_range_recompute_shifts_below_ranges(self):
+        """After a patch that inserts lines, ranges below the edit shift so a later edit
+        in the shifted region succeeds without a fresh read; the edited region itself
+        requires a re-read."""
+        big_file = self.temp_dir_path / "big.txt"
+        big_file.write_text(
+            "\n".join(f"line_{i:02d}" for i in range(1, 21)), encoding="utf-8"
+        )  # 20 lines, zero-padded so each old_string is unique
+        # Read the whole file -> [[1, 20]]
+        read_file(str(big_file))
+
+        # Patch line 2 -> insert 3 lines (delta = +2). "line_02" is unique.
+        res = patch_file(str(big_file), "line_02", "line_2a\nline_2b\nline_2c")
+        self.assertIn("patched successfully", res)
+
+        # The edited region (old line 2) was rewritten -> re-read required there.
+        # Lines below shifted by +2: old line 5 ("line_05") is now at line 7. Editing it
+        # should succeed because the shifted range still covers it (no fresh read needed).
+        res = patch_file(str(big_file), "line_05", "line_five")
+        self.assertIn("patched successfully", res)
+
+        # The edited region (now "line_2a"/"line_2b"/"line_2c") is NOT authorized: the
+        # original line-2 span was dropped from the ranges during recomputation.
+        res = patch_file(str(big_file), "line_2b", "line_2B")
+        self.assertIn("range validation failed", res)
+
+    def test_patch_file_range_recompute_shrink_preserves_above_range(self):
+        """After a patch that removes lines, an above-range edit still works and a
+        below-range edit works at the shifted location."""
+        big_file = self.temp_dir_path / "big2.txt"
+        big_file.write_text(
+            "\n".join(f"line_{i:02d}" for i in range(1, 21)), encoding="utf-8"
+        )
+        read_file(str(big_file))  # [[1, 20]]
+
+        # Remove lines 10-12 (3 lines) -> replace with one line (delta = -2).
+        res = patch_file(str(big_file), "line_10\nline_11\nline_12", "merged")
+        self.assertIn("patched successfully", res)
+
+        # Above the edit: line 1 unchanged location -> still authorized.
+        res = patch_file(str(big_file), "line_01", "line_one")
+        self.assertIn("patched successfully", res)
+
+        # Below the edit: old line 20 shifted to line 18. "line_20" still exists as text,
+        # now at line 18, covered by the shifted range -> authorized.
+        res = patch_file(str(big_file), "line_20", "line_twenty")
+        self.assertIn("patched successfully", res)
+
+    def test_patch_file_range_recompute_overlapping_splits(self):
+        """A full-file range overlapping the edit is split: the edited region is dropped,
+        while the untouched above/below portions remain authorized."""
+        big_file = self.temp_dir_path / "big3.txt"
+        big_file.write_text(
+            "\n".join(f"line_{i:02d}" for i in range(1, 11)), encoding="utf-8"
+        )  # 10 lines
+        read_file(str(big_file))  # [[1, 10]]
+
+        # Edit line 5 (single line, delta 0).
+        res = patch_file(str(big_file), "line_05", "line_five")
+        self.assertIn("patched successfully", res)
+
+        # Lines 1-4 and 6-10 should remain authorized (split), only line 5 dropped.
+        res = patch_file(str(big_file), "line_01", "L01")
+        self.assertIn("patched successfully", res)
+        res = patch_file(str(big_file), "line_10", "L10")
+        self.assertIn("patched successfully", res)
+
+        # The rewritten region (line 5, now "line_five") is not authorized.
+        res = patch_file(str(big_file), "line_five", "LINE_FIVE")
+        self.assertIn("range validation failed", res)
+
+    def test_patch_file_range_error_names_read_ranges(self):
+        """The range validation error reports the currently-read ranges for self-correction."""
+        read_file(str(self.text_file), start_line=1, end_line=2)
+        res = patch_file(str(self.text_file), "line four", "x")
+        self.assertIn("[1-2]", res)
+        self.assertIn("read_file", res)
+
+    def test_read_file_repeated_partial_reads_merge_ranges(self):
+        """Overlapping/adjacent partial reads merge into a single canonical range."""
+        read_file(str(self.text_file), start_line=1, end_line=2)
+        read_file(str(self.text_file), start_line=2, end_line=4)
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(self.text_file))
+        self.assertEqual(loaded["read_files"][rel_str], [[1, 4]])
+
+    def test_patch_file_empty_file_read_reports_not_found_not_unread(self):
+        """A read empty file is a known path; patching it fails at uniqueness (not-found),
+        not at the path-level 'has not been read' gate."""
+        read_file(str(self.empty_file))  # registers [] ranges for the path
+        res = patch_file(str(self.empty_file), "anything", "something")
+        # Path was read, so we get past the path gate; uniqueness then reports not-found.
+        self.assertIn("was not found", res)
+        self.assertNotIn("has not been read", res)
+
+    def test_read_file_state_save_failure_is_swallowed(self):
+        """A failing state.save during read_file registration is swallowed (read still succeeds)."""
+        with unittest.mock.patch(
+            "orchestrator.tools.state.save", side_effect=RuntimeError("boom")
+        ):
+            content = read_file(str(self.text_file))
+        self.assertEqual(content, "line one\nline two\nline three\nline four")
+
+    def test_read_file_generic_read_failure(self):
+        """A generic OS-level read failure surfaces a 'Failed to read file' error."""
+        with unittest.mock.patch("builtins.open", side_effect=OSError("boom")):
+            res = read_file(str(self.text_file))
+        self.assertIn("Failed to read file", res)
+
+    def test_patch_file_state_load_failure_reports_unread(self):
+        """If state.load fails in patch_file, the file is treated as unread."""
+        with unittest.mock.patch(
+            "orchestrator.tools.state.load", side_effect=RuntimeError("boom")
+        ):
+            res = patch_file(str(self.text_file), "line two", "x")
+        self.assertIn("has not been read", res)
+
+    def test_patch_file_target_is_directory(self):
+        """patch_file on a path that is a directory (but registered) reports 'is a directory'."""
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(self.temp_dir_path))
+        loaded["read_files"][rel_str] = [[1, 10]]
+        state.save(loaded, self.state_file_path)
+
+        res = patch_file(str(self.temp_dir_path), "anything", "x")
+        self.assertIn("is a directory, not a file", res)
+
+    def test_patch_file_non_utf8_registered(self):
+        """patch_file on a registered non-UTF-8 file reports a decode error (not unread)."""
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(self.non_utf8_file))
+        loaded["read_files"][rel_str] = [[1, 10]]
+        state.save(loaded, self.state_file_path)
+
+        res = patch_file(str(self.non_utf8_file), "Hello", "Hi")
+        self.assertIn("cannot be decoded", res)
+
+    def test_patch_file_generic_read_failure(self):
+        """A generic OS-level read failure in patch_file's read block surfaces an error."""
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(self.text_file))
+        loaded["read_files"][rel_str] = [[1, 10]]
+        state.save(loaded, self.state_file_path)
+
+        real_open = open
+        target = str(self.text_file)
+
+        def selective_open(path, *a, **k):
+            if str(path) == target:
+                raise OSError("boom")
+            return real_open(path, *a, **k)
+
+        with unittest.mock.patch("builtins.open", side_effect=selective_open):
+            res = patch_file(str(self.text_file), "line two", "x")
+        self.assertIn("Failed to read file", res)
+
+    def test_patch_file_write_failure(self):
+        """A write failure (e.g. read-only file) surfaces a 'Failed to write' error."""
+        read_file(str(self.text_file))
+        os.chmod(self.text_file, 0o444)  # read-only
+        try:
+            res = patch_file(str(self.text_file), "line one", "changed")
+            # If running as root chmod is ignored; assert accordingly
+            if os.geteuid() == 0:
+                self.assertIn("patched successfully", res)
+            else:
+                self.assertIn("Failed to write to file", res)
+        finally:
+            os.chmod(self.text_file, 0o644)
+
+    def test_patch_file_recompute_state_save_failure_is_swallowed(self):
+        """If state.save fails during the post-edit range recompute, the patch still succeeds."""
+        read_file(str(self.text_file))
+        with unittest.mock.patch(
+            "orchestrator.tools.state.save", side_effect=RuntimeError("boom")
+        ):
+            res = patch_file(str(self.text_file), "line two", "line modified")
+        self.assertIn("patched successfully", res)
 
     def test_path_traversal_protection(self):
         """Test that paths outside the project root are rejected with Access denied."""

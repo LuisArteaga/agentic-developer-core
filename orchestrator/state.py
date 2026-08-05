@@ -30,7 +30,7 @@ class AgentState(TypedDict):
     branch: str | None
     model: str
     plan: str | None
-    read_files: list[str]
+    read_files: dict[str, list[list[int]]]
     updated_at: str
     feedback: str | None
     pushed_at: str | None
@@ -44,7 +44,7 @@ DEFAULT_STATE: AgentState = {
     "branch": None,
     "model": "",
     "plan": None,
-    "read_files": [],
+    "read_files": {},
     "updated_at": "",
     "feedback": None,
     "pushed_at": None,
@@ -172,9 +172,15 @@ def load(filepath: str | Path | None = None) -> AgentState:
         if not isinstance(data["attempts"], dict):
             raise ValueError("Field 'attempts' must be a dictionary")
 
-        # Validate read_files type
-        if not isinstance(data["read_files"], list):
-            raise ValueError("Field 'read_files' must be a list")
+        # Validate read_files type and migrate legacy path-list format to the
+        # range-scoped dict format (path -> list of [start, end] inclusive ranges).
+        # Legacy list entries authorized the whole file; since read_files is reset
+        # on phase start and on stateful resume (ADR-0006 / ADR-0033), an in-flight
+        # legacy state is stale anyway — migrate to an empty dict (forces fresh reads).
+        if isinstance(data["read_files"], list):
+            data["read_files"] = {}
+        if not isinstance(data["read_files"], dict):
+            raise ValueError("Field 'read_files' must be a dictionary")
 
         # Return successfully parsed state
         return cast(AgentState, data)
