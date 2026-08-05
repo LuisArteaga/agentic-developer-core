@@ -1,6 +1,6 @@
 # ADR 0022: Enclosing Function Context Enrichment for PR Review Judges
 
-* **Status**: Accepted
+* **Status**: Accepted (amended by ADR-0032)
 * **Date**: 2026-07-12
 * **Deciders**: Luis Arteaga & The Architect
 
