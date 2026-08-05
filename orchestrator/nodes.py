@@ -424,7 +424,7 @@ def claim_node(state: AgentState) -> AgentState:
             state["phase"] = "claimed"
             state["branch"] = branch_name
             state["plan"] = None
-            state["read_files"] = []
+            state["read_files"] = {}
 
             _safe_telemetry(
                 start_orchestrator_loop, issue_number=issue_num, branch=branch_name
@@ -536,10 +536,10 @@ def plan_node(state: AgentState) -> AgentState:
 
     logger.info("Starting Plan phase for issue #%d...", issue_num)
 
-    # 1. Update state status, phase, and reset read_files per ADR-0006
+    # 1. Update state status, phase, and reset read_files per ADR-0006 / ADR-0033
     state["status"] = "planning"
     state["phase"] = "planning"
-    state["read_files"] = []
+    state["read_files"] = {}
     state_module.save(state)
 
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
@@ -713,10 +713,10 @@ def execute_node(state: AgentState) -> AgentState:
 
     logger.info("Starting Execute phase for issue #%d...", issue_num)
 
-    # 1. Update state status, phase, and reset read_files per CONTEXT / ADR-0006
+    # 1. Update state status, phase, and reset read_files per CONTEXT / ADR-0006 / ADR-0033
     state["status"] = "executing"
     state["phase"] = "executing"
-    state["read_files"] = []
+    state["read_files"] = {}
     state_module.save(state)
 
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
@@ -1034,10 +1034,10 @@ def verify_node(state: AgentState) -> AgentState:
 
     logger.info("Starting Verify phase for issue #%d...", issue_num)
 
-    # 1. Update state status, phase, and reset read_files per CONTEXT
+    # 1. Update state status, phase, and reset read_files per CONTEXT / ADR-0033
     state["status"] = "verifying"
     state["phase"] = "verifying"
-    state["read_files"] = []
+    state["read_files"] = {}
     state_module.save(state)
 
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
@@ -1288,7 +1288,7 @@ def pr_node(state: AgentState) -> AgentState:
 
     state["status"] = "pr_open"
     state["phase"] = "pr_open"
-    state["read_files"] = []
+    state["read_files"] = {}
     state_module.save(state)
 
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
@@ -1389,7 +1389,7 @@ def merge_node(state: AgentState) -> AgentState:
 
     state["status"] = "merging"
     state["phase"] = "merging"
-    state["read_files"] = []
+    state["read_files"] = {}
     state_module.save(state)
 
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
@@ -1579,7 +1579,7 @@ def recovery_node(state: AgentState) -> AgentState:
 
     state["status"] = "failed"
     state["phase"] = "recovery"
-    state["read_files"] = []
+    state["read_files"] = {}
     state_module.save(state)
 
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
@@ -1627,7 +1627,7 @@ def test_writer_node(state: AgentState) -> AgentState:
 
     state["status"] = "executing"
     state["phase"] = "test_writing"
-    state["read_files"] = []
+    state["read_files"] = {}
     state_module.save(state)
 
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")

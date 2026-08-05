@@ -43,6 +43,68 @@ def _normalize_path(path_str: str) -> tuple[Path, str]:
     return abs_path, rel_str
 
 
+def _merge_ranges(ranges: list[list[int]]) -> list[list[int]]:
+    """Sort and merge overlapping/adjacent [start, end] (1-based inclusive) ranges.
+
+    Returns a canonical list of disjoint, ascending ranges. Invalid ranges where
+    start > end are dropped.
+    """
+    cleaned = sorted(
+        (int(s), int(e))
+        for s, e in ranges
+        if s is not None and e is not None and int(s) <= int(e)
+    )
+    merged: list[list[int]] = []
+    for s, e in cleaned:
+        if not merged:
+            merged.append([s, e])
+            continue
+        last = merged[-1]
+        if s <= last[1] + 1:  # overlapping or immediately adjacent
+            last[1] = max(last[1], e)
+        else:
+            merged.append([s, e])
+    return merged
+
+
+def _ranges_contain(ranges: list[list[int]], lo: int, hi: int) -> bool:
+    """Return True if the inclusive interval [lo, hi] is fully covered by the union of ranges."""
+    if lo > hi:
+        return False
+    merged = _merge_ranges(ranges)
+    return any(s <= lo and hi <= e for s, e in merged)
+
+
+def _recompute_ranges(
+    ranges: list[list[int]], edit_start: int, edit_end: int, delta: int
+) -> list[list[int]]:
+    """Recompute read ranges for a file after a patch at [edit_start, edit_end].
+
+    - Ranges entirely above the edit (end < edit_start) keep their line numbers (content
+      above the edit is untouched).
+    - Ranges entirely below the edit (start > edit_end) shift by `delta` (the change in
+      total line count), since content below the edit moves up/down in lockstep.
+    - Ranges overlapping the edit are split: the above-portion is kept unchanged, the
+      below-portion is shifted; the overlapped span (the rewritten content) is dropped,
+      forcing a fresh read before re-editing that region.
+
+    `delta` = new_total_lines - old_total_lines (the single replaced region is the only
+    change, so the shift at the edit point equals the total line-count delta).
+    """
+    out: list[list[int]] = []
+    for s, e in ranges:
+        if e < edit_start:
+            out.append([s, e])
+        elif s > edit_end:
+            out.append([s + delta, e + delta])
+        else:
+            if s < edit_start:
+                out.append([s, edit_start - 1])
+            if e > edit_end:
+                out.append([edit_end + 1 + delta, e + delta])
+    return _merge_ranges(out)
+
+
 def read_file(
     path: str, start_line: int | None = None, end_line: int | None = None
 ) -> str:
@@ -101,14 +163,33 @@ def read_file(
     end_idx = end_line if end_line is not None else total_lines
     sliced_lines = lines[s:end_idx]
 
-    # Register the file read in orchestrator state
+    # Compute the 1-based inclusive line range actually read and register it in
+    # orchestrator state. A full read (no bounds) authorizes [1, total_lines].
+    read_lo = start_line if start_line is not None else 1
+    read_hi = end_line if end_line is not None else total_lines
+    read_range: list[int]
+    if total_lines == 0:
+        # Empty file: nothing to authorize; record an empty range list for the path.
+        read_range = None  # type: ignore[assignment]
+    else:
+        read_range = [read_lo, read_hi]
+
+    # Register the read range in orchestrator state (range-scoped Read-Before-Edit, ADR-0033)
     try:
         curr_state = state.load()
-        if "read_files" not in curr_state:
-            curr_state["read_files"] = []
-        if rel_str not in curr_state["read_files"]:
-            curr_state["read_files"].append(rel_str)
-            state.save(curr_state)
+        if "read_files" not in curr_state or isinstance(curr_state["read_files"], list):
+            curr_state["read_files"] = {}
+        read_ranges = curr_state["read_files"]
+        if not isinstance(read_ranges, dict):
+            read_ranges = {}
+        existing = read_ranges.get(rel_str, [])
+        if read_range is not None:
+            existing = _merge_ranges(existing + [read_range])
+        else:
+            existing = _merge_ranges(existing)
+        read_ranges[rel_str] = existing
+        curr_state["read_files"] = read_ranges
+        state.save(curr_state)
     except Exception:
         # Log state update warnings, but do not fail the file read if the state is not available
         pass
@@ -213,8 +294,9 @@ def grep_search(query: str, path: str) -> str:
 def patch_file(path: str, old_string: str, new_string: str) -> str:
     """Perform exact search-and-replace of old_string with new_string.
 
-    Enforces 'Read-Before-Edit' by verifying that the normalized path has been registered in the
-    'read_files' list inside the orchestrator state.
+    Enforces 'Read-Before-Edit' by verifying that the normalized path has been read in the
+    current execution cycle, and that the line span occupied by old_string falls within the
+    previously read line ranges (range-scoped, ADR-0033).
     Enforces 'Ambiguity Abort' by verifying that old_string matches exactly once in the file.
     """
     try:
@@ -222,14 +304,19 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
     except ValueError as e:
         return f"Error: {e}"
 
-    # 1. Read-Before-Edit Constraint
+    # 1. Read-Before-Edit Constraint (path-level): the file must have been read at least
+    #    once in this cycle (its path is a key in read_files). Whether the *lines* targeted
+    #    by old_string were read is checked later by the range gate.
     try:
         curr_state = state.load()
-        read_files = curr_state.get("read_files", [])
+        read_files = curr_state.get("read_files", {})
+        if isinstance(read_files, list):
+            read_files = {}
     except Exception:
-        read_files = []
+        read_files = {}
 
-    if rel_str not in read_files:
+    file_ranges = read_files.get(rel_str, []) if isinstance(read_files, dict) else []
+    if rel_str not in (read_files if isinstance(read_files, dict) else {}):
         return f"Error: Read-Before-Edit validation failed. File '{path}' has not been read in the current execution cycle. Please call 'read_file' first."
 
     # 2. Path Validation & Existence
@@ -260,7 +347,25 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
     elif matches_count > 1:
         return f"Error: The old_string matches multiple times ({matches_count} occurrences). To resolve this ambiguity, please include more surrounding context lines in 'old_string' so that the match is unique."
 
-    # 5. Perform the edit
+    # 5. Range-Scoped Read-Before-Edit: the old_string's line span must fall within a
+    #    previously read range. Locate the unique match and compute its 1-based inclusive
+    #    line span, then verify it is fully covered by the union of read ranges.
+    idx = content.find(old_string)
+    edit_start = 1 + content.count("\n", 0, idx)
+    edit_end = edit_start + old_string.count("\n")
+
+    if not _ranges_contain(file_ranges, edit_start, edit_end):
+        ranges_repr = (
+            ", ".join(f"[{s}-{e}]" for s, e in _merge_ranges(file_ranges)) or "(none)"
+        )
+        return (
+            f"Error: Read-Before-Edit range validation failed. The edit targets lines "
+            f"{edit_start}-{edit_end} of '{path}', which fall outside the line ranges "
+            f"previously read for this file ({ranges_repr}). Please call 'read_file' on "
+            f"lines {edit_start}-{edit_end} (or the whole file) first, then retry the patch."
+        )
+
+    # 6. Perform the edit
     new_content = content.replace(old_string, new_string, 1)
 
     try:
@@ -268,6 +373,28 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
             f.write(new_content)
     except Exception as e:
         return f"Error: Failed to write to file '{path}': {e}"
+
+    # 7. Recompute read ranges for this file: shift/split around the edited region so the
+    #    recorded ranges remain aligned with the post-edit line numbers (ADR-0033).
+    delta = len(new_content.splitlines()) - len(content.splitlines())
+    try:
+        post_state = state.load()
+        post_ranges = post_state.get("read_files", {})
+        if isinstance(post_ranges, list):
+            post_ranges = {}
+        existing = (
+            post_ranges.get(rel_str, file_ranges)
+            if isinstance(post_ranges, dict)
+            else file_ranges
+        )
+        recomputed = _recompute_ranges(existing, edit_start, edit_end, delta)
+        if not isinstance(post_ranges, dict):
+            post_ranges = {}
+        post_ranges[rel_str] = recomputed
+        post_state["read_files"] = post_ranges
+        state.save(post_state)
+    except Exception:
+        pass
 
     return f"Success: File '{path}' patched successfully. One occurrence replaced."
 

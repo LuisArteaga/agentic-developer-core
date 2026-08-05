@@ -433,7 +433,7 @@ class TestPlanNode(unittest.TestCase):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["model"] = "gpt-4o"
-        state["read_files"] = ["some_old_file.py"]
+        state["read_files"] = {"some_old_file.py": [[1, 5]]}
         state_module.save(state)
 
         # Run plan node
@@ -442,14 +442,14 @@ class TestPlanNode(unittest.TestCase):
         # Verify state transitions and read_files reset
         self.assertEqual(new_state["status"], "planning")
         self.assertEqual(new_state["phase"], "planning")
-        self.assertEqual(new_state["read_files"], [])
+        self.assertEqual(new_state["read_files"], {})
         self.assertIsNotNone(new_state["plan"])
         self.assertEqual(new_state["model"], "gpt-4o")
 
         # Verify state file was saved
         saved_state = state_module.load()
         self.assertEqual(saved_state["status"], "planning")
-        self.assertEqual(saved_state["read_files"], [])
+        self.assertEqual(saved_state["read_files"], {})
 
         # Verify serialized plan structure
         assert new_state["plan"] is not None
@@ -786,7 +786,7 @@ class TestExecuteNode(unittest.TestCase):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
-        state["read_files"] = ["old_file.py"]
+        state["read_files"] = {"old_file.py": [[1, 5]]}
         state_module.save(state)
 
         # Run execute node
@@ -795,7 +795,7 @@ class TestExecuteNode(unittest.TestCase):
         # Verify status transitions, read_files reset
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "executing")
-        self.assertEqual(new_state["read_files"], [])
+        self.assertEqual(new_state["read_files"], {})
 
         # Verify execute_worker was called with correct parameters
         mock_execute_worker.assert_called_once_with(
@@ -808,7 +808,7 @@ class TestExecuteNode(unittest.TestCase):
         # Verify state file was saved
         saved_state = state_module.load()
         self.assertEqual(saved_state["status"], "executing")
-        self.assertEqual(saved_state["read_files"], [])
+        self.assertEqual(saved_state["read_files"], {})
 
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
