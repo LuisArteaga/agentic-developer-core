@@ -2241,6 +2241,41 @@ class TestTestWriterNode(unittest.TestCase):
     @patch("orchestrator.nodes.subprocess.run")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
+    def test_test_writer_node_includes_behavior_not_structure_constraint(
+        self, mock_github_api, mock_execute_worker, mock_run
+    ):
+        """The Test-Writer instructions must carry the Behavior-Not-Structure
+        constraint (issue #58) so generated tests specify behavior and do not
+        leak a specific implementation that would steer the Worker.
+        """
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py.",
+        }
+        mock_res = unittest.mock.MagicMock()
+        mock_res.stdout = "Ran 5 tests in 0.1s\nOK"
+        mock_res.stderr = ""
+        mock_run.return_value = mock_res
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+
+        from orchestrator.nodes import test_writer_node
+
+        test_writer_node(state)
+
+        # execute_worker(instructions, plan, node_name=..., ...) — instructions
+        # is the first positional argument.
+        instructions = mock_execute_worker.call_args.args[0]
+        self.assertIn("BEHAVIOR, NOT STRUCTURE", instructions)
+        self.assertIn("public", instructions.lower())
+        self.assertIn("tautological", instructions.lower())
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_retry_and_success(
         self, mock_github_api, mock_execute_worker, mock_run
     ):

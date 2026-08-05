@@ -1659,7 +1659,12 @@ def test_writer_node(state: AgentState) -> AgentState:
         while attempt <= max_attempts:
             logger.info("Test-Writer attempt %d/%d...", attempt, max_attempts)
 
-            # Guide the worker to act as a Test-Writer per ADR-0010
+            # Guide the worker to act as a Test-Writer per ADR-0010. The
+            # BEHAVIOR, NOT STRUCTURE constraint (issue #58) prevents the
+            # Test-Writer from leaking a specific implementation into the tests,
+            # which would indirectly steer the Worker toward the Test-Writer's
+            # assumed solution rather than an independent one (Implementation
+            # Leakage).
             instructions = (
                 f"Title: {issue_title}\n\n{issue_body}\n\n"
                 f"=== ROLE: TEST-WRITER ===\n"
@@ -1667,7 +1672,20 @@ def test_writer_node(state: AgentState) -> AgentState:
                 f"covering the success paths, failure paths, and edge cases described in the plan.\n"
                 f"Also, generate minimal stub/skeleton files for any new classes, functions, or modules "
                 f"so that the test suite can be imported and run without syntax errors or ModuleNotFoundErrors.\n"
-                f"DO NOT implement the actual business logic. Leave the stubs empty (e.g. raise NotImplementedError or pass).\n"
+                f"DO NOT implement the actual business logic. Leave the stubs empty (e.g. raise NotImplementedError or pass).\n\n"
+                f"=== BEHAVIOR, NOT STRUCTURE ===\n"
+                f"Tests must specify observable BEHAVIOR, not encode a specific IMPLEMENTATION. The Worker "
+                f"must remain free to choose its own internal design. Adhere to the following:\n"
+                f"- Test through the PUBLIC API only: assert on return values, raised exceptions, and observable "
+                f"side effects for given inputs. Do NOT assert on private/dunder attributes or internal data structures.\n"
+                f"- Do NOT assume internal types, collection classes, helper method names, or attribute names beyond "
+                f"the public contract the plan describes. The Worker may refactor internals freely without breaking tests.\n"
+                f"- Derive expected values from the issue/plan specification, NEVER by re-running the stub or mirroring "
+                f"the implementation. A test whose oracle is just the implementation's output is tautological.\n"
+                f"- Prefer state-based (black-box) assertions over mocking internal collaborators. Only mock at the "
+                f"public boundary, for external collaborators the plan names explicitly.\n"
+                f"- Do not over-specify: a few representative assertions on observable behavior beat exhaustive "
+                f"assertions that pin down internal structure.\n"
             )
 
             if feedback:
