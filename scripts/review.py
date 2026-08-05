@@ -1060,6 +1060,18 @@ def _aggregate_verdicts(
     )
 
 
+def _enrich_chunk(chunk_diff: str, workspace_dir: str) -> str:
+    """Enrich a single diff chunk with enclosing function context.
+
+    Uses enrich_diff_with_function_context from scripts/enrichment.py.
+    Applied per-chunk so each file's context stays with its diff segment
+    (avoids ADR-0023's pooled-format orphan bug).
+    """
+    from enrichment import enrich_diff_with_function_context
+
+    return enrich_diff_with_function_context(chunk_diff, workspace_dir)
+
+
 def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
     """Runs a single judge evaluation, returning (status, reasoning, findings,
     error, used_fallback, final_model).
@@ -1103,11 +1115,13 @@ def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
         if len(diff) <= budget:
             span.set_attribute("eval.chunk_count", 1)
             span.set_attribute("eval.diff_total_chars", len(diff))
+            span.set_attribute("eval.workspace_dir", os.getenv("GITHUB_WORKSPACE", "."))
+            enriched_diff = _enrich_chunk(diff, os.getenv("GITHUB_WORKSPACE", "."))
             status, reasoning, findings, error, used_fallback, final_model = (
                 _run_single_chunk(
                     judge_key,
                     prompt,
-                    diff,
+                    enriched_diff,
                     api_key,
                     llm_caller,
                     span,
@@ -1133,10 +1147,11 @@ def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
 
         chunk_results: list[tuple[str, str, list[str], str | None, bool, str]] = []
         for batch in batches:
+            enriched_batch = _enrich_chunk(batch, os.getenv("GITHUB_WORKSPACE", "."))
             result = _run_single_chunk(
                 judge_key,
                 prompt,
-                batch,
+                enriched_batch,
                 api_key,
                 llm_caller,
                 span,

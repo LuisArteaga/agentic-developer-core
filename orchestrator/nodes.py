@@ -44,6 +44,8 @@ from scripts.telemetry import (
     start_orchestrator_phase,
 )
 
+from scripts.enrichment import enrich_diff_with_function_context
+
 logger = logging.getLogger("orchestrator.nodes")
 
 
@@ -1135,6 +1137,11 @@ def _run_bineval_phase(state: AgentState, issue_num: int, workspace_path: Path) 
     )
 
     diff = _get_workspace_diff(workspace_path)
+
+    # Enrich diff with enclosing function context (ADR-0022)
+    enriched_diff = enrich_diff_with_function_context(diff, str(workspace_path))
+    diff = enriched_diff
+
     if not diff.strip():
         logger.info(
             "BinEval skipped: no diff in workspace (empty changes). "

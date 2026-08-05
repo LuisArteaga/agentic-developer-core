@@ -1,6 +1,6 @@
 # ADR 0027: Pre-PR BinEval Review as a Soft Semantic Gate
 
-* **Status**: Accepted
+* **Status**: Accepted (amended by ADR-0032)
 * **Date**: 2026-07
 * **Deciders**: Luis Arteaga & Antigravity
 
