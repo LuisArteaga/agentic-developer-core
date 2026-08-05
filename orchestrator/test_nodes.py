@@ -864,6 +864,126 @@ class TestExecuteNode(unittest.TestCase):
         self.assertEqual(saved_state["status"], "failed")
         self.assertEqual(saved_state["phase"], "executing")
 
+    @patch("orchestrator.nodes.reset_hard")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_execute_node_no_hard_reset_on_early_attempts(
+        self, mock_github_api, mock_execute_worker, mock_reset_hard
+    ):
+        """Early execute attempts (below the hard-reset threshold) stay incremental: no reset."""
+        mock_github_api.return_value = {"title": "Fix a bug", "body": "body"}
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        # attempts["verify"]=0 -> first execute attempt (1) -> below threshold (3)
+        state_module.save(state)
+
+        execute_node(state)
+
+        mock_reset_hard.assert_not_called()
+        mock_execute_worker.assert_called_once_with(
+            unittest.mock.ANY,
+            '{"rationale": "...", "tasks": []}',
+            issue_number=10,
+            attempt=1,
+        )
+
+    @patch("orchestrator.nodes.reset_hard")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_execute_node_hard_reset_on_final_attempt(
+        self, mock_github_api, mock_execute_worker, mock_reset_hard
+    ):
+        """The 3rd execute attempt (default threshold) hard-resets tracked files before the Worker runs."""
+        mock_github_api.return_value = {"title": "Fix a bug", "body": "body"}
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        # attempts["verify"]=2 -> execute attempt 3 -> meets default threshold
+        state["attempts"] = {"verify": 2}
+        state_module.save(state)
+
+        execute_node(state)
+
+        # reset_hard called exactly once, to HEAD, on the resolved workspace
+        self.assertEqual(mock_reset_hard.call_count, 1)
+        call_args, call_kwargs = mock_reset_hard.call_args
+        self.assertEqual(call_args[1], "HEAD")
+        self.assertEqual(Path(call_args[0]), self.workspace_dir)
+        self.assertEqual(call_kwargs, {})
+        # Worker still invoked on attempt 3 with prior feedback injected
+        mock_execute_worker.assert_called_once_with(
+            unittest.mock.ANY,
+            '{"rationale": "...", "tasks": []}',
+            issue_number=10,
+            attempt=3,
+        )
+
+    @patch("orchestrator.nodes.reset_hard")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_execute_node_hard_reset_threshold_configurable(
+        self, mock_github_api, mock_execute_worker, mock_reset_hard
+    ):
+        """AGENT_RETRY_HARD_RESET_ATTEMPT lowers the reset point for weaker models."""
+        mock_github_api.return_value = {"title": "Fix a bug", "body": "body"}
+
+        self.original_env["AGENT_RETRY_HARD_RESET_ATTEMPT"] = os.environ.get(
+            "AGENT_RETRY_HARD_RESET_ATTEMPT"
+        )
+        os.environ["AGENT_RETRY_HARD_RESET_ATTEMPT"] = "2"
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        # attempts["verify"]=1 -> execute attempt 2 -> meets configured threshold
+        state["attempts"] = {"verify": 1}
+        state_module.save(state)
+
+        execute_node(state)
+
+        mock_reset_hard.assert_called_once()
+        call_args, _ = mock_reset_hard.call_args
+        self.assertEqual(call_args[1], "HEAD")
+        mock_execute_worker.assert_called_once_with(
+            unittest.mock.ANY,
+            '{"rationale": "...", "tasks": []}',
+            issue_number=10,
+            attempt=2,
+        )
+
+    @patch("orchestrator.nodes.reset_hard")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_execute_node_hard_reset_disabled_when_threshold_high(
+        self, mock_github_api, mock_execute_worker, mock_reset_hard
+    ):
+        """A threshold above the max retry count disables hard reset (pure ADR-0013 incremental)."""
+        mock_github_api.return_value = {"title": "Fix a bug", "body": "body"}
+
+        self.original_env["AGENT_RETRY_HARD_RESET_ATTEMPT"] = os.environ.get(
+            "AGENT_RETRY_HARD_RESET_ATTEMPT"
+        )
+        os.environ["AGENT_RETRY_HARD_RESET_ATTEMPT"] = "99"
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state["attempts"] = {"verify": 2}  # attempt 3, but threshold 99 -> no reset
+        state_module.save(state)
+
+        execute_node(state)
+
+        mock_reset_hard.assert_not_called()
+        mock_execute_worker.assert_called_once_with(
+            unittest.mock.ANY,
+            '{"rationale": "...", "tasks": []}',
+            issue_number=10,
+            attempt=3,
+        )
+
 
 class TestVerifyNode(unittest.TestCase):
     def setUp(self):
