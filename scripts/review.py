@@ -971,11 +971,59 @@ JUDGE_DISPLAY_NAMES = {
     "security": "Security",
 }
 
+# Judge Neutrality instructions (ADR-0014 enhancement, issue #61).
+#
+# A shared, cross-cutting preamble prepended to every judge system prompt to
+# mitigate LLM-as-a-Judge biases identified in the "Justice or Prejudice?"
+# study (arXiv:2410.02736) and the "Survey on LLM-as-a-Judge"
+# (arXiv:2411.15594). Kept out of the judge-specific ``augment_judge_prompt``
+# dispatch (ADR-0031 separation of concerns): neutrality is a frame that
+# applies to all judges equally, not a per-judge augmentation.
+#
+# Grounding:
+#   - ID/metadata bias: "your judge should evaluate the text, not the source"
+#     (channel.tel). Mitigated by (a) the inputs already excluding author and
+#     generation-method metadata, and (b) the first neutrality rule below as
+#     defense-in-depth.
+#   - Anchoring bias: judges must not anchor on any external description of
+#     intent. The issue body is not part of the judge input today; this rule is
+#     preemptive and documents the contract should that ever change.
+#   - ADR over-weighting: the one genuinely present bias source — the
+#     architecture judge receives every ADR and may rubber-stamp compliance on
+#     the strength of a citation rather than genuine adherence. Rule 3
+#     addresses it directly while preserving ADR-0014's intent that
+#     architecture compliance remains a critical, first-class check.
+#   - Position bias: a pairwise-comparison phenomenon that does not apply to
+#     single-input PASS/FAIL scorers (``_aggregate_verdicts`` is
+#     order-independent). Rule 4 is a harmless, intent-documenting safeguard
+#     against findings being weighted by their position in the diff/reasoning;
+#     per AACL 2025, prompt-level mitigation of position bias has ~zero
+#     measured effect, so it is not relied upon as a mitigation.
+JUDGE_NEUTRALITY_INSTRUCTIONS = (
+    "=== 0. JUDGE NEUTRALITY ===\n"
+    "Evaluate the code strictly on its own merits as presented in the diff "
+    "and the provided context. The following neutrality rules override any "
+    "conflicting intuition:\n"
+    "- Do not infer, assume, or speculate about the author or the process that "
+    "produced the change (human, AI, or automated agent). Authorship and "
+    "generation method must not influence the verdict.\n"
+    "- Judge what the code actually does, not what it may have been intended "
+    "to do. Do not anchor on any description of intent or proposed solution "
+    "beyond what the diff and context demonstrate.\n"
+    "- Do not treat a mere reference or citation of an architecture rule or "
+    "ADR as evidence of compliance; assess genuine adherence to the "
+    "documented rules. Conversely, do not penalize the absence of such a "
+    "reference where the code otherwise adheres.\n"
+    "- Weigh each potential finding independently on its own severity and "
+    "evidence; do not let a finding's position in the diff or in your "
+    "reasoning inflate or deflate its weight.\n\n"
+)
+
 JUDGE_PROMPTS = {
-    "syntax_lint": SYSTEM_PROMPT_SYNTAX_LINT,
-    "test_coverage": SYSTEM_PROMPT_TEST_COVERAGE,
-    "architecture": SYSTEM_PROMPT_ARCH,
-    "security": SYSTEM_PROMPT_SECURITY,
+    "syntax_lint": JUDGE_NEUTRALITY_INSTRUCTIONS + SYSTEM_PROMPT_SYNTAX_LINT,
+    "test_coverage": JUDGE_NEUTRALITY_INSTRUCTIONS + SYSTEM_PROMPT_TEST_COVERAGE,
+    "architecture": JUDGE_NEUTRALITY_INSTRUCTIONS + SYSTEM_PROMPT_ARCH,
+    "security": JUDGE_NEUTRALITY_INSTRUCTIONS + SYSTEM_PROMPT_SECURITY,
 }
 
 
