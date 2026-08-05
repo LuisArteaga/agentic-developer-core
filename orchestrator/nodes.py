@@ -767,9 +767,30 @@ def execute_node(state: AgentState) -> AgentState:
         from orchestrator.worker import execute_worker
 
         # Derive the 1-based execute attempt index from the verify retry counter
-        # (first execute = 1, after a failed verify = 2, ...). Used only to name
-        # the Worker Trace sidecar file.
+        # (first execute = 1, after a failed verify = 2, ...). Used to name the
+        # Worker Trace sidecar file and to drive the Hybrid Retry strategy.
         attempt = state.get("attempts", {}).get("verify", 0) + 1
+
+        # Hybrid Retry (ADR-0034): retries below the hard-reset threshold stay
+        # incremental (ADR-0013) — the Worker patches its prior edits in place.
+        # From the configurable hard-reset attempt onward, tracked-file edits are
+        # rolled back to HEAD so the Worker retries from a clean branch state
+        # instead of building on compounding errors. Only tracked files are
+        # reverted: nothing is committed until the PR-Node, so the Test-Writer's
+        # tests and stubs are untracked and survive the reset (git reset --hard
+        # does not touch untracked files). reset --hard to HEAD is idempotent, so
+        # a crash-and-resume that re-enters this attempt re-resetting is safe.
+        hard_reset_attempt = int(os.getenv("AGENT_RETRY_HARD_RESET_ATTEMPT", "3"))
+        if attempt >= hard_reset_attempt:
+            logger.info(
+                "Hybrid Retry: execute attempt %d meets the hard-reset threshold "
+                "(%d). Reverting tracked workspace changes to HEAD for a clean "
+                "slate before invoking the Worker (ADR-0034).",
+                attempt,
+                hard_reset_attempt,
+            )
+            reset_hard(workspace_path, "HEAD")
+
         execute_worker(
             issue_description,
             plan,
