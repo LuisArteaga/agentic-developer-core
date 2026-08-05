@@ -1500,6 +1500,69 @@ class EnrichChunkIntegrationTests(unittest.TestCase):
         self.assertIn("=== ENCLOSING FUNCTION CONTEXT ===", captured_diffs[0])
         self.assertIn("--- app.py :: greet ---", captured_diffs[0])
 
+    def test_run_judge_multi_batch_path_enriches_before_llm(self):
+        """AC: multi-batch path enriches EACH batch before passing to llm_caller.
+
+        Closes the residual coverage gap from issue #55: the fast path's
+        enrichment is asserted by ``test_run_judge_fast_path_enriches_before_llm``,
+        but the multi-batch branch (split -> pack -> per-batch enrichment per
+        ADR-0032) was only asserted for verdict aggregation, never for its
+        enrichment behaviour. If the ``_enrich_chunk(batch)`` call were removed,
+        no other test would fail.
+        """
+        captured: list[str] = []
+
+        def capturing_caller(judge_key, prompt, diff, api_key):
+            captured.append(diff)
+            return self._build_llm_response(
+                "<reasoning>r</reasoning><findings></findings>"
+            ), {"used_fallback": False, "final_model": "m", "attempt_count": 1}
+
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            (workspace_path / "a.py").write_text(
+                "def alpha():\n    return 1\n", encoding="utf-8"
+            )
+            (workspace_path / "b.py").write_text(
+                "def beta():\n    return 2\n", encoding="utf-8"
+            )
+            # Budget chosen so each file-section fits (no clip) but two sections
+            # cannot share a batch -> guarantees the multi-batch path (2 calls).
+            env = {
+                "GITHUB_WORKSPACE": str(workspace_path),
+                "REVIEW_BATCH_BUDGET_CHARS": "100",
+            }
+            with patch.dict(os.environ, env):
+                diff = (
+                    "diff --git a/a.py b/a.py\n"
+                    "--- a/a.py\n"
+                    "+++ b/a.py\n"
+                    "@@ -1,1 +1,1 @@\n"
+                    "-old\n"
+                    "+new\n"
+                    "diff --git a/b.py b/b.py\n"
+                    "--- b/b.py\n"
+                    "+++ b/b.py\n"
+                    "@@ -1,1 +1,1 @@\n"
+                    "-x\n"
+                    "+y\n"
+                )
+                review.run_judge(
+                    "architecture",
+                    review.SYSTEM_PROMPT_ARCH,
+                    diff,
+                    "key",
+                    llm_caller=capturing_caller,
+                )
+
+        # Multi-batch path produced one call per batch.
+        self.assertEqual(len(captured), 2)
+        # Each batch received its own enclosing-function context block.
+        for chunk in captured:
+            self.assertIn("=== ENCLOSING FUNCTION CONTEXT ===", chunk)
+        self.assertIn("--- a.py :: alpha ---", captured[0])
+        self.assertIn("--- b.py :: beta ---", captured[1])
+
 
 if __name__ == "__main__":
     unittest.main()
