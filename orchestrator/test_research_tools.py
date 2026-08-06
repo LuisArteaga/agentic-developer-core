@@ -383,6 +383,14 @@ class TestIsDomainAllowed(unittest.TestCase):
         sources = SourcesConfig(strict=True, domains=["python.org"])
         self.assertFalse(is_domain_allowed("https://notpython.org/", sources))
 
+    def test_strict_urlsplit_error_returns_false(self):
+        # A malformed URL that urlsplit rejects is denied (defensive).
+        sources = SourcesConfig(strict=True, domains=["python.org"])
+        with patch(
+            "orchestrator.research_tools.urlsplit", side_effect=ValueError("bad")
+        ):
+            self.assertFalse(is_domain_allowed("https://python.org/", sources))
+
 
 class TestIsUrlAllowed(unittest.TestCase):
     def test_combines_ssrf_and_strict(self):
@@ -831,6 +839,16 @@ class TestResolveValidatedIp(unittest.TestCase):
             side_effect=socket.gaierror,
         ):
             self.assertIsNone(_resolve_validated_ip("nonexistent.invalid"))
+
+    def test_returns_none_on_unparseable_address(self):
+        # An unparseable address record fails closed (ADR-0037 layer 3).
+        with patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("not-an-ip", 0))
+            ],
+        ):
+            self.assertIsNone(_resolve_validated_ip("evil.example"))
 
 
 class TestPinnedConnections(unittest.TestCase):

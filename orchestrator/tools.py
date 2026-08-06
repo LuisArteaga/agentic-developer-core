@@ -16,8 +16,13 @@ _PROJECT_ROOT: Path | None = None
 
 # Curated set of binaries the Worker may execute via run_command. Network
 # binaries (curl, wget, nc, ssh, scp, ...) are deliberately EXCLUDED — outbound
-# research must go through fetch_url, which has SSRF protection. Overridable as
-# a comma-separated list via AGENT_RUN_COMMAND_ALLOWLIST.
+# research must go through fetch_url, which has SSRF protection. File-reading
+# binaries (cat, ls, ...) are also EXCLUDED: they read arbitrary paths with no
+# is_safe_path check, so a prompt-injected Worker could `cat .env` / `ls .git`
+# and leak secrets into the LLM context, defeating ADR-0037 layer 2. File
+# inspection must go through the is_safe_path-protected read_file /
+# list_directory / grep_search tools. Overridable as a comma-separated list
+# via AGENT_RUN_COMMAND_ALLOWLIST.
 DEFAULT_RUN_COMMAND_ALLOWLIST = frozenset(
     {
         "python",
@@ -30,8 +35,6 @@ DEFAULT_RUN_COMMAND_ALLOWLIST = frozenset(
         "mypy",
         "semgrep",
         "pip-audit",
-        "ls",
-        "cat",
         "echo",
     }
 )

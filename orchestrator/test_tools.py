@@ -687,6 +687,34 @@ class TestCodebaseTools(unittest.TestCase):
         self.assertIn("not in the run_command allowlist", res)
         self.assertIn("npm", res)
 
+    def test_run_command_rejects_file_reading_binaries(self):
+        """cat/ls are excluded from the allowlist: they read arbitrary paths
+        with no is_safe_path check and would bypass ADR-0037 layer 2 (a
+        prompt-injected Worker could `cat .env` / `ls .git`)."""
+        for binary in ("cat", "ls"):
+            res = run_command(f"{binary} .env")
+            self.assertIn("not in the run_command allowlist", res)
+            self.assertIn(binary, res)
+
+    def test_get_workspace_root_honors_env_when_project_root_unset(self):
+        """When _PROJECT_ROOT is None, get_workspace_root resolves GITHUB_WORKSPACE
+        (relative to the orchestrator package, or absolute)."""
+        from orchestrator import tools as _tools
+
+        original_root = _tools._PROJECT_ROOT
+        _tools._PROJECT_ROOT = None
+        original_ws = os.environ.get("GITHUB_WORKSPACE")
+        try:
+            # Absolute path is returned resolved.
+            os.environ["GITHUB_WORKSPACE"] = str(self.temp_dir_path)
+            self.assertEqual(_tools.get_workspace_root(), self.temp_dir_path)
+        finally:
+            _tools._PROJECT_ROOT = original_root
+            if original_ws is not None:
+                os.environ["GITHUB_WORKSPACE"] = original_ws
+            else:
+                os.environ.pop("GITHUB_WORKSPACE", None)
+
     def test_run_command_allowlist_accepts_curated_binary(self):
         """An allowlisted binary actually executes."""
         res = run_command("echo allowed")
