@@ -157,6 +157,32 @@ class TestStatePersistence(unittest.TestCase):
         loaded_state = load(self.state_file)
         self.assertEqual(loaded_state["read_files"], {})
 
+    def test_load_defaults_verify_output_when_missing(self):
+        """A legacy state.json lacking verify_output defaults it to None."""
+        # Round-trip through JSON to get a plain dict (DEFAULT_STATE is a
+        # TypedDict, whose keys mypy forbids deleting), then drop the key to
+        # simulate a state file written before verify_output existed.
+        data = json.loads(json.dumps(copy.deepcopy(DEFAULT_STATE)))
+        data.pop("verify_output", None)
+
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        loaded_state = load(self.state_file)
+        self.assertIn("verify_output", loaded_state)
+        self.assertIsNone(loaded_state["verify_output"])
+
+    def test_load_preserves_verify_output_when_present(self):
+        """A state.json that carries verify_output round-trips it unchanged."""
+        state_with_output = copy.deepcopy(DEFAULT_STATE)
+        state_with_output["verify_output"] = "collected 5 items\nTOTAL 10 1 90%\n"
+
+        save(state_with_output, self.state_file)
+        loaded_state = load(self.state_file)
+        self.assertEqual(
+            loaded_state["verify_output"], "collected 5 items\nTOTAL 10 1 90%\n"
+        )
+
 
 class TestGetStateFilepath(unittest.TestCase):
     def setUp(self):

@@ -355,6 +355,16 @@ class TestGitSubprocessHelper(unittest.TestCase):
         with tempfile.TemporaryDirectory() as non_repo:
             self.assertEqual(diff_stat(Path(non_repo)), "")
 
+    def test_diff_stat_empty_on_git_error(self):
+        """diff_stat returns '' (never raises) when _run_git raises GitError."""
+        from unittest import mock
+
+        from orchestrator.git import GitError, diff_stat
+
+        err = GitError("boom")
+        with mock.patch("orchestrator.git._run_git", side_effect=err):
+            self.assertEqual(diff_stat(self.repo_path, base="main...HEAD"), "")
+
     def test_clean_and_reset_hard(self):
         """Test workspace hygiene commands: clean and reset_hard."""
         # Modify an existing tracked file

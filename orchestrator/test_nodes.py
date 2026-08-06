@@ -1931,6 +1931,21 @@ class TestPRBodyHelpers(unittest.TestCase):
 
         self.assertEqual(extract_plan_rationale(json.dumps({"tasks": []})), "")
 
+    def test_extract_plan_rationale_non_dict_json(self):
+        """A plan that parses to a non-dict (list/scalar) degrades to ''."""
+        from orchestrator.metrics import extract_plan_rationale
+
+        self.assertEqual(extract_plan_rationale("[]"), "")
+        self.assertEqual(extract_plan_rationale('"a string"'), "")
+        self.assertEqual(extract_plan_rationale("123"), "")
+
+    def test_extract_plan_rationale_non_string_rationale(self):
+        """A non-string rationale value degrades to '' rather than leaking it."""
+        from orchestrator.metrics import extract_plan_rationale
+
+        self.assertEqual(extract_plan_rationale(json.dumps({"rationale": 42})), "")
+        self.assertEqual(extract_plan_rationale(json.dumps({"rationale": None})), "")
+
     def test_extract_plan_rationale_invalid_json(self):
         from orchestrator.metrics import extract_plan_rationale
 
