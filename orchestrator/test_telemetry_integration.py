@@ -316,6 +316,68 @@ class TestTelemetryIntegration(unittest.TestCase):
 
         self.assertIn("42_feat/issue-42", session_ids)
 
+    def test_langfuse_session_id_attached_on_already_set_provider(self):
+        """BaggageSpanProcessor attaches on the already-set-provider path (issue #75).
+
+        Regression guard for the fix to ``init_telemetry``'s early-return branch.
+        When a first ``init_telemetry(in_memory_exporter=...)`` call registers a
+        fresh provider WITHOUT Langfuse configured (so no BaggageSpanProcessor),
+        a subsequent ``init_telemetry()`` call with Langfuse keys set must still
+        attach the BaggageSpanProcessor to the existing provider — the
+        already-set-provider path — so ``langfuse.session.id`` propagates to
+        spans regardless of call order. Before the fix, the early-return path
+        skipped the BaggageSpanProcessor and the session id never landed on
+        spans; this test failed in that state.
+
+        Spans are asserted via the in-memory exporter attached in the first
+        call (it remains on the shared provider), not via JSONL — so the
+        assertion is independent of file I/O.
+        """
+        if not HAS_OTEL:
+            self.skipTest("OpenTelemetry is not installed in the current environment.")
+
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        # Step 1: register a fresh provider with an in-memory exporter but
+        # WITHOUT Langfuse configured, so no BaggageSpanProcessor is attached
+        # (the in_memory_exporter branch of the fresh path skips it).
+        os.environ.pop("LANGFUSE_PUBLIC_KEY", None)
+        os.environ.pop("LANGFUSE_SECRET_KEY", None)
+        os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+        exporter = InMemorySpanExporter()
+        init_telemetry(in_memory_exporter=exporter, reset_state=True)
+
+        # Step 2: now configure Langfuse and re-init. This takes the
+        # already-set-provider early-return path. The fix attaches the
+        # BaggageSpanProcessor here; the pre-fix code did not.
+        os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-test"
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-test"
+        with patch("scripts.telemetry.OTLPSpanExporter"):
+            init_telemetry(reset_state=True, issue_number=42, branch="feat/issue-42")
+
+        start_orchestrator_loop(issue_number=42, branch="feat/issue-42")
+        start_orchestrator_phase("plan")
+        end_orchestrator_phase(exit_code=0)
+        end_orchestrator_loop(exit_code=0)
+
+        spans = exporter.get_finished_spans()
+        self.assertTrue(spans, "Expected spans captured by the in-memory exporter")
+
+        session_ids = {
+            span.attributes.get("langfuse.session.id")
+            for span in spans
+            if span.attributes
+        }
+        self.assertIn(
+            "42_feat/issue-42",
+            session_ids,
+            "BaggageSpanProcessor must attach on the already-set-provider path "
+            "so langfuse.session.id propagates regardless of init_telemetry "
+            "call order (issue #75)",
+        )
+
     def test_no_langfuse_keys_unchanged_behavior(self):
         """Without Langfuse keys, behavior is unchanged (generic OTLP or local-only).
 
