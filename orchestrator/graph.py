@@ -98,9 +98,24 @@ def route_after_pr(state: AgentState) -> str:
 
 
 def route_after_merge(state: AgentState) -> str:
-    """Routes execution after the Merge-Node."""
-    if state.get("status") == "failed":
+    """Routes execution after the Merge-Node.
+
+    Closes the post-PR judge-feedback loop (ADR-0036): when ``merge_node`` parses
+    actionable PR Review Judge verdicts (FAIL / NEEDS REVIEW, ADR-0014) and the
+    merge-fix budget is not exhausted, it signals a retry by setting
+    ``status="executing"`` + ``phase="merge_fix"``. This router then returns
+    ``"execute"`` so the Worker receives the judge findings via the existing
+    ``state["feedback"]`` injection path, re-enters ``pr_node`` for a ``fix:``
+    commit, and re-polls the merge. The remaining statuses are unchanged:
+    ``failed`` -> ``recovery`` (incl. cap-exhaustion escalation and poll
+    timeout), ``done`` -> ``end``.
+    """
+    status = state.get("status")
+    if status == "failed":
         return "recovery"
+    if status == "executing":
+        # Merge-fix retry: actionable judge feedback with budget remaining.
+        return "execute"
     return "end"
 
 
@@ -160,7 +175,9 @@ builder.add_conditional_edges(
 )
 
 builder.add_conditional_edges(
-    "merge", route_after_merge, {"end": END, "recovery": "recovery"}
+    "merge",
+    route_after_merge,
+    {"end": END, "execute": "execute", "recovery": "recovery"},
 )
 
 builder.add_edge("recovery", END)

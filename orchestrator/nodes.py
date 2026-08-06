@@ -9,7 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, Mapping, cast
 
 from pydantic import BaseModel, Field
 
@@ -425,6 +425,12 @@ def claim_node(state: AgentState) -> AgentState:
             state["branch"] = branch_name
             state["plan"] = None
             state["read_files"] = {}
+            # Reset retry counters and per-cycle fields for a fresh issue cycle.
+            # Without this, a stale attempts["merge"] / attempts["verify"]
+            # from a prior cycle would leak into the new one (ADR-0036).
+            state["attempts"] = {}
+            state["feedback"] = None
+            state["pushed_at"] = None
 
             _safe_telemetry(
                 start_orchestrator_loop, issue_number=issue_num, branch=branch_name
@@ -1320,8 +1326,17 @@ def pr_node(state: AgentState) -> AgentState:
         logger.info("Staging all changes in workspace...")
         add(workspace_path, ".")
 
-        # 2. Commit staged changes
-        commit_message = f"feat: resolve issue #{issue_num}"
+        # 2. Commit staged changes. On a Merge-Fix Loop re-entry (ADR-0036),
+        #    attempts["merge"] > 0 (the counter survives execute -> verify ->
+        #    pr) — use a `fix:` commit instead of the initial `feat:` so the
+        #    initial PR keeps its feat message and each correction is labelled.
+        merge_attempts = state.get("attempts", {}).get("merge", 0)
+        if merge_attempts > 0:
+            commit_message = (
+                f"fix: address PR review feedback (attempt {merge_attempts})"
+            )
+        else:
+            commit_message = f"feat: resolve issue #{issue_num}"
         logger.info("Committing changes with message: '%s'", commit_message)
         commit(workspace_path, commit_message)
 
@@ -1394,8 +1409,136 @@ def pr_node(state: AgentState) -> AgentState:
     return state
 
 
+# ==============================================================================
+# Post-PR Merge-Fix Loop helpers (ADR-0036)
+# ==============================================================================
+
+
+def _extract_review_findings(body: str) -> list[str]:
+    """Extract actionable ``[SEVERITY]``-tagged finding lines from a review body.
+
+    Mirrors the ``extract_findings`` parser in the ``pr-feedback-loop`` skill
+    (``.agents/skills/pr-feedback-loop/scripts/parse_pr_verdicts.py``): finding
+    lines are formatted as ``- `[SEVERITY]` message``. Ported here so the
+    headless loop stays self-contained and does not import skill scripts.
+    """
+    findings = []
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("- `[") and "]`" in s:
+            findings.append(s)
+    return findings
+
+
+def _merge_fix_feedback(
+    review_body: str,
+    verdicts: Mapping[str, str | None],
+    attempt: int,
+    cap: int,
+) -> str:
+    """Build the Worker feedback message from actionable judge findings.
+
+    Structured like ``_bineval_failed_feedback``: lists the failing judges and
+    each ``[SEVERITY]``-tagged finding so the Worker can address them
+    specifically. Consumed by ``execute_node``'s existing injection path
+    (``state["feedback"]``), requiring no new feedback channel.
+    """
+    failing = [k for k, v in verdicts.items() if v in ("FAIL", "NEEDS REVIEW")]
+    lines = [
+        f"PR Review Judge feedback — merge-fix attempt {attempt}/{cap}.",
+        "The post-PR hard-gate judges returned actionable verdicts. Address each "
+        "finding; the diff will be re-reviewed after the next push.",
+        "",
+    ]
+    if failing:
+        lines.append(
+            "Failing judges: " + ", ".join(f"{k} ({verdicts[k]})" for k in failing)
+        )
+        lines.append("")
+    findings = _extract_review_findings(review_body)
+    if findings:
+        lines.append("Findings:")
+        for f in findings:
+            lines.append(f"  {f}")
+    else:
+        lines.append(
+            "No [SEVERITY]-tagged finding lines were found in the review body; "
+            "re-read the failing judges' detail sections in the PR review and "
+            "address the flagged issues."
+        )
+    lines.append("")
+    lines.append(
+        "Fix the diff. The next push triggers a fresh CI run and a fresh judge "
+        "review; the loop re-polls the merge."
+    )
+    return "\n".join(lines)
+
+
+def _merge_fix_escalation_comment(
+    review_body: str,
+    verdicts: Mapping[str, str | None],
+    merge_attempts: int,
+) -> str:
+    """Build the PR comment posted at merge-fix budget exhaustion (ADR-0036).
+
+    Replaces the previous silent re-queue with a human-readable summary of the
+    unresolved judge findings before transitioning to recovery.
+    """
+    failing = [k for k, v in verdicts.items() if v in ("FAIL", "NEEDS REVIEW")]
+    lines = [
+        "### Merge-fix budget exhausted",
+        "",
+        f"The autonomous loop exhausted its merge-fix retry budget "
+        f"({merge_attempts} attempts) addressing PR Review Judge feedback.",
+        "",
+    ]
+    if failing:
+        lines.append(
+            "Unresolved judges: " + ", ".join(f"{k} ({verdicts[k]})" for k in failing)
+        )
+        lines.append("")
+    findings = _extract_review_findings(review_body)
+    if findings:
+        lines.append("Unresolved findings:")
+        for f in findings:
+            lines.append(f"- {f}")
+        lines.append("")
+    lines.append(
+        "The issue is being re-queued for a future attempt. A human reviewer may "
+        "wish to resolve the findings above directly on this branch."
+    )
+    return "\n".join(lines)
+
+
+def _post_pr_comment(github_repo: str, pr_num: int, body: str) -> None:
+    """Post a comment on a PR via the GitHub issues/comments REST endpoint."""
+    try:
+        _github_api_request(
+            "POST",
+            f"/repos/{github_repo}/issues/{pr_num}/comments",
+            {"body": body},
+        )
+    except Exception as e:  # noqa: BLE001 - best-effort handover comment
+        logger.warning(
+            "Failed to post merge-fix escalation comment on PR #%d: %s",
+            pr_num,
+            e,
+        )
+
+
 def merge_node(state: AgentState) -> AgentState:
-    """Polls the PR merge status and LLM Judge review comments, transitioning to failed/recovery on failure or timeout."""
+    """Polls the PR merge status and LLM Judge review comments.
+
+    Closes the post-PR judge-feedback loop (ADR-0036): on an actionable verdict
+    (FAIL / NEEDS REVIEW, ADR-0014) with merge-fix budget remaining, signals a
+    bounded retry by setting ``status="executing"`` + ``phase="merge_fix"`` and
+    injecting the judge findings into ``state["feedback"]`` (consumed by
+    ``execute_node``'s existing injection path). At budget exhaustion, posts a
+    summary PR comment before transitioning to ``failed``/recovery, replacing
+    the previous silent re-queue. A successful merge transitions to ``done``;
+    a poll timeout (no actionable verdict) transitions to ``failed``/recovery
+    unchanged.
+    """
     issue_num = state.get("issue_number")
     if issue_num is None:
         raise ValueError(
@@ -1468,6 +1611,10 @@ def merge_node(state: AgentState) -> AgentState:
 
         pr_merged = False
         failure_reason = None
+        # Body of the qualifying review that carried the parsed verdict block
+        # (newest wins), retained so actionable findings can be extracted from
+        # it when the merge-fix loop is triggered (ADR-0036).
+        verdict_review_body: str | None = None
 
         # Determine reference time to anchor freshness (push time recorded by orchestrator)
         pushed_at_str = state.get("pushed_at")
@@ -1539,6 +1686,10 @@ def merge_node(state: AgentState) -> AgentState:
                             verdicts[k] = parsed[k]
                         else:
                             verdicts[k] = "NEEDS REVIEW"
+                    # Retain the body of the newest qualifying review so its
+                    # [SEVERITY]-tagged findings can be extracted on an
+                    # actionable verdict (ADR-0036).
+                    verdict_review_body = body
 
             # Only block when we have actually parsed a hidden verdict block.
             if block_found:
@@ -1567,11 +1718,81 @@ def merge_node(state: AgentState) -> AgentState:
             if not failure_reason:
                 failure_reason = f"Polling timed out after {poll_timeout} seconds."
             logger.error("Merge phase failed: %s", failure_reason)
-            state["status"] = "failed"
-            state["feedback"] = failure_reason
+
+            # Post-PR judge-feedback loop (ADR-0036): an actionable verdict is
+            # distinct from a poll timeout (no review posted). Only an
+            # actionable verdict triggers a bounded merge-fix retry; a timeout
+            # (no actionable verdict) transitions to recovery unchanged.
+            actionable = verdict_review_body is not None and failure_reason.startswith(
+                "PR review block:"
+            )
+            if actionable:
+                merge_attempts = state.get("attempts", {}).get("merge", 0)
+                pr_fix_max = int(os.getenv("AGENT_PR_FIX_MAX", "3"))
+                if merge_attempts < pr_fix_max:
+                    # Budget remaining: signal a bounded merge-fix retry. The
+                    # findings are injected into the existing feedback channel
+                    # (consumed by execute_node), and a fresh per-cycle verify
+                    # budget is granted so the Hybrid Retry threshold (ADR-0034)
+                    # counts Execute attempts within this merge-fix cycle, not
+                    # across cycles.
+                    attempts = state.get("attempts", {}).copy()
+                    attempts["merge"] = merge_attempts + 1
+                    attempts["verify"] = 0
+                    state["attempts"] = attempts
+                    state["feedback"] = _merge_fix_feedback(
+                        verdict_review_body or "",
+                        verdicts,
+                        merge_attempts + 1,
+                        pr_fix_max,
+                    )
+                    state["status"] = "executing"
+                    state["phase"] = "merge_fix"
+                    logger.info(
+                        "Merge-fix retry %d/%d triggered for PR #%d (actionable "
+                        "judge feedback). Routing back to execute.",
+                        merge_attempts + 1,
+                        pr_fix_max,
+                        pr_num,
+                    )
+                else:
+                    # Budget exhausted: post a summary PR comment with the
+                    # unresolved findings before transitioning to recovery,
+                    # preserving a human-readable handover (replacing the prior
+                    # silent re-queue).
+                    _post_pr_comment(
+                        github_repo,
+                        pr_num,
+                        _merge_fix_escalation_comment(
+                            verdict_review_body or "",
+                            verdicts,
+                            merge_attempts,
+                        ),
+                    )
+                    state["status"] = "failed"
+                    state["feedback"] = (
+                        f"Merge-fix budget exhausted ({merge_attempts}/"
+                        f"{pr_fix_max}). Unresolved judge feedback: {failure_reason}"
+                    )
+                    logger.warning(
+                        "Merge-fix budget exhausted (%d/%d) for PR #%d. Posted "
+                        "escalation comment; transitioning to recovery.",
+                        merge_attempts,
+                        pr_fix_max,
+                        pr_num,
+                    )
+            else:
+                state["status"] = "failed"
+                state["feedback"] = failure_reason
         else:
             state["status"] = "done"
             state["feedback"] = None
+            # Reset the merge-fix counter on a clean merge so a subsequent
+            # issue cycle does not inherit a stale counter.
+            attempts = state.get("attempts", {}).copy()
+            if attempts.get("merge", 0) != 0:
+                attempts["merge"] = 0
+                state["attempts"] = attempts
 
     except Exception as e:
         logger.error("Merge phase failed with exception: %s", e)
