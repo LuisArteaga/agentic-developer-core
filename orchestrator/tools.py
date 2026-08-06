@@ -1,4 +1,7 @@
+import contextlib
+import fcntl
 import os
+import re
 from pathlib import Path
 
 from orchestrator import state
@@ -6,6 +9,132 @@ from orchestrator.path_safety import is_safe_path
 
 # Can be overridden for testing purposes
 _PROJECT_ROOT: Path | None = None
+
+# ---------------------------------------------------------------------------
+# ADR-0037 layer 1: run_command command allowlist + secret-stripped env.
+# ---------------------------------------------------------------------------
+
+# Curated set of binaries the Worker may execute via run_command. Network
+# binaries (curl, wget, nc, ssh, scp, ...) are deliberately EXCLUDED — outbound
+# research must go through fetch_url, which has SSRF protection. File-reading
+# binaries (cat, ls, ...) are also EXCLUDED: they read arbitrary paths with no
+# is_safe_path check, so a prompt-injected Worker could `cat .env` / `ls .git`
+# and leak secrets into the LLM context, defeating ADR-0037 layer 2. File
+# inspection must go through the is_safe_path-protected read_file /
+# list_directory / grep_search tools. Overridable as a comma-separated list
+# via AGENT_RUN_COMMAND_ALLOWLIST.
+DEFAULT_RUN_COMMAND_ALLOWLIST = frozenset(
+    {
+        "python",
+        "python3",
+        "pytest",
+        "pip",
+        "make",
+        "git",
+        "ruff",
+        "mypy",
+        "semgrep",
+        "pip-audit",
+        "echo",
+    }
+)
+
+# Env vars that must never leak into a Worker subprocess: the named
+# orchestrator secrets plus any var whose name ends in KEY/TOKEN/SECRET/
+# PASSWORD (case-insensitive). A prompt-injected Worker cannot then exfiltrate
+# credentials via `printenv`/`env` or inherit them into a child process.
+_SECRET_ENV_NAMES = frozenset(
+    {"GH_PAT", "GH_TOKEN", "GITHUB_TOKEN", "OPENROUTER_API_KEY"}
+)
+_SECRET_ENV_NAME_RE = re.compile(r"(?i).*(?:KEY|TOKEN|SECRET|PASSWORD)$")
+
+# ---------------------------------------------------------------------------
+# ADR-0037 layer 6: bounded reads — prevent a planted oversized file from
+# exhausting Worker context / memory (CWE-400).
+# ---------------------------------------------------------------------------
+
+# read_file refuses to read more than this many bytes in one call. The Worker
+# can still read a large file in line ranges via start_line/end_line.
+MAX_READ_FILE_BYTES = 512 * 1024  # 512 KB
+# grep_search stops collecting matches after this many, returning a truncation
+# note, so a query that matches millions of lines cannot OOM the context.
+MAX_GREP_MATCHES = 500
+
+
+def _resolve_run_command_allowlist() -> frozenset[str]:
+    """Resolve the run_command allowlist, honoring the AGENT_RUN_COMMAND_ALLOWLIST override."""
+    override = os.getenv("AGENT_RUN_COMMAND_ALLOWLIST", "").strip()
+    if not override:
+        return DEFAULT_RUN_COMMAND_ALLOWLIST
+    return frozenset(name.strip() for name in override.split(",") if name.strip())
+
+
+def _sanitize_subprocess_env() -> dict[str, str]:
+    """Return a copy of os.environ with secret-bearing variables removed."""
+    sanitized: dict[str, str] = {}
+    for name, value in os.environ.items():
+        if name in _SECRET_ENV_NAMES:
+            continue
+        if _SECRET_ENV_NAME_RE.match(name):
+            continue
+        sanitized[name] = value
+    return sanitized
+
+
+def _truncate_output(output: str) -> str:
+    """Truncate ``output`` to a maximum of 150 lines and 10 KB (10240 bytes).
+
+    Single source of truth for command-output truncation, shared by
+    ``run_command`` (Worker tool) and ``verify_node`` (orchestrator). Enforces
+    the 150-line cap with a first-30 + last-100 window, then the 10 KB byte cap
+    on the (possibly already line-truncated) result. This was unified
+    so both surfaces apply the same bounds and the prior ``<= 130`` special case
+    (which let oversized-but-short output pass untruncated) is gone.
+    """
+    lines = output.splitlines()
+    if len(lines) > 150:
+        first_part = lines[:30]
+        last_part = lines[-100:]
+        output = (
+            "\n".join(first_part)
+            + "\n\n... [Output truncated: exceeded 150 lines] ...\n\n"
+            + "\n".join(last_part)
+        )
+
+    output_bytes = output.encode("utf-8", errors="replace")
+    if len(output_bytes) > 10240:
+        # Keep the first 10000 bytes and append a note (safe against partial
+        # UTF-8 sequences).
+        truncated_bytes = output_bytes[:10000]
+        truncated_text = truncated_bytes.decode("utf-8", errors="replace")
+        output = truncated_text + "\n\n... [Output truncated: exceeded 10 KB limit] ..."
+
+    return output
+
+
+@contextlib.contextmanager
+def _state_lock():
+    """Exclusive flock on a dedicated lock file beside state.json.
+
+    Guards the load→mutate→save critical section in read_file/patch_file
+    against parallel tool calls: create_react_agent runs a batch
+    of tool calls concurrently, and two concurrent read_file/patch_file calls
+    racing on state.json could lose a read-range mutation. The lock is held on
+    a sidecar ``.lock`` file (not state.json itself) so it does not interfere
+    with state.save's atomic temp-file replace.
+    """
+    lock_path = state.get_state_filepath().with_suffix(".lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    lock_file = open(lock_path, "w")  # noqa: SIM115 — flock manages the handle
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield lock_file
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def get_workspace_root() -> Path:
@@ -132,12 +261,18 @@ def read_file(
     try:
         # Binary check: search for null byte in the first chunk
         with open(abs_path, "rb") as f:
-            chunk = f.read(1024)
-            if b"\0" in chunk:
-                return f"Error: File '{path}' is a binary file."
-
-        with open(abs_path, "r", encoding="utf-8") as f:
-            content = f.read()
+            raw = f.read(MAX_READ_FILE_BYTES + 1)
+        if b"\0" in raw[:1024]:
+            return f"Error: File '{path}' is a binary file."
+        # Bounded read (ADR-0037 layer 6): refuse oversized files so a planted
+        # huge file cannot exhaust context/memory (CWE-400). The Worker can
+        # still read a large file in line ranges via start_line/end_line.
+        if len(raw) > MAX_READ_FILE_BYTES:
+            return (
+                f"Error: File '{path}' exceeds the {MAX_READ_FILE_BYTES}-byte "
+                f"read cap. Read it in smaller portions using start_line/end_line."
+            )
+        content = raw.decode("utf-8")
     except UnicodeDecodeError:
         return f"Error: File '{path}' cannot be decoded with UTF-8 encoding."
     except Exception as e:
@@ -183,16 +318,20 @@ def read_file(
 
     # Register the read range in orchestrator state (range-scoped Read-Before-Edit, ADR-0033).
     # state.load() normalizes legacy list read_files to {}, so curr_state["read_files"] is a dict.
+    # The load→mutate→save critical section is guarded by an exclusive flock
+    # so two concurrent tool calls cannot lose a read-range
+    # mutation (create_react_agent runs a batch of tool calls concurrently).
     try:
-        curr_state = state.load()
-        read_ranges: dict = curr_state["read_files"]
-        existing = read_ranges.get(rel_str, [])
-        if read_range is not None:
-            existing = _merge_ranges(existing + [read_range])
-        else:
-            existing = _merge_ranges(existing)
-        read_ranges[rel_str] = existing
-        state.save(curr_state)
+        with _state_lock():
+            curr_state = state.load()
+            read_ranges: dict = curr_state["read_files"]
+            existing = read_ranges.get(rel_str, [])
+            if read_range is not None:
+                existing = _merge_ranges(existing + [read_range])
+            else:
+                existing = _merge_ranges(existing)
+            read_ranges[rel_str] = existing
+            state.save(curr_state)
     except Exception:
         # Do not fail the file read if state persistence is unavailable
         pass
@@ -203,9 +342,15 @@ def read_file(
 def list_directory(path: str) -> str:
     """List the contents of a directory, sorted alphabetically with directories first, followed by files."""
     try:
-        abs_path, _ = _normalize_path(path)
+        abs_path, rel_str = _normalize_path(path)
     except ValueError as e:
         return f"Error: {e}"
+
+    # Runtime Path-Safety Validation (ADR-0037 layer 2): validate the resolved
+    # relative path against the sensitive-path blocklist before listing, so
+    # `list_directory(path=".git")` returns the policy error, not contents.
+    if not is_safe_path(rel_str):
+        return f"Error: Path '{path}' is blocked by the path-safety policy and cannot be listed."
 
     if not abs_path.exists():
         return f"Error: Directory '{path}' does not exist."
@@ -243,9 +388,15 @@ def grep_search(query: str, path: str) -> str:
     Ignores common non-code / environment directories.
     """
     try:
-        abs_path, _ = _normalize_path(path)
+        abs_path, rel_str = _normalize_path(path)
     except ValueError as e:
         return f"Error: {e}"
+
+    # Runtime Path-Safety Validation (ADR-0037 layer 2): validate the target
+    # path before any read, so `grep_search(query="x", path=".env")` returns
+    # the policy error, not live secrets.
+    if not is_safe_path(rel_str):
+        return f"Error: Path '{path}' is blocked by the path-safety policy and cannot be searched."
 
     if not abs_path.exists():
         return f"Error: Path '{path}' does not exist."
@@ -259,39 +410,66 @@ def grep_search(query: str, path: str) -> str:
         "__pycache__",
     }
 
-    def search_file(file_path: Path) -> list[str]:
-        file_matches = []
-        _, rel_str = _normalize_path(str(file_path))
+    matches: list[str] = []
+    match_limit = MAX_GREP_MATCHES
+
+    def search_file(file_path: Path) -> None:
+        # Bounded matches (ADR-0037 layer 6): stop once the cap is reached.
+        if len(matches) >= match_limit:
+            return
+        try:
+            _, file_rel = _normalize_path(str(file_path))
+        except ValueError:
+            return
+        # Re-check each walked file's relative path against the blocklist
+        # (ADR-0037 layer 2): a safe target dir can still contain a sensitive
+        # file (e.g. .env) that must not be read into the Worker context.
+        if not is_safe_path(file_rel):
+            return
+        file_matches: list[str] = []
         try:
             # Quick binary check
             with open(file_path, "rb") as f:
                 chunk = f.read(1024)
                 if b"\0" in chunk:
-                    return []
+                    return
             with open(file_path, "r", encoding="utf-8") as f:
                 for idx, line in enumerate(f, 1):
                     if query in line:
                         clean_line = line.rstrip("\r\n")
-                        file_matches.append(f"{rel_str}:{idx}:{clean_line}")
+                        file_matches.append(f"{file_rel}:{idx}:{clean_line}")
+                        if len(matches) + len(file_matches) >= match_limit:
+                            break
         except Exception:
             pass
-        return file_matches
+        matches.extend(file_matches)
 
-    matches = []
     if abs_path.is_file():
-        matches.extend(search_file(abs_path))
+        search_file(abs_path)
     elif abs_path.is_dir():
         for root, dirs, files in os.walk(abs_path):
             # Prune directory search recursively
             dirs[:] = [d for d in dirs if d not in ignored_names]
+            if len(matches) >= match_limit:
+                break
             for file in files:
                 file_path = Path(root) / file
-                matches.extend(search_file(file_path))
+                search_file(file_path)
+                if len(matches) >= match_limit:
+                    break
 
     if not matches:
         return f"No matches found for query '{query}' in '{path}'."
 
-    return "\n".join(matches)
+    truncated = len(matches) >= match_limit
+    if truncated:
+        matches = matches[:match_limit]
+    result = "\n".join(matches)
+    if truncated:
+        result += (
+            f"\n\n... [Results truncated: reached the {match_limit}-match cap] ..."
+        )
+    return result
 
 
 def patch_file(path: str, old_string: str, new_string: str) -> str:
@@ -388,11 +566,14 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
     #    recorded ranges remain aligned with the post-edit line numbers (ADR-0033).
     delta = len(new_content.splitlines()) - len(content.splitlines())
     try:
-        post_state = state.load()
-        post_ranges: dict = post_state["read_files"]
-        existing = post_ranges.get(rel_str, file_ranges)
-        post_ranges[rel_str] = _recompute_ranges(existing, edit_start, edit_end, delta)
-        state.save(post_state)
+        with _state_lock():
+            post_state = state.load()
+            post_ranges: dict = post_state["read_files"]
+            existing = post_ranges.get(rel_str, file_ranges)
+            post_ranges[rel_str] = _recompute_ranges(
+                existing, edit_start, edit_end, delta
+            )
+            state.save(post_state)
     except Exception:
         pass
 
@@ -403,8 +584,13 @@ def run_command(command: str) -> str:
     """Execute a shell command safely in a subprocess with shell=False.
 
     Captures stdout and stderr together. If the output exceeds 150 lines or 10 KB,
-    it is truncated showing the first 30 lines and the last 100 lines, with a truncation note.
+    it is truncated (first 30 + last 100 lines, then a 10 KB byte cap).
     A timeout of 300 seconds is enforced.
+
+    Security (ADR-0037 layer 1): only a curated allowlist of binaries may run
+    (network binaries are excluded — outbound research must use fetch_url),
+    and the child receives a secret-stripped environment so a prompt-injected
+    Worker cannot exfiltrate credentials via `printenv`/`env`.
     """
     import shlex
     import subprocess
@@ -419,14 +605,31 @@ def run_command(command: str) -> str:
     if not args:
         return "Error: Empty command provided."
 
+    # ADR-0037 layer 1: command allowlist. Only a curated set of binaries may
+    # run; network binaries are excluded so exfiltration must go through
+    # fetch_url (SSRF-protected). PATH tricks are neutralized by matching on
+    # the basename of args[0].
+    allowlist = _resolve_run_command_allowlist()
+    binary = os.path.basename(args[0])
+    if binary not in allowlist:
+        return (
+            f"Error: Command '{binary}' is not in the run_command allowlist. "
+            f"Allowed binaries: {', '.join(sorted(allowlist))}. Network access "
+            f"is not permitted from run_command; use the fetch_url tool for "
+            f"outbound requests."
+        )
+
     try:
-        # Run the command with a 300 second timeout, capturing stdout and stderr together
+        # Run the command with a 300 second timeout, capturing stdout and
+        # stderr together. The child receives a sanitized env with all
+        # secret-bearing variables removed (ADR-0037 layer 1).
         result = subprocess.run(
             args,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=project_root,
             timeout=300,
+            env=_sanitize_subprocess_env(),
         )
         output_bytes = result.stdout
         timed_out = False
@@ -445,32 +648,10 @@ def run_command(command: str) -> str:
     elif not output and timed_out:
         return "Error: Command timed out after 300 seconds with no output."
 
-    # Check truncation conditions: > 150 lines or > 10 KB (10240 bytes)
-    output_size_bytes = len(output_bytes)
-    lines = output.splitlines()
-    total_lines = len(lines)
-
-    is_too_long = total_lines > 150
-    is_too_large = output_size_bytes > 10240
-
-    if is_too_long or is_too_large:
-        # Apply truncation
-        if total_lines <= 130:
-            # Avoid overlap/duplication: first 30 lines, truncation note, and the rest
-            first_part = lines[:30]
-            last_part = lines[30:]
-            removed_lines = 0
-            truncation_note = f"\n\n... [Output truncated: {removed_lines} lines and {output_size_bytes} bytes processed (lines kept without duplication due to length <= 130)] ...\n\n"
-            output = "\n".join(first_part) + truncation_note + "\n".join(last_part)
-        else:
-            first_part = lines[:30]
-            last_part = lines[-100:]
-            removed_lines = total_lines - 130
-            # Calculate bytes of removed lines
-            removed_lines_content = "\n".join(lines[30:-100])
-            removed_bytes = len(removed_lines_content.encode("utf-8", errors="replace"))
-            truncation_note = f"\n\n... [Output truncated: {removed_lines} lines and {removed_bytes} bytes removed due to exceeding limits] ...\n\n"
-            output = "\n".join(first_part) + truncation_note + "\n".join(last_part)
+    # Unified truncation: 150-line + 10 KB byte cap, shared with
+    # verify_node via _truncate_output. The prior `<= 130` special case (which
+    # let oversized-but-short output pass untruncated) is removed.
+    output = _truncate_output(output)
 
     if timed_out:
         return f"Error: Command '{command}' timed out after 300 seconds.\nOutput captured before timeout:\n{output}"

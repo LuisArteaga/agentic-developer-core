@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from scripts.redaction import redact_secrets
+
 # Try importing opentelemetry, fallback to dummy classes if not installed
 try:
     from opentelemetry import trace
@@ -285,7 +287,9 @@ if HAS_OTEL:
             all_baggage = get_all(context=parent_context)
             value = all_baggage.get("langfuse.session.id")
             if value is not None:
-                span.set_attribute("langfuse.session.id", value)
+                # Defense-in-depth (ADR-0037 layer 4): scrub any secret shape
+                # from string span values before they reach the OTLP exporter.
+                span.set_attribute("langfuse.session.id", redact_secrets(str(value)))
 
         def on_end(self, span):
             pass
@@ -666,7 +670,11 @@ def _export_recorded_spans():
                 "llm.usage.completion_tokens", phase_data["completion_tokens"]
             )
         if "model_name" in phase_data and phase_data["model_name"] is not None:
-            phase_span.set_attribute("llm.model_name", phase_data["model_name"])
+            # Defense-in-depth (ADR-0037 layer 4): scrub secret shapes from
+            # string span attributes before export.
+            phase_span.set_attribute(
+                "llm.model_name", redact_secrets(str(phase_data["model_name"]))
+            )
 
         status_code = trace.StatusCode.OK if p_exit == 0 else trace.StatusCode.ERROR
         phase_span.set_status(

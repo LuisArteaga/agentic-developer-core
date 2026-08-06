@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -84,7 +84,7 @@ class TestWorkerAgent(unittest.TestCase):
             AIMessage(content="Done."),
         ]
 
-    @unittest.mock.patch("orchestrator.worker.create_react_agent")
+    @unittest.mock.patch("orchestrator.worker.create_agent")
     def test_execute_worker_writes_worker_trace(self, mock_create_agent):
         """The full message trajectory is serialized to worker_trace_<issue>_<attempt>.jsonl."""
         messages = self._build_trajectory_messages()
@@ -126,7 +126,7 @@ class TestWorkerAgent(unittest.TestCase):
         self.assertEqual(records[3]["role"], "ai")
         self.assertEqual(records[3]["content"], "Done.")
 
-    @unittest.mock.patch("orchestrator.worker.create_react_agent")
+    @unittest.mock.patch("orchestrator.worker.create_agent")
     def test_execute_worker_trace_uses_node_prefix_for_test_writer(
         self, mock_create_agent
     ):
@@ -146,7 +146,7 @@ class TestWorkerAgent(unittest.TestCase):
         trace_path = Path(os.environ["AGENT_LOG_PATH"]) / "test_writer_trace_7_2.jsonl"
         self.assertTrue(trace_path.exists())
 
-    @unittest.mock.patch("orchestrator.worker.create_react_agent")
+    @unittest.mock.patch("orchestrator.worker.create_agent")
     def test_execute_worker_skips_trace_without_issue_number(self, mock_create_agent):
         """No trace file is written when issue_number/attempt are not provided."""
         mock_agent = MagicMock()
@@ -189,3 +189,79 @@ class TestWorkerAgent(unittest.TestCase):
         self.assertIsInstance(record["content"], str)
         self.assertEqual(record["tool_name"], "run_command")
         self.assertEqual(record["tool_call_id"], "c1")
+
+    def test_redact_arguments_handles_str_list_and_scalar(self):
+        """_redact_arguments redacts str values and recurses into dicts/lists;
+        non-str scalars are returned unchanged (ADR-0037 layer 4)."""
+        from orchestrator.worker import _redact_arguments
+
+        token = "ghp_" + "a" * 36
+        # str -> redacted
+        redacted_str = _redact_arguments(token)
+        assert isinstance(redacted_str, str)
+        self.assertNotIn(token, redacted_str)
+        # list of str -> each redacted
+        redacted_list = _redact_arguments([token, "plain"])
+        assert isinstance(redacted_list, list)
+        self.assertNotIn(token, redacted_list[0])
+        self.assertEqual(redacted_list[1], "plain")
+        # nested dict with list value
+        redacted_dict = _redact_arguments({"old_string": token, "nested": [token]})
+        assert isinstance(redacted_dict, dict)
+        self.assertNotIn(token, redacted_dict["old_string"])
+        nested = redacted_dict["nested"]
+        assert isinstance(nested, list)
+        self.assertNotIn(token, nested[0])
+        # non-str scalar returned unchanged
+        self.assertEqual(_redact_arguments(123), 123)
+        self.assertIsNone(_redact_arguments(None))
+
+    def test_serialize_message_redacts_secret_in_tool_result(self):
+        """A secret leaked into a tool result is redacted in the trace record
+        (ADR-0037 layer 4)."""
+        from orchestrator.worker import _serialize_message
+
+        token = "ghp_" + "a" * 36
+        msg = MagicMock()
+        msg.type = "tool"
+        msg.content = f"the token is {token}"
+        msg.name = "run_command"
+        msg.tool_call_id = "c1"
+        msg.tool_calls = None
+        record = _serialize_message(msg)
+        self.assertNotIn(token, record["content"])
+        self.assertIn("[REDACTED:ghp]", record["content"])
+
+    def test_record_run_metrics_degrades_gracefully(self):
+        """_record_run_metrics never raises even if the collector import fails
+        (ADR-0016 graceful degradation)."""
+        from orchestrator.worker import _record_run_metrics
+
+        # Patch the metrics collector to raise so the graceful-degradation
+        # try/except in _record_run_metrics is actually exercised — a plain
+        # call with no failure does not cover the except branch.
+        with patch(
+            "orchestrator.metrics.get_collector",
+            side_effect=RuntimeError("no collector"),
+        ):
+            # Must not raise despite the collector failure.
+            _record_run_metrics([MagicMock()], "execute")
+
+    def test_coerce_content_fallback_to_str(self):
+        """_coerce_content falls back to str() for unhandled content types."""
+        from orchestrator.worker import _coerce_content
+
+        result = _coerce_content(object())
+        self.assertIsInstance(result, str)
+
+    def test_write_worker_trace_swallows_write_failure(self):
+        """_write_worker_trace logs but does not raise when the trace file
+        cannot be written (observability never impacts execution)."""
+        from orchestrator.worker import _write_worker_trace
+
+        # Point get_log_dir at an unwritable path by monkeypatching it.
+        with patch(
+            "orchestrator.worker.get_log_dir",
+            side_effect=RuntimeError("no log dir"),
+        ):
+            _write_worker_trace([MagicMock()], 1, 1, "execute")  # must not raise

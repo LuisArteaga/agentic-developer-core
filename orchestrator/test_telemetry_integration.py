@@ -491,6 +491,39 @@ class TestTelemetryIntegration(unittest.TestCase):
         assert loop_span.context is not None
         self.assertEqual(verify_span.parent.span_id, loop_span.context.span_id)
 
+    def test_phase_model_name_secret_redacted_in_telemetry(self):
+        """Secret-shaped model_name values are redacted before span export (ADR-0037 layer 4).
+
+        Covers the redact_secrets() call on llm.model_name in
+        _export_recorded_spans — a defense-in-depth scrub so a secret that
+        somehow reaches the model_name telemetry field is not exported.
+        """
+        if not HAS_OTEL:
+            self.skipTest("OpenTelemetry is not installed in the current environment.")
+
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        exporter = InMemorySpanExporter()
+        init_telemetry(in_memory_exporter=exporter, reset_state=True)
+
+        secret_model = "sk-or-v1-" + "x" * 30
+        start_orchestrator_loop(issue_number=999)
+        start_orchestrator_phase("execute")
+        end_orchestrator_phase(exit_code=0, model_name=secret_model)
+        end_orchestrator_loop(exit_code=0)
+
+        spans = exporter.get_finished_spans()
+        spans_by_name = {span.name: span for span in spans}
+        execute_span = spans_by_name["orchestrator_phase_execute"]
+        attrs = execute_span.attributes or {}
+
+        # The raw secret must not appear; it must be replaced by the redaction marker.
+        model_attr = str(attrs.get("llm.model_name", ""))
+        self.assertNotIn(secret_model, model_attr)
+        self.assertIn("[REDACTED:sk-or-v1]", model_attr)
+
 
 if __name__ == "__main__":
     unittest.main()

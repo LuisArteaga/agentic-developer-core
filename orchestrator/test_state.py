@@ -172,6 +172,26 @@ class TestStatePersistence(unittest.TestCase):
         self.assertIn("verify_output", loaded_state)
         self.assertIsNone(loaded_state["verify_output"])
 
+    def test_load_defaults_error_and_bineval_degraded_when_missing(self):
+        """A legacy state.json lacking 'error' and 'bineval_degraded' defaults
+        them to None (backward-compat for state files written before those
+        fields existed)."""
+        # Round-trip through JSON to get a plain dict (DEFAULT_STATE is a
+        # TypedDict, whose keys mypy forbids deleting), then drop both keys to
+        # simulate a state file written before error/bineval_degraded existed.
+        data = json.loads(json.dumps(copy.deepcopy(DEFAULT_STATE)))
+        del data["error"]
+        del data["bineval_degraded"]
+
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        loaded_state = load(self.state_file)
+        self.assertIn("error", loaded_state)
+        self.assertIsNone(loaded_state["error"])
+        self.assertIn("bineval_degraded", loaded_state)
+        self.assertIsNone(loaded_state["bineval_degraded"])
+
     def test_load_preserves_verify_output_when_present(self):
         """A state.json that carries verify_output round-trips it unchanged."""
         state_with_output = copy.deepcopy(DEFAULT_STATE)

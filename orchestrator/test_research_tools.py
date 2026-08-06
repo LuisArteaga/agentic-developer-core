@@ -6,10 +6,14 @@ from unittest.mock import MagicMock, patch
 from orchestrator.research_tools import (
     MAX_FETCH_CHARS,
     MAX_SNIPPET_CHARS,
+    _PinnedHTTPConnection,
+    _PinnedHTTPSConnection,
     _build_search_tool_parameters,
     _coerce_text,
     _extract_json_block,
     _parse_search_results,
+    _pin_url,
+    _resolve_validated_ip,
     fetch_url,
     is_domain_allowed,
     is_ssrf_safe_url,
@@ -379,6 +383,14 @@ class TestIsDomainAllowed(unittest.TestCase):
         sources = SourcesConfig(strict=True, domains=["python.org"])
         self.assertFalse(is_domain_allowed("https://notpython.org/", sources))
 
+    def test_strict_urlsplit_error_returns_false(self):
+        # A malformed URL that urlsplit rejects is denied (defensive).
+        sources = SourcesConfig(strict=True, domains=["python.org"])
+        with patch(
+            "orchestrator.research_tools.urlsplit", side_effect=ValueError("bad")
+        ):
+            self.assertFalse(is_domain_allowed("https://python.org/", sources))
+
 
 class TestIsUrlAllowed(unittest.TestCase):
     def test_combines_ssrf_and_strict(self):
@@ -420,7 +432,9 @@ class TestFetchUrlTool(unittest.TestCase):
                 "orchestrator.research_tools.load_sources_config",
                 return_value=self._sources(),
             ),
-            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=False),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip", return_value=None
+            ),
         ):
             out = fetch_url.invoke({"url": "http://169.254.169.254/"})
         self.assertIn("blocked by SSRF protection", out)
@@ -432,7 +446,10 @@ class TestFetchUrlTool(unittest.TestCase):
                 "orchestrator.research_tools.load_sources_config",
                 return_value=self._sources(strict=True),
             ),
-            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
             patch("orchestrator.research_tools.is_domain_allowed", return_value=False),
         ):
             out = fetch_url.invoke({"url": "https://example.com/"})
@@ -452,7 +469,10 @@ class TestFetchUrlTool(unittest.TestCase):
                 "orchestrator.research_tools.load_sources_config",
                 return_value=self._sources(),
             ),
-            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
             patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
             patch(
                 "orchestrator.research_tools.urllib.request.build_opener",
@@ -477,7 +497,10 @@ class TestFetchUrlTool(unittest.TestCase):
                 "orchestrator.research_tools.load_sources_config",
                 return_value=self._sources(),
             ),
-            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
             patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
             patch(
                 "orchestrator.research_tools.urllib.request.build_opener",
@@ -504,7 +527,10 @@ class TestFetchUrlTool(unittest.TestCase):
                 "orchestrator.research_tools.load_sources_config",
                 return_value=self._sources(),
             ),
-            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
             patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
             patch(
                 "orchestrator.research_tools.urllib.request.build_opener",
@@ -534,7 +560,10 @@ class TestFetchUrlTool(unittest.TestCase):
                 "orchestrator.research_tools.load_sources_config",
                 return_value=self._sources(),
             ),
-            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
             patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
             patch(
                 "orchestrator.research_tools.urllib.request.build_opener",
@@ -557,8 +586,8 @@ class TestFetchUrlTool(unittest.TestCase):
                 return_value=self._sources(),
             ),
             patch(
-                "orchestrator.research_tools.is_ssrf_safe_url",
-                side_effect=[True, False],
+                "orchestrator.research_tools._resolve_validated_ip",
+                side_effect=["93.184.216.34", None],
             ),
             patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
             patch(
@@ -583,7 +612,10 @@ class TestFetchUrlTool(unittest.TestCase):
                 "orchestrator.research_tools.load_sources_config",
                 return_value=self._sources(),
             ),
-            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
             patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
             patch(
                 "orchestrator.research_tools.urllib.request.build_opener",
@@ -601,7 +633,10 @@ class TestFetchUrlTool(unittest.TestCase):
                 "orchestrator.research_tools.load_sources_config",
                 return_value=self._sources(),
             ),
-            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
             patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
             patch(
                 "orchestrator.research_tools.urllib.request.build_opener",
@@ -624,7 +659,10 @@ class TestFetchUrlTool(unittest.TestCase):
                 "orchestrator.research_tools.load_sources_config",
                 return_value=self._sources(),
             ),
-            patch("orchestrator.research_tools.is_ssrf_safe_url", return_value=True),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
             patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
             patch(
                 "orchestrator.research_tools.urllib.request.build_opener",
@@ -633,6 +671,304 @@ class TestFetchUrlTool(unittest.TestCase):
         ):
             out = fetch_url.invoke({"url": "https://example.com/"})
         self.assertIn("too many redirects", out)
+
+    def test_urlerror_returns_error(self):
+        """A URLError from the opener is surfaced as an Error."""
+        import urllib.error
+
+        opener = MagicMock()
+        opener.open.side_effect = urllib.error.URLError("dns failed")
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/"})
+        self.assertIn("Error fetching URL", out)
+        self.assertIn("dns failed", out)
+
+    def test_generic_exception_returns_error(self):
+        """A non-HTTP/non-URL exception is caught and surfaced (never crashes)."""
+        opener = MagicMock()
+        opener.open.side_effect = RuntimeError("boom")
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
+            patch("orchestrator.research_tools.is_domain_allowed", return_value=True),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://example.com/"})
+        self.assertIn("Error fetching URL", out)
+        self.assertIn("boom", out)
+
+    def test_strict_mode_redirect_to_unlisted_url_blocked(self):
+        """Under strict mode, a redirect to a non-allowlisted URL is blocked."""
+        from orchestrator.research_tools import _Redirect
+
+        # Strict mode with one allowed domain; the redirect target is unlisted.
+        sources = self._sources(strict=True, domains=["allowed.example"])
+
+        def domain_allowed(url, src):
+            # Real is_domain_allowed under strict: allow allowed.example, block others.
+            return "allowed.example" in url
+
+        opener = MagicMock()
+        opener.open.side_effect = [_Redirect("https://evil.example/", 302)]
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=sources,
+            ),
+            patch(
+                "orchestrator.research_tools._resolve_validated_ip",
+                return_value="93.184.216.34",
+            ),
+            patch(
+                "orchestrator.research_tools.is_domain_allowed",
+                side_effect=domain_allowed,
+            ),
+            patch(
+                "orchestrator.research_tools.urllib.request.build_opener",
+                return_value=opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "https://allowed.example/"})
+        self.assertIn("restricted under strict mode", out)
+        self.assertIn("evil.example", out)
+
+    def test_dns_pinning_no_rebinding_to_private_ip(self):
+        """CVE-2026-41488 regression: a rebinding-style double-resolution
+        cannot reach a private IP. The first resolution returns a public IP; a
+        would-be second resolution returns a private IP. With DNS pinning the
+        connection uses the validated public IP and there is NO second
+        resolution, so the private address is never reached."""
+        captured: dict = {}
+
+        def fake_opener(pinned_ip):
+            captured["ip"] = pinned_ip
+            opener = MagicMock()
+            resp = MagicMock()
+            resp.read.return_value = b"<html>ok</html>"
+            resp.status = 200
+            resp.headers.get_content_charset.return_value = "utf-8"
+            resp.__enter__ = MagicMock(return_value=resp)
+            resp.__exit__ = MagicMock(return_value=False)
+            opener.open.return_value = resp
+            return opener
+
+        gai_calls: list = []
+
+        def fake_gai(host, port):
+            gai_calls.append(host)
+            # Only ever return a public IP. If a second resolution occurred it
+            # would (in this test) also be public, but the assertion is on the
+            # call count: pinning must do exactly one resolution.
+            return _gaia("93.184.216.34")
+
+        with (
+            patch(
+                "orchestrator.research_tools.load_sources_config",
+                return_value=self._sources(),
+            ),
+            patch(
+                "orchestrator.research_tools.socket.getaddrinfo",
+                side_effect=fake_gai,
+            ),
+            patch(
+                "orchestrator.research_tools._build_pinned_opener",
+                side_effect=fake_opener,
+            ),
+        ):
+            out = fetch_url.invoke({"url": "http://example.com/"})
+        self.assertEqual(out, "<html>ok</html>")
+        # Pinned to the validated public IP.
+        self.assertEqual(captured["ip"], "93.184.216.34")
+        # Exactly one DNS resolution — no second (rebinding) lookup.
+        self.assertEqual(len(gai_calls), 1)
+
+
+class TestResolveValidatedIp(unittest.TestCase):
+    def _patch_gai(self, addrs):
+        return patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            side_effect=lambda host, port: (
+                _gaia(addrs)
+                if isinstance(addrs, str)
+                else sum((_gaia(a) for a in addrs), [])
+            ),
+        )
+
+    def test_returns_first_public_ip(self):
+        with self._patch_gai("93.184.216.34"):
+            self.assertEqual(_resolve_validated_ip("example.com"), "93.184.216.34")
+
+    def test_returns_none_for_private(self):
+        with self._patch_gai("10.0.0.1"):
+            self.assertIsNone(_resolve_validated_ip("internal.corp"))
+
+    def test_returns_none_on_round_robin_with_private(self):
+        # DNS round-robin rebinding: one public + one private -> reject (None).
+        with patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            side_effect=lambda host, port: _gaia("93.184.216.34") + _gaia("10.0.0.1"),
+        ):
+            self.assertIsNone(_resolve_validated_ip("evil.example"))
+
+    def test_returns_none_on_dns_failure(self):
+        with patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            side_effect=socket.gaierror,
+        ):
+            self.assertIsNone(_resolve_validated_ip("nonexistent.invalid"))
+
+    def test_returns_none_on_unparseable_address(self):
+        # An unparseable address record fails closed (ADR-0037 layer 3).
+        with patch(
+            "orchestrator.research_tools.socket.getaddrinfo",
+            return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("not-an-ip", 0))
+            ],
+        ):
+            self.assertIsNone(_resolve_validated_ip("evil.example"))
+
+    def test_returns_none_on_empty_address_list(self):
+        # getaddrinfo returning an empty list (no records) fails closed.
+        with patch("orchestrator.research_tools.socket.getaddrinfo", return_value=[]):
+            self.assertIsNone(_resolve_validated_ip("example.com"))
+
+
+class TestPinnedConnections(unittest.TestCase):
+    def test_http_connect_uses_pinned_ip(self):
+        with patch("orchestrator.research_tools.socket.create_connection") as mock_cc:
+            conn = _PinnedHTTPConnection("example.com", "93.184.216.34")
+            conn.port = 80
+            conn.timeout = 5
+            conn.connect()
+        mock_cc.assert_called_once_with(("93.184.216.34", 80), 5)
+
+    def test_https_connect_pins_ip_and_preserves_sni(self):
+        fake_sock = MagicMock()
+        fake_ctx = MagicMock()
+        fake_ctx.wrap_socket.return_value = MagicMock()
+        with patch(
+            "orchestrator.research_tools.socket.create_connection",
+            return_value=fake_sock,
+        ) as mock_cc:
+            # Pass the fake SSL context via the constructor (the stdlib sets
+            # ``_context`` from it) so connect() uses it without a real handshake.
+            conn = _PinnedHTTPSConnection(
+                "example.com", "93.184.216.34", context=fake_ctx
+            )
+            conn.port = 443
+            conn.timeout = 5
+            conn.connect()
+        # TCP connects to the pinned validated IP...
+        mock_cc.assert_called_once_with(("93.184.216.34", 443), 5)
+        # ...while TLS SNI uses the original hostname (cert validation intact).
+        fake_ctx.wrap_socket.assert_called_once_with(
+            fake_sock, server_hostname="example.com"
+        )
+
+    def test_build_pinned_opener_http_handler_uses_pinned_ip(self):
+        """The opener's HTTP handler builds a _PinnedHTTPConnection carrying the
+        pinned IP when it opens a request."""
+        import urllib.request
+
+        from orchestrator.research_tools import _build_pinned_opener
+
+        opener = _build_pinned_opener("1.2.3.4")
+        # OpenerDirector.handlers exists at runtime but is not in the type stubs.
+        handlers = getattr(opener, "handlers", [])
+        http_handler = next(
+            h for h in handlers if isinstance(h, urllib.request.HTTPHandler)
+        )
+        captured = {}
+
+        def fake_do_open(self, http_class, req):
+            # Invoke the connection factory (the lambda) the real do_open would.
+            captured["conn"] = http_class("example.com")
+            return MagicMock()
+
+        with patch.object(urllib.request.HTTPHandler, "do_open", fake_do_open):
+            http_handler.http_open(MagicMock())
+        self.assertIsInstance(captured["conn"], _PinnedHTTPConnection)
+        self.assertEqual(captured["conn"]._pinned_ip, "1.2.3.4")
+
+    def test_build_pinned_opener_https_handler_uses_pinned_ip(self):
+        """The opener's HTTPS handler builds a _PinnedHTTPSConnection with the
+        pinned IP."""
+        import urllib.request
+
+        from orchestrator.research_tools import _build_pinned_opener
+
+        opener = _build_pinned_opener("5.6.7.8")
+        # OpenerDirector.handlers exists at runtime but is not in the type stubs.
+        handlers = getattr(opener, "handlers", [])
+        https_handler = next(
+            h for h in handlers if isinstance(h, urllib.request.HTTPSHandler)
+        )
+        captured = {}
+
+        def fake_do_open(self, http_class, req):
+            captured["conn"] = http_class("example.com")
+            return MagicMock()
+
+        with patch.object(urllib.request.HTTPSHandler, "do_open", fake_do_open):
+            https_handler.https_open(MagicMock())
+        self.assertIsInstance(captured["conn"], _PinnedHTTPSConnection)
+        self.assertEqual(captured["conn"]._pinned_ip, "5.6.7.8")
+
+
+class TestPinUrl(unittest.TestCase):
+    """DNS pinning: _pin_url resolves+validates once and returns (url, ip)."""
+
+    def test_returns_none_for_bad_scheme(self):
+        self.assertIsNone(_pin_url("file:///etc/passwd"))
+
+    def test_returns_none_for_no_host(self):
+        self.assertIsNone(_pin_url("https:///path"))
+
+    def test_returns_none_on_ssrf_block(self):
+        with patch(
+            "orchestrator.research_tools._resolve_validated_ip", return_value=None
+        ):
+            self.assertIsNone(_pin_url("http://169.254.169.254/"))
+
+    def test_returns_url_and_ip_for_public(self):
+        with patch(
+            "orchestrator.research_tools._resolve_validated_ip",
+            return_value="93.184.216.34",
+        ):
+            self.assertEqual(
+                _pin_url("https://example.com/path"),
+                ("https://example.com/path", "93.184.216.34"),
+            )
+
+    def test_returns_none_on_urlsplit_error(self):
+        """A malformed URL that urlsplit rejects yields None (defensive)."""
+        with patch(
+            "orchestrator.research_tools.urlsplit", side_effect=ValueError("bad")
+        ):
+            self.assertIsNone(_pin_url("https://example.com/"))
 
 
 if __name__ == "__main__":
