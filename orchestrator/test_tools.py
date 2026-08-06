@@ -819,6 +819,69 @@ class TestCodebaseTools(unittest.TestCase):
         res = run_command("echo hi")
         self.assertIn("timed out after 300 seconds with no output", res)
 
+    # ------------------------------------------------------------------
+    # grep_search directory-walk edge cases (is_safe_path + match cap)
+    # ------------------------------------------------------------------
+
+    def test_grep_search_match_cap_in_directory_walk(self):
+        """grep_search stops walking once the match cap is reached across files.
+
+        Covers the break in the outer walk loop (line 454) and the inner
+        loop break (line 459) — the single-file match-cap test does not
+        exercise the directory-walk path. Uses subdirectories so the outer
+        loop check triggers when the walk moves past the cap-filling dir.
+        """
+        from orchestrator.tools import MAX_GREP_MATCHES
+
+        search_dir = self.temp_dir_path / "cap_dir"
+        sub_a = search_dir / "sub_a"
+        sub_b = search_dir / "sub_b"
+        sub_a.mkdir(parents=True)
+        sub_b.mkdir()
+        # First subdirectory's file alone exceeds the cap.
+        (sub_a / "file_a.txt").write_text(
+            "\n".join("needle" for _ in range(MAX_GREP_MATCHES + 10))
+        )
+        # Second subdirectory's file triggers the outer-loop break.
+        (sub_b / "file_b.txt").write_text("needle")
+        res = grep_search("needle", str(search_dir))
+        self.assertIn("Results truncated", res)
+
+    def test_grep_search_skips_sensitive_file_in_walked_dir(self):
+        """grep_search skips sensitive files (e.g. .env) during directory walk.
+
+        Covers the is_safe_path re-check in search_file (line 428): a safe
+        target directory can still contain a sensitive file that must not be
+        read into the Worker context.
+        """
+        search_dir = self.temp_dir_path / "mixed_dir"
+        search_dir.mkdir()
+        (search_dir / ".env").write_text("API_KEY=needle")
+        (search_dir / "safe.txt").write_text("needle found")
+        res = grep_search("needle", str(search_dir))
+        self.assertNotIn("API_KEY", res)
+        self.assertIn("safe.txt", res)
+
+    def test_state_lock_handles_mkdir_failure(self):
+        """_state_lock catches directory creation failure (lines 129-130).
+
+        When the lock file's parent directory cannot be created (e.g. the
+        parent path is a file, not a directory), the mkdir exception is
+        caught and execution continues to the open() call, which then fails.
+        """
+        from orchestrator.tools import _state_lock
+
+        # Create a file where a directory would need to be created.
+        blocker = self.temp_dir_path / "blocker_file"
+        blocker.write_text("blocks dir creation")
+
+        with unittest.mock.patch("orchestrator.state.get_state_filepath") as mock_state:
+            mock_state.return_value = blocker / "state.json"
+            # mkdir fails (parent is a file) → except catches → open fails → raises
+            with self.assertRaises(OSError):
+                with _state_lock():
+                    pass
+
 
 if __name__ == "__main__":
     unittest.main()
