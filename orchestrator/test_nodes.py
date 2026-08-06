@@ -3293,6 +3293,45 @@ class TestGithubApiRetry(unittest.TestCase):
         _, kwargs = mock_urlopen.call_args
         self.assertEqual(kwargs.get("timeout"), _GH_API_TIMEOUT)
 
+    @patch("orchestrator.nodes.time.sleep")
+    @patch("orchestrator.nodes.urllib.request.urlopen")
+    def test_retries_exhausted_on_persistent_5xx(self, mock_urlopen, mock_sleep):
+        """ADR-0037 #7: after the retry budget, a persistent 5xx raises."""
+        from orchestrator.nodes import _GH_API_MAX_ATTEMPTS, _github_api_request
+
+        mock_urlopen.side_effect = [self._http_error(503)] * _GH_API_MAX_ATTEMPTS
+        with self.assertRaises(RuntimeError) as ctx:
+            _github_api_request("GET", "/x")
+        self.assertIn("exhausted", str(ctx.exception).lower())
+        self.assertEqual(mock_urlopen.call_count, _GH_API_MAX_ATTEMPTS)
+
+    @patch("orchestrator.nodes.time.sleep")
+    @patch("orchestrator.nodes.urllib.request.urlopen")
+    def test_retries_exhausted_on_persistent_urlerror(self, mock_urlopen, mock_sleep):
+        """ADR-0037 #7: persistent connection errors exhaust the budget and raise."""
+        import urllib.error as urlerr
+
+        from orchestrator.nodes import _GH_API_MAX_ATTEMPTS, _github_api_request
+
+        mock_urlopen.side_effect = urlerr.URLError("conn refused")
+        with self.assertRaises(RuntimeError) as ctx:
+            _github_api_request("GET", "/x")
+        self.assertIn("exhausted", str(ctx.exception).lower())
+        self.assertEqual(mock_urlopen.call_count, _GH_API_MAX_ATTEMPTS)
+
+    @patch("orchestrator.nodes.time.sleep")
+    @patch("orchestrator.nodes.urllib.request.urlopen")
+    def test_generic_exception_is_not_retried(self, mock_urlopen, mock_sleep):
+        """A non-HTTP/non-URLError exception is raised immediately (no retry)."""
+        from orchestrator.nodes import _github_api_request
+
+        mock_urlopen.side_effect = ValueError("unexpected")
+        with self.assertRaises(RuntimeError) as ctx:
+            _github_api_request("GET", "/x")
+        self.assertIn("Failed to connect to GitHub API", str(ctx.exception))
+        self.assertEqual(mock_urlopen.call_count, 1)
+        mock_sleep.assert_not_called()
+
 
 class TestRecoveryOnException(unittest.TestCase):
     """ADR-0038: a node exception is recorded (status=failed, return state) so
@@ -3400,6 +3439,151 @@ class TestRecoveryOnException(unittest.TestCase):
         self.assertIn("agent-in-progress", self.labels_removed)
         # The original root-cause error survives recovery.
         self.assertIn("verify: ", result.get("error") or "")
+
+
+class TestClaimNodeExceptionPaths(unittest.TestCase):
+    """ADR-0038: claim_node exception handlers record failed + return state."""
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        self.original_env = {}
+        for k, v in {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "owner/repo",
+            "AGENT_LABEL_READY": "agent-ready",
+            "AGENT_LABEL_IN_PROGRESS": "agent-in-progress",
+            "AGENT_LABEL_BLOCKED": "agent-blocked",
+        }.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 7
+        state["status"] = "claimed"
+        state["branch"] = "feat/issue-7"
+        state_module.save(state)
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.nodes._get_github_repository")
+    def test_claim_resolve_repo_failure_records_and_returns(self, mock_repo):
+        """When repo resolution raises, claim_node records failed and returns."""
+        mock_repo.side_effect = ValueError("no remote")
+        result = claim_node(state_module.load())
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["phase"], "claim")
+        self.assertIn("claim: no remote", result["error"] or "")
+
+    @patch("orchestrator.nodes.is_git_repository", return_value=False)
+    @patch("orchestrator.nodes.clone")
+    @patch("orchestrator.nodes._get_github_repository", return_value="owner/repo")
+    def test_claim_workspace_hygiene_failure_records_and_returns(
+        self, mock_repo, mock_clone, mock_is_repo
+    ):
+        """When workspace cloning fails, claim_node records failed and returns."""
+        mock_clone.side_effect = RuntimeError("clone failed")
+        # Fresh (non-resume) state so the clone path runs.
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = None
+        state_module.save(state)
+        result = claim_node(state)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["phase"], "claim")
+        self.assertIn("claim: clone failed", result["error"] or "")
+
+
+class TestPrNodeAndRecoveryExceptionPaths(unittest.TestCase):
+    """ADR-0038: pr_node and recovery_node exception handlers record + return."""
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        self.original_env = {}
+        for k, v in {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "owner/repo",
+        }.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+        # Minimal git repo on main with a committed file.
+        subprocess.run(["git", "init", "-q"], cwd=self.workspace_dir, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@t"], cwd=self.workspace_dir, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "t"], cwd=self.workspace_dir, check=True
+        )
+        subprocess.run(
+            ["git", "checkout", "-b", "main", "-q"], cwd=self.workspace_dir, check=True
+        )
+        (self.workspace_dir / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=self.workspace_dir, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "init"], cwd=self.workspace_dir, check=True
+        )
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.nodes.add")
+    @patch("orchestrator.nodes._get_github_repository")
+    def test_pr_node_exception_records_and_returns(self, mock_repo, mock_add):
+        """ADR-0038: a pr_node step failure records failed and returns state."""
+        from orchestrator.nodes import pr_node
+
+        mock_repo.return_value = "owner/repo"
+        mock_add.side_effect = RuntimeError("git add failed")
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 9
+        state["branch"] = "feat/issue-9"
+        state_module.save(state)
+        result = pr_node(state)
+        self.assertIs(result, state)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["phase"], "pr_open")
+        self.assertIn("pr: git add failed", result["error"] or "")
+
+    @patch("orchestrator.nodes._remove_label")
+    @patch("orchestrator.nodes._add_label")
+    @patch("orchestrator.nodes._checkout_default_branch")
+    def test_recovery_self_rescue_records_and_returns(
+        self, mock_checkout, mock_add_label, mock_remove_label
+    ):
+        """ADR-0038: a failure inside recovery_node is caught; the original
+        root-cause error survives and status stays failed."""
+        from orchestrator.nodes import recovery_node
+
+        # recovery_node's own cleanup blows up, but it must still persist failed.
+        mock_checkout.side_effect = RuntimeError("checkout blew up")
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 9
+        state["status"] = "failed"
+        state["phase"] = "verifying"
+        state["error"] = "verify: original boom"
+        state_module.save(state)
+        result = recovery_node(state)
+        self.assertEqual(result["status"], "failed")
+        # The original root-cause error is preserved (recovery does not mask it).
+        self.assertEqual(result["error"], "verify: original boom")
 
 
 if __name__ == "__main__":

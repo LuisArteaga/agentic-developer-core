@@ -128,7 +128,15 @@ def _github_api_request(
             # Retry on 5xx (transient server error) and on 403 carrying a
             # Retry-After header (GitHub's secondary-rate-limit / abuse signal).
             retryable = e.code >= 500 or (e.code == 403 and retry_after is not None)
-            if retryable and attempt < _GH_API_MAX_ATTEMPTS:
+            if not retryable:
+                logger.error("GitHub API error: %d %s - %s", e.code, e.reason, err_body)
+                raise RuntimeError(
+                    f"GitHub API request {method} {path} failed: {e.code} {e.reason} - {err_body}"
+                ) from e
+            # Retryable: retry while budget remains; on the final attempt,
+            # break out so the single exhaustion raise below fires.
+            last_exc = e
+            if attempt < _GH_API_MAX_ATTEMPTS:
                 wait = _gh_backoff_seconds(attempt, retry_after)
                 logger.warning(
                     "GitHub API %d %s (attempt %d/%d); retrying in %.1fs",
@@ -139,14 +147,12 @@ def _github_api_request(
                     wait,
                 )
                 time.sleep(wait)
-                last_exc = e
                 continue
-            logger.error("GitHub API error: %d %s - %s", e.code, e.reason, err_body)
-            raise RuntimeError(
-                f"GitHub API request {method} {path} failed: {e.code} {e.reason} - {err_body}"
-            ) from e
+            break
         except urllib.error.URLError as e:
-            # Transient connection / DNS / timeout error → retry with backoff.
+            # Transient connection / DNS / timeout error: retry with backoff;
+            # on the final attempt, break out to the exhaustion raise.
+            last_exc = e
             if attempt < _GH_API_MAX_ATTEMPTS:
                 wait = _gh_backoff_seconds(attempt, None)
                 logger.warning(
@@ -157,15 +163,13 @@ def _github_api_request(
                     e.reason,
                 )
                 time.sleep(wait)
-                last_exc = e
                 continue
-            logger.error("Failed to connect to GitHub API: %s", e)
-            raise RuntimeError(f"Failed to connect to GitHub API: {e.reason}") from e
+            break
         except Exception as e:
             logger.error("Failed to connect to GitHub API: %s", e)
             raise RuntimeError(f"Failed to connect to GitHub API: {e}") from e
 
-    # Exhausted all retries on a transient error.
+    # Exhausted all retries on a transient (retryable) error.
     raise RuntimeError(
         f"GitHub API request {method} {path} exhausted {_GH_API_MAX_ATTEMPTS} retries"
     ) from last_exc

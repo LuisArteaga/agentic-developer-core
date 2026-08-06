@@ -763,6 +763,34 @@ class TestCodebaseTools(unittest.TestCase):
         self.assertIn("Results truncated", res)
         self.assertIn(f"{MAX_GREP_MATCHES}-match cap", res)
 
+    # ------------------------------------------------------------------
+    # ADR-0037 run_command edge cases (coverage gaps cited by test_coverage judge)
+    # ------------------------------------------------------------------
+
+    def test_run_command_empty_string(self):
+        """An empty command string yields the empty-command error."""
+        res = run_command("")
+        self.assertIn("Empty command", res)
+
+    @unittest.mock.patch("subprocess.run")
+    def test_run_command_generic_exception(self, mock_run):
+        """A non-timeout exception from subprocess.run is caught and reported."""
+        mock_run.side_effect = OSError("spawn failed")
+        res = run_command("echo hi")
+        self.assertIn("Failed to run command", res)
+        self.assertIn("spawn failed", res)
+
+    @unittest.mock.patch("subprocess.run")
+    def test_run_command_timeout_with_no_output(self, mock_run):
+        """A timeout with no captured output returns the no-output timeout error."""
+        import subprocess
+
+        mock_run.side_effect = subprocess.TimeoutExpired(
+            cmd=["echo", "hi"], timeout=300, output=b""
+        )
+        res = run_command("echo hi")
+        self.assertIn("timed out after 300 seconds with no output", res)
+
 
 if __name__ == "__main__":
     unittest.main()
