@@ -350,6 +350,40 @@ class TestTelemetryIntegration(unittest.TestCase):
                         "langfuse.session.id must not appear without Langfuse keys",
                     )
 
+    def test_otlp_uses_simple_span_processor(self):
+        """OTLP export attaches SimpleSpanProcessor, not BatchSpanProcessor.
+
+        Regression guard for issue #62 (ADR-0016 amendment): SimpleSpanProcessor
+        exports each ended span synchronously, so every span reaches the OTLP
+        collector before end_orchestrator_loop returns. No force_flush() is
+        called in the loop, so a batched processor could lose spans on quick
+        process exit; the synchronous processor eliminates that risk. If the
+        OTLP exporter were ever re-wrapped in BatchSpanProcessor, this test
+        fails because SimpleSpanProcessor would not be called at all.
+        """
+        if not HAS_OTEL:
+            self.skipTest("OpenTelemetry is not installed in the current environment.")
+
+        os.environ.pop("LANGFUSE_PUBLIC_KEY", None)
+        os.environ.pop("LANGFUSE_SECRET_KEY", None)
+        os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = (
+            "https://generic.collector/v1/traces"
+        )
+
+        with (
+            patch("scripts.telemetry.OTLPSpanExporter") as mock_exporter_cls,
+            patch("scripts.telemetry.SimpleSpanProcessor") as mock_simple,
+            patch("scripts.telemetry.trace.get_tracer_provider") as mock_get,
+            patch("scripts.telemetry.trace.set_tracer_provider"),
+        ):
+            mock_exporter_cls.return_value = MagicMock()
+            mock_get.return_value = MagicMock()
+            init_telemetry(reset_state=True)
+
+            # The OTLP exporter is constructed and wrapped in SimpleSpanProcessor.
+            mock_exporter_cls.assert_called_once()
+            mock_simple.assert_called_once()
+
     def test_verify_bineval_nests_under_verify_phase(self):
         """BinEval phase span must be a child of the verify phase span (ADR-0016).
 

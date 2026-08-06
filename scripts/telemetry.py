@@ -13,7 +13,7 @@ try:
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
     HAS_OTEL = True
 except ImportError:
@@ -419,7 +419,18 @@ def init_telemetry(
         if endpoint:
             try:
                 exporter = OTLPSpanExporter(endpoint=endpoint, headers=headers)
-                provider.add_span_processor(BatchSpanProcessor(exporter))
+                # ADR-0016 amendment (2026-08): SimpleSpanProcessor exports each
+                # ended span synchronously to the OTLP endpoint, instead of
+                # BatchSpanProcessor's deferred batch flush. No force_flush() is
+                # called anywhere in the loop, so a batched processor could lose
+                # spans when the process exits shortly after _export_recorded_spans;
+                # the synchronous processor guarantees every span reaches the
+                # collector before end_orchestrator_loop returns. Note: because
+                # spans are still created/ended retrospectively in
+                # _export_recorded_spans, this swap gives immediate end-of-run
+                # export (and exit safety), NOT live in-run visibility — see the
+                # ADR-0016 amendment for why in-run streaming is a separate decision.
+                provider.add_span_processor(SimpleSpanProcessor(exporter))
             except Exception as e:
                 sys.stderr.write(f"[WARN] Failed to initialize OTLP exporter: {e}\n")
 
