@@ -3586,5 +3586,277 @@ class TestPrNodeAndRecoveryExceptionPaths(unittest.TestCase):
         self.assertEqual(result["error"], "verify: original boom")
 
 
+class TestIsinstanceGuardCoverage(unittest.TestCase):
+    """Covers the ``if not isinstance(data, dict): raise RuntimeError(...)``
+    guards scattered across the nodes, plus the BinEval degradation flag.
+
+    Each guard validates that the GitHub REST API returned a JSON object (dict)
+    rather than a list/scalar. A non-dict response triggers a RuntimeError that
+    is caught by the node's exception handler (ADR-0038 record-and-return for
+    plan/execute/pr/test_writer, inner try/except warning-and-continue for the
+    claim dependency checks and merge user check, and the BinEval soft-gate
+    degradation handler).
+    """
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        self.original_env = {}
+        for k, v in {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "owner/repo",
+            "AGENT_LABEL_READY": "agent-ready",
+            "AGENT_LABEL_IN_PROGRESS": "agent-in-progress",
+            "AGENT_LABEL_BLOCKED": "agent-blocked",
+            # Merge-node: an empty trusted user forces the /user API fallback
+            # whose isinstance guard is under test; a zero poll timeout skips
+            # the blocking polling loop so the merge test stays fast.
+            "AGENT_TRUSTED_JUDGE_USER": "",
+            "AGENT_MERGE_POLL_TIMEOUT": "0",
+        }.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+        # Minimal git repo on main with a committed file so workspace hygiene
+        # (checkout/reset/clean) and commit-time lookups operate cleanly.
+        subprocess.run(["git", "init", "-q"], cwd=self.workspace_dir, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@t"], cwd=self.workspace_dir, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "t"], cwd=self.workspace_dir, check=True
+        )
+        subprocess.run(
+            ["git", "checkout", "-b", "main", "-q"], cwd=self.workspace_dir, check=True
+        )
+        (self.workspace_dir / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=self.workspace_dir, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "init"], cwd=self.workspace_dir, check=True
+        )
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    # --- plan_node (line 651) ---
+
+    @patch("orchestrator.nodes._get_github_repository", return_value="owner/repo")
+    @patch("orchestrator.nodes._github_api_request", return_value=[])
+    def test_plan_node_non_dict_issue_data_records_failure(self, mock_api, mock_repo):
+        from orchestrator.nodes import plan_node
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 42
+        state["status"] = "claimed"
+        state["branch"] = "feat/issue-42"
+        state_module.save(state)
+
+        result = plan_node(state)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("expected a dict", result["error"] or "")
+
+    # --- execute_node (line 837) ---
+
+    @patch("orchestrator.nodes._get_github_repository", return_value="owner/repo")
+    @patch("orchestrator.nodes._github_api_request", return_value=[])
+    def test_execute_node_non_dict_issue_data_records_failure(
+        self, mock_api, mock_repo
+    ):
+        from orchestrator.nodes import execute_node
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 42
+        state["status"] = "planning"
+        state["plan"] = "do stuff"
+        state["model"] = "test-model"
+        state_module.save(state)
+
+        result = execute_node(state)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("expected a dict", result["error"] or "")
+
+    # --- test_writer_node (line 2139) ---
+
+    @patch("orchestrator.nodes._get_github_repository", return_value="owner/repo")
+    @patch("orchestrator.nodes._github_api_request", return_value=[])
+    def test_test_writer_node_non_dict_issue_data_records_failure(
+        self, mock_api, mock_repo
+    ):
+        from orchestrator.nodes import test_writer_node
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 42
+        state["plan"] = "do stuff"
+        state_module.save(state)
+
+        result = test_writer_node(state)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("expected a dict", result["error"] or "")
+
+    # --- _run_bineval_phase (line 1280 + bineval_degraded at 1288-1292) ---
+
+    @patch("orchestrator.nodes._get_github_repository", return_value="owner/repo")
+    @patch("orchestrator.nodes._github_api_request", return_value=[])
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
+    def test_bineval_phase_non_dict_issue_sets_degraded_flag(
+        self, _diff, mock_api, mock_repo
+    ):
+        from orchestrator.nodes import _run_bineval_phase
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 42
+        state_module.save(state)
+
+        exit_code = _run_bineval_phase(state, 42, self.workspace_dir)
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(state["bineval_degraded"])
+
+    # --- pr_node (line 1597) ---
+
+    @patch("orchestrator.nodes.push")
+    @patch("orchestrator.nodes.commit")
+    @patch("orchestrator.nodes._get_github_repository", return_value="owner/repo")
+    @patch("orchestrator.nodes._github_api_request", side_effect=[[], []])
+    def test_pr_node_non_dict_issue_data_records_failure(
+        self, mock_api, mock_repo, mock_commit, mock_push
+    ):
+        from orchestrator.nodes import pr_node
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 42
+        state["status"] = "verifying"
+        state["branch"] = "feat/issue-42"
+        state_module.save(state)
+
+        result = pr_node(state)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("expected a dict", result["error"] or "")
+
+    # --- claim_node: Unblocking Scan dep check (line 380) ---
+
+    @patch("orchestrator.nodes._remove_label")
+    @patch("orchestrator.nodes._add_label")
+    @patch("orchestrator.nodes._get_github_repository", return_value="owner/repo")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_claim_node_unblocking_dep_non_dict_continues(
+        self, mock_api, mock_repo, mock_add_label, mock_remove_label
+    ):
+        from orchestrator.nodes import claim_node
+
+        mock_api.side_effect = [
+            # Unblocking scan: one blocked issue depending on #99.
+            [{"number": 5, "title": "Blocked", "body": "## Blocked by - #99"}],
+            # Dependency issue #99 returns a non-dict list -> line 380 guard.
+            [],
+            # Claim scan: no ready issues.
+            [],
+        ]
+
+        # Fresh (non-resume) state so both scans run.
+        state = DEFAULT_STATE.copy()
+        state_module.save(state)
+
+        result = claim_node(state)
+
+        # No issue claimed -> idle; the non-dict RuntimeError was swallowed by
+        # the inner try/except (warning + all_closed=False).
+        self.assertEqual(result["status"], "idle")
+
+    # --- claim_node: Claim Scan dep check (line 438) ---
+
+    @patch("orchestrator.nodes._remove_label")
+    @patch("orchestrator.nodes._add_label")
+    @patch("orchestrator.nodes._get_github_repository", return_value="owner/repo")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_claim_node_claim_scan_dep_non_dict_transitions_blocked(
+        self, mock_api, mock_repo, mock_add_label, mock_remove_label
+    ):
+        from orchestrator.nodes import claim_node
+
+        mock_api.side_effect = [
+            # Unblocking scan: no blocked issues.
+            [],
+            # Claim scan: one ready issue depending on #88.
+            [{"number": 7, "title": "Ready", "body": "## Blocked by - #88"}],
+            # Dependency issue #88 returns a non-dict list -> line 438 guard.
+            [],
+        ]
+
+        state = DEFAULT_STATE.copy()
+        state_module.save(state)
+
+        result = claim_node(state)
+
+        # The ready issue had an open dependency (guard swallowed the error),
+        # so it was transitioned to blocked and no issue was claimed -> idle.
+        self.assertEqual(result["status"], "idle")
+        mock_add_label.assert_called_with("owner/repo", 7, "agent-blocked")
+
+    # --- claim_node: Claim Scan view_data check (line 476) ---
+
+    @patch("orchestrator.nodes._remove_label")
+    @patch("orchestrator.nodes._add_label")
+    @patch("orchestrator.nodes._get_github_repository", return_value="owner/repo")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_claim_node_claim_scan_view_data_non_dict_skips(
+        self, mock_api, mock_repo, mock_add_label, mock_remove_label
+    ):
+        from orchestrator.nodes import claim_node
+
+        mock_api.side_effect = [
+            # Unblocking scan: no blocked issues.
+            [],
+            # Claim scan: one ready issue with no dependencies.
+            [{"number": 7, "title": "Ready", "body": "no deps"}],
+            # Double-check issue #7 returns a non-dict list -> line 476 guard.
+            [],
+        ]
+
+        state = DEFAULT_STATE.copy()
+        state_module.save(state)
+
+        result = claim_node(state)
+
+        # The view_data guard swallowed the error (skip), no issue claimed.
+        self.assertEqual(result["status"], "idle")
+
+    # --- merge_node: curr_user_data check (line 1826) ---
+
+    @patch("orchestrator.nodes._get_github_repository", return_value="owner/repo")
+    @patch("orchestrator.nodes._github_api_request", side_effect=[[{"number": 1}], []])
+    def test_merge_node_non_dict_user_data_falls_back_gracefully(
+        self, mock_api, mock_repo
+    ):
+        from orchestrator.nodes import merge_node
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 42
+        state["status"] = "pr_open"
+        state["branch"] = "feat/issue-42"
+        state["pushed_at"] = "2024-01-01T00:00:00Z"
+        state_module.save(state)
+
+        result = merge_node(state)
+
+        # The /user isinstance guard was swallowed by the inner except
+        # (fallback to GITHUB_ACTOR). The poll loop is skipped (timeout=0),
+        # so the PR times out -> failed. The key assertion is that the node
+        # did not crash on the non-dict response.
+        self.assertEqual(result["status"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main()

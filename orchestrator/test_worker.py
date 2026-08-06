@@ -237,8 +237,15 @@ class TestWorkerAgent(unittest.TestCase):
         (ADR-0016 graceful degradation)."""
         from orchestrator.worker import _record_run_metrics
 
-        # Should not raise regardless of input.
-        _record_run_metrics([MagicMock()], "execute")
+        # Patch the metrics collector to raise so the graceful-degradation
+        # try/except in _record_run_metrics is actually exercised — a plain
+        # call with no failure does not cover the except branch.
+        with patch(
+            "orchestrator.metrics.get_collector",
+            side_effect=RuntimeError("no collector"),
+        ):
+            # Must not raise despite the collector failure.
+            _record_run_metrics([MagicMock()], "execute")
 
     def test_coerce_content_fallback_to_str(self):
         """_coerce_content falls back to str() for unhandled content types."""

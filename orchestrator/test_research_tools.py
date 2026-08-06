@@ -850,6 +850,11 @@ class TestResolveValidatedIp(unittest.TestCase):
         ):
             self.assertIsNone(_resolve_validated_ip("evil.example"))
 
+    def test_returns_none_on_empty_address_list(self):
+        # getaddrinfo returning an empty list (no records) fails closed.
+        with patch("orchestrator.research_tools.socket.getaddrinfo", return_value=[]):
+            self.assertIsNone(_resolve_validated_ip("example.com"))
+
 
 class TestPinnedConnections(unittest.TestCase):
     def test_http_connect_uses_pinned_ip(self):
