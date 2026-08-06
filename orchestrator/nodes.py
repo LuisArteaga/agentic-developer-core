@@ -39,6 +39,7 @@ from orchestrator.outline import (
 )
 from orchestrator.path_safety import is_safe_path
 from orchestrator.state import AgentState
+from orchestrator.tools import _truncate_output
 from scripts.telemetry import (
     end_orchestrator_phase,
     start_orchestrator_loop,
@@ -58,10 +59,37 @@ def _safe_telemetry(func, *args, **kwargs):
         logger.debug("Non-fatal telemetry error in %s: %s", func.__name__, e)
 
 
+# GitHub API request bounds (ADR-0037 #7): a bounded per-request timeout and a
+# bounded retry with exponential backoff on transient failures (5xx, and 403
+# carrying a Retry-After header — GitHub's secondary-rate-limit signal) so a
+# correlated OpenRouter/GitHub outage does not crash a node before recovery.
+_GH_API_TIMEOUT = 30
+_GH_API_MAX_ATTEMPTS = 3
+
+
+def _gh_backoff_seconds(attempt: int, retry_after: str | None) -> float:
+    """Compute a bounded backoff wait before retrying a GitHub API request.
+
+    Honors a ``Retry-After`` header (capped at 30s) when present, else falls back
+    to exponential backoff (1, 2, 4, …) capped at 8s.
+    """
+    if retry_after:
+        try:
+            return min(float(retry_after), 30.0)
+        except (TypeError, ValueError):
+            pass
+    return min(2.0 ** (attempt - 1), 8.0)
+
+
 def _github_api_request(
     method: str, path: str, body: dict | None = None
 ) -> dict | list:
-    """Helper to make authenticated HTTP requests to the GitHub REST API using urllib."""
+    """Helper to make authenticated HTTP requests to the GitHub REST API using urllib.
+
+    Bounded by a per-request timeout (``_GH_API_TIMEOUT``) and a bounded retry
+    with backoff on transient failures (5xx, 403 with Retry-After, and
+    connection errors), per ADR-0037 #7.
+    """
     token = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
 
     # Clean path (ensure leading slash)
@@ -82,26 +110,65 @@ def _github_api_request(
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
 
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-
-    try:
-        with urllib.request.urlopen(req) as response:  # nosemgrep  # fmt: skip
-            res_data = response.read().decode("utf-8")
-            if not res_data:
-                return {}
-            return json.loads(res_data)
-    except urllib.error.HTTPError as e:
+    last_exc: Exception | None = None
+    for attempt in range(1, _GH_API_MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            err_body = e.read().decode("utf-8")
-        except Exception:
-            err_body = ""
-        logger.error("GitHub API error: %d %s - %s", e.code, e.reason, err_body)
-        raise RuntimeError(
-            f"GitHub API request {method} {path} failed: {e.code} {e.reason} - {err_body}"
-        ) from e
-    except Exception as e:
-        logger.error("Failed to connect to GitHub API: %s", e)
-        raise RuntimeError(f"Failed to connect to GitHub API: {e}") from e
+            with urllib.request.urlopen(req, timeout=_GH_API_TIMEOUT) as response:  # nosemgrep  # fmt: skip
+                res_data = response.read().decode("utf-8")
+                if not res_data:
+                    return {}
+                return json.loads(res_data)
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8")
+            except Exception:
+                err_body = ""
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            # Retry on 5xx (transient server error) and on 403 carrying a
+            # Retry-After header (GitHub's secondary-rate-limit / abuse signal).
+            retryable = e.code >= 500 or (e.code == 403 and retry_after is not None)
+            if retryable and attempt < _GH_API_MAX_ATTEMPTS:
+                wait = _gh_backoff_seconds(attempt, retry_after)
+                logger.warning(
+                    "GitHub API %d %s (attempt %d/%d); retrying in %.1fs",
+                    e.code,
+                    path,
+                    attempt,
+                    _GH_API_MAX_ATTEMPTS,
+                    wait,
+                )
+                time.sleep(wait)
+                last_exc = e
+                continue
+            logger.error("GitHub API error: %d %s - %s", e.code, e.reason, err_body)
+            raise RuntimeError(
+                f"GitHub API request {method} {path} failed: {e.code} {e.reason} - {err_body}"
+            ) from e
+        except urllib.error.URLError as e:
+            # Transient connection / DNS / timeout error → retry with backoff.
+            if attempt < _GH_API_MAX_ATTEMPTS:
+                wait = _gh_backoff_seconds(attempt, None)
+                logger.warning(
+                    "GitHub API connection error (attempt %d/%d); retrying in %.1fs: %s",
+                    attempt,
+                    _GH_API_MAX_ATTEMPTS,
+                    wait,
+                    e.reason,
+                )
+                time.sleep(wait)
+                last_exc = e
+                continue
+            logger.error("Failed to connect to GitHub API: %s", e)
+            raise RuntimeError(f"Failed to connect to GitHub API: {e.reason}") from e
+        except Exception as e:
+            logger.error("Failed to connect to GitHub API: %s", e)
+            raise RuntimeError(f"Failed to connect to GitHub API: {e}") from e
+
+    # Exhausted all retries on a transient error.
+    raise RuntimeError(
+        f"GitHub API request {method} {path} exhausted {_GH_API_MAX_ATTEMPTS} retries"
+    ) from last_exc
 
 
 def _add_label(github_repo: str, issue_num: int, label: str) -> None:
@@ -213,8 +280,10 @@ def claim_node(state: AgentState) -> AgentState:
         else:
             github_repo = _get_github_repository(workspace_path)
     except Exception as e:
-        logger.error("Failed to resolve target repository: %s", e)
+        logger.exception("Failed to resolve target repository")
         state["status"] = "failed"
+        state["phase"] = "claim"
+        state["error"] = f"claim: {e}"
         state_module.save(state)
         return state
 
@@ -265,8 +334,10 @@ def claim_node(state: AgentState) -> AgentState:
             clean(workspace_path)
             logger.info("Workspace hygiene complete.")
     except Exception as e:
-        logger.error("Workspace hygiene/cloning failed: %s", e)
+        logger.exception("Workspace hygiene/cloning failed")
         state["status"] = "failed"
+        state["phase"] = "claim"
+        state["error"] = f"claim: {e}"
         state_module.save(state)
         return state
 
@@ -301,7 +372,11 @@ def claim_node(state: AgentState) -> AgentState:
                     dep_issue = _github_api_request(
                         "GET", f"/repos/{github_repo}/issues/{dep}"
                     )
-                    assert isinstance(dep_issue, dict)
+                    if not isinstance(dep_issue, dict):
+                        raise RuntimeError(
+                            "expected a dict from the GitHub API, got "
+                            + type(dep_issue).__name__
+                        )
                     if dep_issue.get("state", "").upper() != "CLOSED":
                         all_closed = False
                         break
@@ -355,7 +430,11 @@ def claim_node(state: AgentState) -> AgentState:
                     dep_issue = _github_api_request(
                         "GET", f"/repos/{github_repo}/issues/{dep}"
                     )
-                    assert isinstance(dep_issue, dict)
+                    if not isinstance(dep_issue, dict):
+                        raise RuntimeError(
+                            "expected a dict from the GitHub API, got "
+                            + type(dep_issue).__name__
+                        )
                     if dep_issue.get("state", "").upper() != "CLOSED":
                         has_open_dep = True
                         break
@@ -389,7 +468,11 @@ def claim_node(state: AgentState) -> AgentState:
                 view_data = _github_api_request(
                     "GET", f"/repos/{github_repo}/issues/{issue_num}"
                 )
-                assert isinstance(view_data, dict)
+                if not isinstance(view_data, dict):
+                    raise RuntimeError(
+                        "expected a dict from the GitHub API, got "
+                        + type(view_data).__name__
+                    )
                 labels = [label["name"] for label in view_data.get("labels", [])]
                 if label_ready not in labels:
                     logger.warning(
@@ -560,7 +643,10 @@ def plan_node(state: AgentState) -> AgentState:
         issue_data = _github_api_request(
             "GET", f"/repos/{github_repo}/issues/{issue_num}"
         )
-        assert isinstance(issue_data, dict)
+        if not isinstance(issue_data, dict):
+            raise RuntimeError(
+                "expected a dict from the GitHub API, got " + type(issue_data).__name__
+            )
         issue_title = issue_data.get("title", "")
         issue_body = issue_data.get("body", "")
 
@@ -688,13 +774,19 @@ def plan_node(state: AgentState) -> AgentState:
         _safe_telemetry(end_orchestrator_phase, exit_code=0)
 
     except Exception as e:
-        # Catch all transient or permanent errors, mark state as failed, save, and propagate
-        logger.error("Planning phase failed: %s", e)
+        # Record the failure and return so the status="failed" conditional
+        # edges route to recovery_node (ADR-0038). Re-raising would propagate
+        # out of graph.invoke, bypassing recovery and leaving the issue stuck
+        # agent-in-progress with a dirty workspace. logger.exception keeps the
+        # full stack trace in logs; the non-zero exit is preserved by
+        # __main__ mapping status="failed" to exit code 1.
+        logger.exception("Planning phase failed")
         state["status"] = "failed"
         state["phase"] = "planning"
+        state["error"] = f"plan: {e}"
         state_module.save(state)
         _safe_telemetry(end_orchestrator_phase, exit_code=1)
-        raise e
+        return state
 
     # Save the successful planning state
     state_module.save(state)
@@ -737,7 +829,10 @@ def execute_node(state: AgentState) -> AgentState:
         issue_data = _github_api_request(
             "GET", f"/repos/{github_repo}/issues/{issue_num}"
         )
-        assert isinstance(issue_data, dict)
+        if not isinstance(issue_data, dict):
+            raise RuntimeError(
+                "expected a dict from the GitHub API, got " + type(issue_data).__name__
+            )
         issue_title = issue_data.get("title", "")
         issue_body = issue_data.get("body", "")
         issue_description = f"Title: {issue_title}\n\n{issue_body}"
@@ -808,38 +903,22 @@ def execute_node(state: AgentState) -> AgentState:
         _safe_telemetry(end_orchestrator_phase, exit_code=0)
 
     except Exception as e:
-        logger.error("Execute phase failed: %s", e)
+        logger.exception("Execute phase failed")
         state["status"] = "failed"
         state["phase"] = "executing"
+        state["error"] = f"execute: {e}"
         state_module.save(state)
         _safe_telemetry(end_orchestrator_phase, exit_code=1)
-        raise e
+        return state
 
     # Save the successful executing state
     state_module.save(state)
     return state
 
 
-def _truncate_output(output: str) -> str:
-    """Truncates the output string to enforce a maximum of 150 lines and 10 KB (10240 bytes) limit."""
-    lines = output.splitlines()
-    if len(lines) > 150:
-        first_part = lines[:30]
-        last_part = lines[-100:]
-        output = (
-            "\n".join(first_part)
-            + "\n\n... [Output truncated: exceeded 150 lines] ...\n\n"
-            + "\n".join(last_part)
-        )
-
-    output_bytes = output.encode("utf-8", errors="replace")
-    if len(output_bytes) > 10240:
-        # Keep the first 10000 bytes and append a note (safe against partial UTF-8 sequences)
-        truncated_bytes = output_bytes[:10000]
-        truncated_text = truncated_bytes.decode("utf-8", errors="replace")
-        output = truncated_text + "\n\n... [Output truncated: exceeded 10 KB limit] ..."
-
-    return output
+# Truncation of command output is unified in orchestrator.tools._truncate_output
+# (imported above) and shared by run_command (Worker tool) and verify_node, so
+# both surfaces apply the same 150-line + 10 KB byte cap (ADR-0037 #5).
 
 
 # ==============================================================================
@@ -1098,12 +1177,13 @@ def verify_node(state: AgentState) -> AgentState:
         exit_code = -1
         timed_out = True
     except Exception as e:
-        logger.error("Failed to execute verification command '%s': %s", verify_cmd, e)
+        logger.exception("Failed to execute verification command '%s'", verify_cmd)
         state["status"] = "failed"
         state["phase"] = "verifying"
+        state["error"] = f"verify: {e}"
         state_module.save(state)
         _safe_telemetry(end_orchestrator_phase, exit_code=1)
-        raise e
+        return state
 
     raw_output = output_bytes.decode("utf-8", errors="replace")
     if timed_out:
@@ -1192,7 +1272,10 @@ def _run_bineval_phase(state: AgentState, issue_num: int, workspace_path: Path) 
         issue_data = _github_api_request(
             "GET", f"/repos/{github_repo}/issues/{issue_num}"
         )
-        assert isinstance(issue_data, dict)
+        if not isinstance(issue_data, dict):
+            raise RuntimeError(
+                "expected a dict from the GitHub API, got " + type(issue_data).__name__
+            )
         issue_body = issue_data.get("body", "") or ""
     except Exception as e:
         logger.warning(
@@ -1200,6 +1283,9 @@ def _run_bineval_phase(state: AgentState, issue_num: int, workspace_path: Path) 
             "(soft gate, infrastructure failure does not block).",
             e,
         )
+        # ADR-0037 #7: flag the degradation so it is surfaced in the PR body
+        # rather than silently passing bad code.
+        state["bineval_degraded"] = True
         _reset_verify_success(state)
         return 0
 
@@ -1212,6 +1298,8 @@ def _run_bineval_phase(state: AgentState, issue_num: int, workspace_path: Path) 
     if bineval_result is None:
         # LLM failure / malformed output → PASS (infrastructure does not block).
         _safe_telemetry(end_orchestrator_phase, exit_code=0, phase_name="bineval")
+        # ADR-0037 #7: flag the degradation (LLM/infra failure → silent PASS).
+        state["bineval_degraded"] = True
         _reset_verify_success(state)
         return 0
 
@@ -1227,10 +1315,14 @@ def _run_bineval_phase(state: AgentState, issue_num: int, workspace_path: Path) 
         logger.info(
             "BinEval PASS for issue #%d. Transitioning to PR creation.", issue_num
         )
+        # Genuinely graded (not degraded).
+        state["bineval_degraded"] = False
         _reset_verify_success(state)
         return 0
 
     feedback = _bineval_failed_feedback(bineval_result)
+    # Genuinely graded (a real FAIL, not a degraded PASS).
+    state["bineval_degraded"] = False
     attempts = state.get("attempts", {}).copy()
     attempts["verify"] = attempts.get("verify", 0) + 1
     state["attempts"] = attempts
@@ -1352,6 +1444,7 @@ def _build_pr_body(
     rationale: str,
     diff_stat_output: str,
     coverage_tail: str,
+    bineval_degraded: bool | None = None,
 ) -> str:
     """Compose the PR body deterministically from plan rationale, git stat, and
     the verify coverage tail — no LLM call.
@@ -1362,6 +1455,10 @@ def _build_pr_body(
     human-facing artifact only — it never enters the PR Review Judge inputs
     (AC2): judges receive only the git diff via the ``pr-checks`` stdin
     contract, never this string.
+
+    When BinEval degraded to PASS on an infrastructure failure, a visible
+    notice is appended (ADR-0037 #7) so a human reviewer sees the PR was not
+    semantically graded — a correlated outage could otherwise hide bad code.
     """
     sections: list[str] = [f"Closes #{issue_num}", ""]
 
@@ -1399,6 +1496,19 @@ def _build_pr_body(
             "(the verify command did not emit a pytest-cov term-missing table)._"
         )
     sections.append("")
+
+    # BinEval degradation notice (ADR-0037 #7): only surfaced when the soft
+    # gate degraded to PASS on an infrastructure failure. A genuine grade (PASS
+    # or FAIL) produces no notice.
+    if bineval_degraded:
+        sections.append("## BinEval Notice")
+        sections.append(
+            "_The Pre-PR BinEval Review degraded to PASS on an infrastructure "
+            "failure (the grading LLM or the GitHub API was unavailable). The "
+            "diff was NOT semantically graded before this PR was opened; rely on "
+            "the post-PR Review Judges and CI for the hard gate._"
+        )
+        sections.append("")
 
     return "\n".join(sections).rstrip() + "\n"
 
@@ -1479,7 +1589,11 @@ def pr_node(state: AgentState) -> AgentState:
             issue_data = _github_api_request(
                 "GET", f"/repos/{github_repo}/issues/{issue_num}"
             )
-            assert isinstance(issue_data, dict)
+            if not isinstance(issue_data, dict):
+                raise RuntimeError(
+                    "expected a dict from the GitHub API, got "
+                    + type(issue_data).__name__
+                )
             issue_title = issue_data.get("title", "")
 
             # Create a Pull Request via the GitHub REST API (no gh CLI harness)
@@ -1498,7 +1612,13 @@ def pr_node(state: AgentState) -> AgentState:
             rationale = extract_plan_rationale(state.get("plan"))
             stat_output = diff_stat(workspace_path, "origin/main...HEAD")
             coverage_tail = _extract_coverage_tail(state.get("verify_output"))
-            pr_body = _build_pr_body(issue_num, rationale, stat_output, coverage_tail)
+            pr_body = _build_pr_body(
+                issue_num,
+                rationale,
+                stat_output,
+                coverage_tail,
+                state.get("bineval_degraded"),
+            )
 
             logger.info("Creating Pull Request via API: '%s'...", pr_title)
             payload = {
@@ -1511,11 +1631,12 @@ def pr_node(state: AgentState) -> AgentState:
             logger.info("Pull Request created successfully.")
 
     except Exception as e:
-        logger.error("PR phase failed: %s", e)
+        logger.exception("PR phase failed")
         state["status"] = "failed"
         state["phase"] = "pr_open"
+        state["error"] = f"pr: {e}"
         state_module.save(state)
-        raise e
+        return state
 
     state_module.save(state)
     return state
@@ -1697,7 +1818,11 @@ def merge_node(state: AgentState) -> AgentState:
         if not trusted_user:
             try:
                 curr_user_data = _github_api_request("GET", "/user")
-                assert isinstance(curr_user_data, dict)
+                if not isinstance(curr_user_data, dict):
+                    raise RuntimeError(
+                        "expected a dict from the GitHub API, got "
+                        + type(curr_user_data).__name__
+                    )
                 trusted_user = curr_user_data.get("login")
             except Exception:
                 trusted_user = os.getenv("GITHUB_ACTOR")
@@ -1739,8 +1864,10 @@ def merge_node(state: AgentState) -> AgentState:
         while time.time() - start_time < poll_timeout:
             # Fetch latest PR data
             pr_data = _github_api_request("GET", f"/repos/{github_repo}/pulls/{pr_num}")
-            assert isinstance(pr_data, dict)
-
+            if not isinstance(pr_data, dict):
+                raise RuntimeError(
+                    "expected a dict from the GitHub API, got " + type(pr_data).__name__
+                )
             # Check merge state
             if pr_data.get("merged") is True:
                 logger.info("PR #%d was successfully merged.", pr_num)
@@ -1835,8 +1962,12 @@ def merge_node(state: AgentState) -> AgentState:
             # distinct from a poll timeout (no review posted). Only an
             # actionable verdict triggers a bounded merge-fix retry; a timeout
             # (no actionable verdict) transitions to recovery unchanged.
-            actionable = verdict_review_body is not None and failure_reason.startswith(
-                "PR review block:"
+            # Derive actionable from the parsed verdicts dict (any FAIL /
+            # NEEDS REVIEW) rather than the failure_reason log-message prefix,
+            # so the signal survives wording changes to failure_reason
+            # (ADR-0037 #9 quick win).
+            actionable = verdict_review_body is not None and any(
+                v in ("FAIL", "NEEDS REVIEW") for v in verdicts.values()
             )
             if actionable:
                 merge_attempts = state.get("attempts", {}).get("merge", 0)
@@ -1907,12 +2038,13 @@ def merge_node(state: AgentState) -> AgentState:
                 state["attempts"] = attempts
 
     except Exception as e:
-        logger.error("Merge phase failed with exception: %s", e)
+        logger.exception("Merge phase failed with exception")
         state["status"] = "failed"
         state["phase"] = "merging"
         state["feedback"] = str(e)
+        state["error"] = f"merge: {e}"
         state_module.save(state)
-        raise e
+        return state
 
     state_module.save(state)
     return state
@@ -1961,9 +2093,14 @@ def recovery_node(state: AgentState) -> AgentState:
         _remove_label(github_repo, issue_num, label_in_progress)
 
     except Exception as e:
-        logger.error("Recovery phase failed: %s", e)
+        logger.exception("Recovery phase failed")
+        # Recovery must catch its own errors and persist status="failed" so a
+        # bug inside recovery does not mask the original failure (ADR-0038).
+        # status is already "failed" (set at the top of recovery_node); preserve
+        # any prior root-cause error from the node that triggered recovery.
+        state["error"] = state.get("error") or f"recovery: {e}"
         state_module.save(state)
-        raise e
+        return state
 
     state_module.save(state)
     return state
@@ -1994,7 +2131,10 @@ def test_writer_node(state: AgentState) -> AgentState:
         issue_data = _github_api_request(
             "GET", f"/repos/{github_repo}/issues/{issue_num}"
         )
-        assert isinstance(issue_data, dict)
+        if not isinstance(issue_data, dict):
+            raise RuntimeError(
+                "expected a dict from the GitHub API, got " + type(issue_data).__name__
+            )
         issue_title = issue_data.get("title", "")
         issue_body = issue_data.get("body", "")
 
@@ -2094,12 +2234,13 @@ def test_writer_node(state: AgentState) -> AgentState:
         _safe_telemetry(end_orchestrator_phase, exit_code=0)
 
     except Exception as e:
-        logger.error("Test-Writer phase failed: %s", e)
+        logger.exception("Test-Writer phase failed")
         state["status"] = "failed"
         state["phase"] = "test_writing"
+        state["error"] = f"test_writer: {e}"
         state_module.save(state)
         _safe_telemetry(end_orchestrator_phase, exit_code=1)
-        raise e
+        return state
 
     state_module.save(state)
     return state

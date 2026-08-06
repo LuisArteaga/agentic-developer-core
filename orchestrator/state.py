@@ -35,6 +35,16 @@ class AgentState(TypedDict):
     feedback: str | None
     pushed_at: str | None
     verify_output: str | None
+    # Transient root-cause message set by a node's exception handler so
+    # recovery_node and a resumed run can surface the prior failure reason
+    # without parsing a stack trace (ADR-0038). Overwritten each claim; not a
+    # durable schema field beyond the optional defaults below.
+    error: str | None
+    # Set by the BinEval soft gate when it degraded to PASS on an
+    # infrastructure failure (ADR-0037 #7): a correlated outage could otherwise
+    # hide bad code behind a silent PASS. Surfaced in the PR body so a human
+    # reviewer sees the PR was not semantically graded.
+    bineval_degraded: bool | None
 
 
 DEFAULT_STATE: AgentState = {
@@ -50,6 +60,8 @@ DEFAULT_STATE: AgentState = {
     "feedback": None,
     "pushed_at": None,
     "verify_output": None,
+    "error": None,
+    "bineval_degraded": None,
 }
 
 VALID_STATUSES = {
@@ -110,6 +122,12 @@ def save(state: AgentState, filepath: str | Path | None = None) -> None:
     try:
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
+            # Power-loss durability (ADR-0037 #6): flush the Python buffer and
+            # fsync the file descriptor so the bytes reach stable storage before
+            # the atomic replace. Without this, a crash between write and
+            # os.replace could leave a torn state.json that breaks Stateful Resume.
+            f.flush()
+            os.fsync(f.fileno())
 
         # Atomically replace target file with the temp file
         os.replace(temp_path, target_path)
@@ -167,6 +185,10 @@ def load(filepath: str | Path | None = None) -> AgentState:
             data["pushed_at"] = None
         if "verify_output" not in data:
             data["verify_output"] = None
+        if "error" not in data:
+            data["error"] = None
+        if "bineval_degraded" not in data:
+            data["bineval_degraded"] = None
 
         # Validate status value
         if data["status"] not in VALID_STATUSES:

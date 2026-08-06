@@ -21,6 +21,12 @@ _FORBIDDEN_NAMES = {
 
 _FORBIDDEN_DIRS = {".git", ".venv", ".agent_logs", ".agents", "node_modules"}
 
+# Forbidden credential/config file names and certificate extensions, all
+# lower-cased so the comparison in is_safe_path is case-insensitive: on a
+# case-insensitive filesystem (macOS/Windows) `.ENV` or `.Git` would otherwise
+# bypass a case-sensitive blocklist (ADR-0037 quick win).
+_FORBIDDEN_EXTENSIONS = (".pem", ".key", ".pkcs12", ".pfx")
+
 
 def is_safe_path(path_str: str) -> bool:
     """Verifies that a path is safe and does not point to sensitive configuration or credential files."""
@@ -29,12 +35,15 @@ def is_safe_path(path_str: str) -> bool:
         return False
 
     for part in p.parts:
-        if part in _FORBIDDEN_DIRS:
+        # Case-insensitive comparison: normalize each path component to lower
+        # case before matching against the forbidden sets/extensions.
+        part_lower = part.lower()
+        if part_lower in _FORBIDDEN_DIRS:
             return False
-        part_stem = Path(part).stem
-        if part in _FORBIDDEN_NAMES or part_stem in _FORBIDDEN_NAMES:
+        stem_lower = Path(part_lower).stem
+        if part_lower in _FORBIDDEN_NAMES or stem_lower in _FORBIDDEN_NAMES:
             return False
-        if part.endswith((".pem", ".key", ".pkcs12", ".pfx")):
+        if part_lower.endswith(_FORBIDDEN_EXTENSIONS):
             return False
 
     return True

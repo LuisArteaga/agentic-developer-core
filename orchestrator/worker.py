@@ -1,12 +1,13 @@
 import json
 import logging
 
+from langchain.agents import create_agent
 from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent
 
 from orchestrator import tools as codebase_tools
 from orchestrator.research_tools import fetch_url, web_search
 from orchestrator.state import get_log_dir
+from scripts.redaction import redact_secrets
 
 # Set up logging
 logger = logging.getLogger("orchestrator.worker")
@@ -150,9 +151,10 @@ def execute_worker(
     llm = get_chat_model_from_config(cfg)
     tools = get_worker_tools()
 
-    # Compile the prebuilt ReAct agent
-    # We pass the system prompt as the 'prompt' parameter
-    agent = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
+    # Compile the prebuilt ReAct agent. LangGraph v1 moved
+    # create_react_agent to langchain.agents.create_agent and renamed the
+    # `prompt` kwarg to `system_prompt` (ADR-0037 #8).
+    agent = create_agent(llm, tools, system_prompt=SYSTEM_PROMPT)
 
     # Formulate the user message combining issue and plan
     user_message = (
@@ -229,15 +231,27 @@ def _coerce_content(content) -> str:
 
 
 def _serialize_message(msg) -> dict:
-    """Serialize a single LangChain message to a trace record dict."""
+    """Serialize a single LangChain message to a trace record dict.
+
+    Secret redaction (ADR-0037 layer 4): every textual field that could carry
+    a secret leaked into a tool result — ``content``, tool-call arguments,
+    and the tool result name — is passed through ``redact_secrets`` before
+    being written to the worker-trace JSONL sidecar. This is defense-in-depth;
+    the structural controls (allowlist, env stripping, path safety, DNS pinning)
+    are the primary defense, but any residual secret that reaches a tool result
+    is not durably persisted.
+    """
     record = {
         "role": getattr(msg, "type", "unknown"),
-        "content": _coerce_content(getattr(msg, "content", "")),
+        "content": redact_secrets(_coerce_content(getattr(msg, "content", ""))),
     }
     tool_calls = getattr(msg, "tool_calls", None)
     if tool_calls:
         record["tool_calls"] = [
-            {"name": tc.get("name"), "arguments": tc.get("args", {})}
+            {
+                "name": tc.get("name"),
+                "arguments": _redact_arguments(tc.get("args", {})),
+            }
             for tc in tool_calls
         ]
     tool_name = getattr(msg, "name", None)
@@ -247,6 +261,23 @@ def _serialize_message(msg) -> dict:
     if tool_call_id:
         record["tool_call_id"] = tool_call_id
     return record
+
+
+def _redact_arguments(args) -> object:
+    """Recursively redact secret shapes from tool-call arguments.
+
+    Tool-call arguments are typically a dict of parameter name → value. We
+    redact every string value (a ``patch_file`` old_string/new_string or a
+    ``run_command`` command can carry a leaked secret) and recurse into nested
+    dicts/lists. Non-str scalars are returned unchanged.
+    """
+    if isinstance(args, str):
+        return redact_secrets(args)
+    if isinstance(args, dict):
+        return {k: _redact_arguments(v) for k, v in args.items()}
+    if isinstance(args, list):
+        return [_redact_arguments(v) for v in args]
+    return args
 
 
 def _write_worker_trace(messages, issue_number, attempt, node_name) -> None:

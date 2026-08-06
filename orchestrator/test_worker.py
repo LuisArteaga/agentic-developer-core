@@ -84,7 +84,7 @@ class TestWorkerAgent(unittest.TestCase):
             AIMessage(content="Done."),
         ]
 
-    @unittest.mock.patch("orchestrator.worker.create_react_agent")
+    @unittest.mock.patch("orchestrator.worker.create_agent")
     def test_execute_worker_writes_worker_trace(self, mock_create_agent):
         """The full message trajectory is serialized to worker_trace_<issue>_<attempt>.jsonl."""
         messages = self._build_trajectory_messages()
@@ -126,7 +126,7 @@ class TestWorkerAgent(unittest.TestCase):
         self.assertEqual(records[3]["role"], "ai")
         self.assertEqual(records[3]["content"], "Done.")
 
-    @unittest.mock.patch("orchestrator.worker.create_react_agent")
+    @unittest.mock.patch("orchestrator.worker.create_agent")
     def test_execute_worker_trace_uses_node_prefix_for_test_writer(
         self, mock_create_agent
     ):
@@ -146,7 +146,7 @@ class TestWorkerAgent(unittest.TestCase):
         trace_path = Path(os.environ["AGENT_LOG_PATH"]) / "test_writer_trace_7_2.jsonl"
         self.assertTrue(trace_path.exists())
 
-    @unittest.mock.patch("orchestrator.worker.create_react_agent")
+    @unittest.mock.patch("orchestrator.worker.create_agent")
     def test_execute_worker_skips_trace_without_issue_number(self, mock_create_agent):
         """No trace file is written when issue_number/attempt are not provided."""
         mock_agent = MagicMock()

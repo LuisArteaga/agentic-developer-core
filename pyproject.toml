@@ -5,9 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "langchain>=1.0.0",
     "langchain-core>=0.2.0",
     "langchain-openai>=0.1.0",
-    "langgraph>=0.1.0",
+    "langgraph>=0.1.0,<2",
     "tree-sitter-language-pack>=1.14.0",
 ]
 
@@ -42,12 +43,11 @@ omit = [
 
 [tool.pytest.ini_options]
 filterwarnings = [
-    # create_react_agent is deprecated in LangGraph v1 in favour of
-    # langchain.agents.create_agent, but that target requires the `langchain`
-    # package, which is not a dependency of this project (only langgraph,
-    # langchain-core, and langchain-openai are installed). Migration is deferred
-    # until we adopt LangGraph v2 or add `langchain` as a dependency.
-    "ignore::langgraph.warnings.LangGraphDeprecatedSinceV10",
+    # create_react_agent was migrated to langchain.agents.create_agent with the
+    # `system_prompt` kwarg (ADR-0037 #8). Narrowly suppress only the
+    # create_react_agent deprecation notice as a safety net; all other
+    # LangGraph v1 deprecations are surfaced rather than blanket-ignored.
+    "ignore:.*create_react_agent.*:langgraph.warnings.LangGraphDeprecatedSinceV10",
 ]
 
 [tool.ruff.lint]

@@ -423,7 +423,7 @@ class TestRunMetricsWiring(unittest.TestCase):
             ),
         ]
 
-    @unittest.mock.patch("orchestrator.worker.create_react_agent")
+    @unittest.mock.patch("orchestrator.worker.create_agent")
     def test_execute_worker_records_tl_and_execution_tokens(self, mock_create_agent):
         from orchestrator.worker import execute_worker
 
@@ -439,7 +439,7 @@ class TestRunMetricsWiring(unittest.TestCase):
         self.assertEqual(collector.trajectory_lengths, [1])
         self.assertEqual(collector.tokens_execution, 80)
 
-    @unittest.mock.patch("orchestrator.worker.create_react_agent")
+    @unittest.mock.patch("orchestrator.worker.create_agent")
     def test_test_writer_records_execution_tokens_but_not_tl(self, mock_create_agent):
         from orchestrator.worker import execute_worker
 
