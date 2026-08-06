@@ -4,11 +4,12 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 from orchestrator import state as state_module
 from orchestrator.nodes import claim_node, execute_node, plan_node, verify_node
-from orchestrator.state import DEFAULT_STATE
+from orchestrator.state import DEFAULT_STATE, AgentState
 
 
 class TestClaimNode(unittest.TestCase):
@@ -1837,9 +1838,14 @@ class TestMergeNode(unittest.TestCase):
 
         new_state = merge_node(state)
 
-        self.assertEqual(new_state["status"], "failed")
+        # Actionable verdict with budget remaining -> bounded merge-fix retry.
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        self.assertEqual(new_state["attempts"].get("merge"), 1)
+        self.assertEqual(new_state["attempts"].get("verify"), 0)
         assert new_state["feedback"] is not None
-        self.assertIn("security check verdict is 'FAIL'", new_state["feedback"])
+        self.assertIn("merge-fix attempt 1/", new_state["feedback"])
+        self.assertIn("security (FAIL)", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
@@ -1882,9 +1888,14 @@ class TestMergeNode(unittest.TestCase):
 
         new_state = merge_node(state)
 
-        self.assertEqual(new_state["status"], "failed")
+        # Actionable verdict with budget remaining -> bounded merge-fix retry.
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        self.assertEqual(new_state["attempts"].get("merge"), 1)
+        self.assertEqual(new_state["attempts"].get("verify"), 0)
         assert new_state["feedback"] is not None
-        self.assertIn("architecture check verdict is 'FAIL'", new_state["feedback"])
+        self.assertIn("merge-fix attempt 1/", new_state["feedback"])
+        self.assertIn("architecture (FAIL)", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
@@ -1973,9 +1984,14 @@ class TestMergeNode(unittest.TestCase):
 
         new_state = merge_node(state)
 
-        self.assertEqual(new_state["status"], "failed")
+        # Actionable verdict with budget remaining -> bounded merge-fix retry.
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        self.assertEqual(new_state["attempts"].get("merge"), 1)
+        self.assertEqual(new_state["attempts"].get("verify"), 0)
         assert new_state["feedback"] is not None
-        self.assertIn("syntax_lint check verdict is 'FAIL'", new_state["feedback"])
+        self.assertIn("merge-fix attempt 1/", new_state["feedback"])
+        self.assertIn("syntax_lint (FAIL)", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
@@ -2018,9 +2034,14 @@ class TestMergeNode(unittest.TestCase):
 
         new_state = merge_node(state)
 
-        self.assertEqual(new_state["status"], "failed")
+        # Actionable verdict with budget remaining -> bounded merge-fix retry.
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        self.assertEqual(new_state["attempts"].get("merge"), 1)
+        self.assertEqual(new_state["attempts"].get("verify"), 0)
         assert new_state["feedback"] is not None
-        self.assertIn("test_coverage check verdict is 'FAIL'", new_state["feedback"])
+        self.assertIn("merge-fix attempt 1/", new_state["feedback"])
+        self.assertIn("test_coverage (FAIL)", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
@@ -2063,9 +2084,15 @@ class TestMergeNode(unittest.TestCase):
 
         new_state = merge_node(state)
 
-        self.assertEqual(new_state["status"], "failed")
+        # Actionable verdict (NEEDS REVIEW) with budget remaining -> bounded
+        # merge-fix retry. A missing verdict line is treated as NEEDS REVIEW.
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        self.assertEqual(new_state["attempts"].get("merge"), 1)
+        self.assertEqual(new_state["attempts"].get("verify"), 0)
         assert new_state["feedback"] is not None
-        self.assertIn("security check verdict is 'NEEDS REVIEW'", new_state["feedback"])
+        self.assertIn("merge-fix attempt 1/", new_state["feedback"])
+        self.assertIn("security (NEEDS REVIEW)", new_state["feedback"])
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
@@ -2201,9 +2228,297 @@ class TestMergeNode(unittest.TestCase):
 
         new_state = merge_node(state)
 
-        self.assertEqual(new_state["status"], "failed")
+        # Actionable verdict (NEEDS REVIEW) with budget remaining -> bounded
+        # merge-fix retry. A missing verdict line is treated as NEEDS REVIEW.
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        self.assertEqual(new_state["attempts"].get("merge"), 1)
+        self.assertEqual(new_state["attempts"].get("verify"), 0)
         assert new_state["feedback"] is not None
-        self.assertIn("security check verdict is 'NEEDS REVIEW'", new_state["feedback"])
+        self.assertIn("merge-fix attempt 1/", new_state["feedback"])
+        self.assertIn("security (NEEDS REVIEW)", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_fix_findings_extracted_into_feedback(
+        self, mock_api, mock_commit_time
+    ):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+
+        # Review body with actionable [SEVERITY]-tagged finding lines.
+        review_body = (
+            "## Security\n"
+            "- `[CRITICAL]` SQL injection in `foo.py:12` via unsanitized input.\n"
+            "- `[WARNING]` Hardcoded secret in `config.py`.\n"
+            "<!-- llm-pr-review-verdicts\n"
+            "syntax_lint: PASS\n"
+            "test_coverage: PASS\n"
+            "architecture: PASS\n"
+            "security: FAIL\n"
+            "-->"
+        )
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": review_body,
+                            "user": {"login": "test-judge-user"},
+                        }
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(state)
+
+        self.assertEqual(new_state["status"], "executing")
+        assert new_state["feedback"] is not None
+        # Both [SEVERITY]-tagged findings are extracted into the feedback channel.
+        self.assertIn("[CRITICAL]", new_state["feedback"])
+        self.assertIn("[WARNING]", new_state["feedback"])
+        self.assertIn("SQL injection in `foo.py:12`", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_fix_cap_exhaustion_posts_comment_and_fails(
+        self, mock_api, mock_commit_time
+    ):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+
+        posted_comments = []
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "PASS",
+                                    "test_coverage": "PASS",
+                                    "architecture": "PASS",
+                                    "security": "FAIL",
+                                }
+                            ),
+                            "user": {"login": "test-judge-user"},
+                        }
+                    ]
+            elif method == "POST" and path.endswith("/comments"):
+                posted_comments.append(body)
+                return {}
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        # Budget already exhausted: cap=1 and one merge-fix already attempted.
+        state["attempts"] = {"merge": 1, "verify": 0}
+        state_module.save(state)
+
+        os.environ["AGENT_PR_FIX_MAX"] = "1"
+        try:
+            from orchestrator.nodes import merge_node
+
+            new_state = merge_node(state)
+        finally:
+            os.environ.pop("AGENT_PR_FIX_MAX", None)
+
+        # Cap exhausted -> escalation comment posted, then recovery.
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(len(posted_comments), 1)
+        self.assertIn("Merge-fix budget exhausted", posted_comments[0]["body"])
+        self.assertIn("security (FAIL)", posted_comments[0]["body"])
+        assert new_state["feedback"] is not None
+        self.assertIn("Merge-fix budget exhausted", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_fix_success_resets_merge_counter(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": True, "state": "closed"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return []
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        # Simulate a prior merge-fix cycle whose PR then merged.
+        state["attempts"] = {"merge": 2, "verify": 0}
+        state_module.save(state)
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(state)
+
+        self.assertEqual(new_state["status"], "done")
+        self.assertEqual(new_state["attempts"].get("merge"), 0)
+
+
+class TestRouteAfterMerge(unittest.TestCase):
+    """route_after_merge closes the post-PR judge-feedback loop (ADR-0036)."""
+
+    def test_routes_to_execute_on_merge_fix_retry(self):
+        from orchestrator.graph import route_after_merge
+
+        state = cast(AgentState, {"status": "executing", "phase": "merge_fix"})
+        self.assertEqual(route_after_merge(state), "execute")
+
+    def test_routes_to_recovery_on_failed(self):
+        from orchestrator.graph import route_after_merge
+
+        # Cap exhaustion / poll timeout / closed PR all set status="failed".
+        state = cast(AgentState, {"status": "failed", "phase": "merging"})
+        self.assertEqual(route_after_merge(state), "recovery")
+
+    def test_routes_to_end_on_done(self):
+        from orchestrator.graph import route_after_merge
+
+        state = cast(AgentState, {"status": "done", "phase": "merging"})
+        self.assertEqual(route_after_merge(state), "end")
+
+
+class TestPrNodeCommitSelection(unittest.TestCase):
+    """pr_node selects `fix:` vs `feat:` commit message per the Merge-Fix Loop."""
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+        (self.workspace_dir / "README.md").write_text("# Test Repo", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @patch("orchestrator.nodes.push")
+    @patch("orchestrator.nodes.commit")
+    @patch("orchestrator.nodes.add")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_feat_commit_on_initial_pr(
+        self, mock_api, mock_add, mock_commit, mock_push
+    ):
+        mock_api.side_effect = lambda method, path, body=None: (
+            {"number": 1}
+            if method == "GET" and "/pulls" in path and "/reviews" not in path
+            else {"title": "x", "body": ""}
+            if method == "GET" and path.endswith("/issues/10")
+            else {}
+        )
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state["attempts"] = {"merge": 0}
+        state_module.save(state)
+
+        from orchestrator.nodes import pr_node
+
+        pr_node(state)
+
+        commit_msg = mock_commit.call_args.args[1]
+        self.assertEqual(commit_msg, "feat: resolve issue #10")
+
+    @patch("orchestrator.nodes.push")
+    @patch("orchestrator.nodes.commit")
+    @patch("orchestrator.nodes.add")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_fix_commit_on_merge_fix_reentry(
+        self, mock_api, mock_add, mock_commit, mock_push
+    ):
+        mock_api.side_effect = lambda method, path, body=None: (
+            [{"number": 1}]  # PR already exists -> creation skipped
+            if method == "GET" and "/pulls" in path and "/reviews" not in path
+            else {}
+        )
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state["attempts"] = {"merge": 2, "verify": 0}
+        state_module.save(state)
+
+        from orchestrator.nodes import pr_node
+
+        pr_node(state)
+
+        commit_msg = mock_commit.call_args.args[1]
+        self.assertEqual(commit_msg, "fix: address PR review feedback (attempt 2)")
 
 
 class TestRecoveryNode(unittest.TestCase):
