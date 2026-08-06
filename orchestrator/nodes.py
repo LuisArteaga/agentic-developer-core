@@ -24,6 +24,7 @@ from orchestrator.git import (
     commit,
     diff_cached,
     diff_name_only,
+    diff_stat,
     get_commit_time,
     get_remote_url,
     is_git_repository,
@@ -1109,6 +1110,14 @@ def verify_node(state: AgentState) -> AgentState:
         raw_output = f"Error: Command '{verify_cmd}' timed out after {timeout} seconds.\nOutput captured before timeout:\n{raw_output}"
     output = _truncate_output(raw_output)
 
+    # Capture the (already-truncated) verify output so the PR-Node can extract
+    # a coverage tail from it deterministically, without a new test run.
+    # Reset first to guarantee a stale prior-cycle output never leaks across
+    # cycles; this is the single field the PR body's Test Coverage section
+    # reads (issue #93). Plain `pytest` (no --cov) leaves this coverage-free and
+    # the PR body degrades to a note — graceful by design (AC6).
+    state["verify_output"] = output
+
     if exit_code == 0 and not timed_out:
         # make verify passed — run the Pre-PR BinEval Review (soft semantic gate).
         verify_exit = _run_bineval_phase(state, issue_num, workspace_path)
@@ -1305,6 +1314,95 @@ def _record_plan_alignment(state: AgentState, workspace_path: Path) -> None:
         logger.debug("Plan Alignment collection failed: %s", e)
 
 
+def _extract_coverage_tail(verify_output: str | None) -> str:
+    """Extract the pytest-cov ``term-missing`` table from captured verify output.
+
+    pytest with ``--cov-report=term-missing`` prints a coverage table bounded by
+    a header line (``Name Stmts Miss Cover Missing``) and a trailing ``TOTAL``
+    line. This returns that block verbatim, or an empty string when the verify
+    command produced no coverage report (e.g. plain ``pytest`` with no
+    ``--cov``). The caller degrades the Test Coverage section to a note when
+    this returns empty — the PR is still created.
+
+    Only the already-truncated verify output is scanned, so the search window
+    is bounded (ADR-0016 / _truncate_output cap of 150 lines / 10 KB).
+    """
+    if not verify_output:
+        return ""
+    lines = verify_output.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        # Header: "Name Stmts Miss Cover Missing" (Missing is optional in
+        # some pytest-cov versions — match the leading fixed columns only).
+        if re.match(r"^Name\s+Stmts\s+Miss\s+Cover(\s+Missing)?\s*$", line):
+            start = i
+            break
+    if start is None:
+        return ""
+    tail = []
+    for line in lines[start:]:
+        tail.append(line)
+        if line.startswith("TOTAL"):
+            break
+    return "\n".join(tail)
+
+
+def _build_pr_body(
+    issue_num: int,
+    rationale: str,
+    diff_stat_output: str,
+    coverage_tail: str,
+) -> str:
+    """Compose the PR body deterministically from plan rationale, git stat, and
+    the verify coverage tail — no LLM call.
+
+    Each section degrades to a short note when its input is missing/empty
+    rather than raising (AC6): the PR must always be created. ``Closes #{n}``
+    is always present so the issue auto-closes on merge (AC4). The body is the
+    human-facing artifact only — it never enters the PR Review Judge inputs
+    (AC2): judges receive only the git diff via the ``pr-checks`` stdin
+    contract, never this string.
+    """
+    sections: list[str] = [f"Closes #{issue_num}", ""]
+
+    # Summary — the plan's rationale, not the Worker's implementation choices
+    # (no Implementation Leakage: AC3).
+    sections.append("## Summary")
+    if rationale and rationale.strip():
+        sections.append(rationale.strip())
+    else:
+        sections.append("_No plan rationale was available at PR creation._")
+    sections.append("")
+
+    # Key Changes — re-derived from the committed branch at PR time (no state).
+    sections.append("## Key Changes")
+    stat = diff_stat_output.strip()
+    if stat:
+        sections.append("```")
+        sections.append(stat)
+        sections.append("```")
+    else:
+        sections.append("_No changed files were reported by `git diff --stat`._")
+    sections.append("")
+
+    # Test Coverage — extracted from the captured verify output. Only present
+    # when the verify command emitted a pytest-cov term-missing report.
+    sections.append("## Test Coverage")
+    cov = coverage_tail.strip()
+    if cov:
+        sections.append("```")
+        sections.append(cov)
+        sections.append("```")
+    else:
+        sections.append(
+            "_No coverage report was produced during verification "
+            "(the verify command did not emit a pytest-cov term-missing table)._"
+        )
+    sections.append("")
+
+    return "\n".join(sections).rstrip() + "\n"
+
+
 def pr_node(state: AgentState) -> AgentState:
     """Stages, commits, and pushes local changes, then creates a Pull Request via GitHub REST API if not already present."""
     issue_num = state.get("issue_number")
@@ -1386,7 +1484,21 @@ def pr_node(state: AgentState) -> AgentState:
 
             # Create a Pull Request via the GitHub REST API (no gh CLI harness)
             pr_title = f"feat: resolve issue #{issue_num} - {issue_title}"
-            pr_body = f"Closes #{issue_num}"
+
+            # Enrich the PR body deterministically (no LLM) — issue #93.
+            # Summary comes from the plan rationale (no Implementation Leakage:
+            # the Worker's implementation choices are not surfaced), Key Changes
+            # from `git diff --stat` re-derived here from the committed branch,
+            # and Test Coverage from the coverage tail captured during Verify.
+            # All inputs degrade to short notes when absent so the PR is always
+            # created (AC6). The body never reaches the PR Review Judges, who
+            # consume only the git diff via the pr-checks stdin contract (AC2).
+            from orchestrator.metrics import extract_plan_rationale
+
+            rationale = extract_plan_rationale(state.get("plan"))
+            stat_output = diff_stat(workspace_path, "origin/main...HEAD")
+            coverage_tail = _extract_coverage_tail(state.get("verify_output"))
+            pr_body = _build_pr_body(issue_num, rationale, stat_output, coverage_tail)
 
             logger.info("Creating Pull Request via API: '%s'...", pr_title)
             payload = {

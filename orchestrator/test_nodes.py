@@ -1694,6 +1694,264 @@ class TestPRNode(unittest.TestCase):
         mock_commit.assert_called_once()
         mock_push.assert_called_once()
 
+    @patch("orchestrator.nodes.push")
+    @patch("orchestrator.nodes.commit")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_pr_node_enriches_body_with_plan_and_coverage(
+        self, mock_api, mock_commit, mock_push
+    ):
+        """pr_node builds an enriched body from plan rationale + verify output.
+
+        With a serialized DevelopmentPlan and a captured verify_output containing
+        a pytest-cov term-missing table, the PR body surfaces a Summary, Key
+        Changes, and Test Coverage section (issue #93, AC1). The Closes marker
+        is preserved (AC4).
+        """
+        plan = json.dumps(
+            {
+                "rationale": "Wire the new signal end-to-end.",
+                "tasks": [],
+                "requested_files": [],
+            }
+        )
+        coverage = (
+            "collected 10 items\n"
+            "Name                          Stmts   Miss   Cover   Missing\n"
+            "-----------------------------------------------------------\n"
+            "orchestrator/nodes.py           1234     56    95%    45-50\n"
+            "TOTAL                           1234     56    95%\n"
+        )
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if "/pulls" in path:
+                    return []
+                if "/issues/10" in path:
+                    return {"title": "Fix a bug"}
+            if method == "POST" and "/pulls" in path:
+                return {"html_url": "https://github.com/test-owner/test-repo/pull/1"}
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state["plan"] = plan
+        state["verify_output"] = coverage
+        state_module.save(state)
+
+        from orchestrator.nodes import pr_node
+
+        pr_node(state)
+
+        post_calls = [
+            call
+            for call in mock_api.mock_calls
+            if call[1][0] == "POST" and "/pulls" in call[1][1]
+        ]
+        self.assertTrue(len(post_calls) > 0)
+        body = post_calls[0].args[2]["body"]
+        self.assertIn("Closes #10", body)
+        self.assertIn("## Summary", body)
+        self.assertIn("Wire the new signal end-to-end.", body)
+        self.assertIn("## Key Changes", body)
+        self.assertIn("## Test Coverage", body)
+        self.assertIn("TOTAL", body)
+
+    @patch("orchestrator.nodes.push")
+    @patch("orchestrator.nodes.commit")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_pr_node_body_degrades_when_plan_and_coverage_absent(
+        self, mock_api, mock_commit, mock_push
+    ):
+        """A missing plan/coverage degrades to notes; the PR is still created (AC6)."""
+        # TestPRNode.setUp created a single initial commit on main with no branch
+        # divergence, so `git diff --stat origin/main...HEAD` is empty here too —
+        # exercising the Key Changes degradation path as well.
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if "/pulls" in path:
+                    return []
+                if "/issues/7" in path:
+                    return {"title": "T"}
+            if method == "POST" and "/pulls" in path:
+                return {"html_url": "https://github.com/test-owner/test-repo/pull/1"}
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 7
+        state["branch"] = "feat/issue-7"
+        # plan and verify_output intentionally absent (None)
+        state_module.save(state)
+
+        from orchestrator.nodes import pr_node
+
+        pr_node(state)
+
+        post_calls = [
+            call
+            for call in mock_api.mock_calls
+            if call[1][0] == "POST" and "/pulls" in call[1][1]
+        ]
+        self.assertTrue(len(post_calls) > 0)
+        body = post_calls[0].args[2]["body"]
+        self.assertIn("Closes #7", body)
+        self.assertIn("No plan rationale was available", body)
+        self.assertIn("No coverage report was produced", body)
+
+
+class TestPRBodyHelpers(unittest.TestCase):
+    """Unit tests for the deterministic PR-body construction helpers (issue #93)."""
+
+    def test_build_pr_body_full(self):
+        from orchestrator.nodes import _build_pr_body
+
+        body = _build_pr_body(
+            42,
+            "Refactor the merge path.",
+            "orchestrator/nodes.py | 12 +-\n 1 file changed, 8 insertions(+), 4 deletions(-)",
+            "Name                 Stmts  Miss  Cover\nTOTAL                10      1    90%",
+        )
+        self.assertIn("Closes #42", body)
+        self.assertIn("## Summary", body)
+        self.assertIn("Refactor the merge path.", body)
+        self.assertIn("## Key Changes", body)
+        self.assertIn("orchestrator/nodes.py", body)
+        self.assertIn("## Test Coverage", body)
+        self.assertIn("TOTAL", body)
+        # Closes marker precedes the Summary (AC4 ordering preserved).
+        self.assertLess(body.index("Closes #42"), body.index("## Summary"))
+
+    def test_build_pr_body_degrades_without_rationale(self):
+        from orchestrator.nodes import _build_pr_body
+
+        body = _build_pr_body(
+            9, "", "a.py | 1 +\n 1 file changed, 1 insertion(+)", "TOTAL 10 1 90%"
+        )
+        self.assertIn("No plan rationale was available", body)
+        self.assertIn("## Key Changes", body)
+        self.assertIn("a.py", body)
+        self.assertIn("## Test Coverage", body)
+        self.assertIn("TOTAL", body)
+
+    def test_build_pr_body_degrades_without_diff_stat(self):
+        from orchestrator.nodes import _build_pr_body
+
+        body = _build_pr_body(9, "Rationale here.", "", "TOTAL 10 1 90%")
+        self.assertIn("Rationale here.", body)
+        self.assertIn("No changed files were reported", body)
+        self.assertIn("## Test Coverage", body)
+        self.assertIn("TOTAL", body)
+
+    def test_build_pr_body_degrades_without_coverage(self):
+        from orchestrator.nodes import _build_pr_body
+
+        body = _build_pr_body(9, "Rationale here.", "a.py | 1 +", "")
+        self.assertIn("No coverage report was produced", body)
+        self.assertIn("a.py", body)
+
+    def test_build_pr_body_degrades_all_missing(self):
+        from orchestrator.nodes import _build_pr_body
+
+        body = _build_pr_body(9, "", "", "")
+        self.assertIn("Closes #9", body)
+        self.assertIn("No plan rationale was available", body)
+        self.assertIn("No changed files were reported", body)
+        self.assertIn("No coverage report was produced", body)
+        # Body never raises and ends with a single trailing newline.
+        self.assertTrue(body.endswith("\n"))
+        self.assertFalse(body.endswith("\n\n"))
+
+    def test_extract_coverage_tail_returns_table_block(self):
+        from orchestrator.nodes import _extract_coverage_tail
+
+        output = (
+            "==== test session starts ====\n"
+            "collected 5 items\n\n"
+            "Name                          Stmts   Miss   Cover   Missing\n"
+            "-----------------------------------------------------------\n"
+            "orchestrator/nodes.py           100      5    95%    45-50\n"
+            "TOTAL                           100      5    95%\n"
+            "==== 5 passed ====\n"
+        )
+        tail = _extract_coverage_tail(output)
+        self.assertIn("Name", tail)
+        self.assertIn("Stmts", tail)
+        self.assertIn("orchestrator/nodes.py", tail)
+        self.assertTrue(tail.lstrip().startswith("Name"))
+        self.assertTrue(
+            tail.rstrip().endswith("TOTAL                           100      5    95%")
+        )
+        # The trailing pytest summary line is NOT part of the coverage block.
+        self.assertNotIn("5 passed", tail)
+
+    def test_extract_coverage_tail_returns_table_without_missing_column(self):
+        from orchestrator.nodes import _extract_coverage_tail
+
+        output = (
+            "Name                 Stmts  Miss  Cover\n"
+            "TOTAL                10     1     90%\n"
+        )
+        tail = _extract_coverage_tail(output)
+        self.assertIn("TOTAL", tail)
+        self.assertIn("Stmts", tail)
+
+    def test_extract_coverage_tail_empty_when_no_report(self):
+        from orchestrator.nodes import _extract_coverage_tail
+
+        # Plain pytest output with no --cov produces no coverage table.
+        self.assertEqual(_extract_coverage_tail("collected 3 items\n3 passed\n"), "")
+        self.assertEqual(_extract_coverage_tail(""), "")
+        self.assertEqual(_extract_coverage_tail(None), "")
+
+    def test_extract_coverage_tail_handles_table_without_total_line(self):
+        from orchestrator.nodes import _extract_coverage_tail
+
+        # A malformed report with no TOTAL line still returns the header block
+        # rather than the entire remaining output (bounded by header match).
+        output = "Name  Stmts  Miss  Cover\nx.py  1  0  100%\ntrailing\n"
+        tail = _extract_coverage_tail(output)
+        self.assertIn("Name  Stmts  Miss  Cover", tail)
+        self.assertIn("x.py  1  0  100%", tail)
+        # No TOTAL present, so the block runs to end of captured output.
+        self.assertIn("trailing", tail)
+
+    def test_extract_plan_rationale_valid(self):
+        from orchestrator.metrics import extract_plan_rationale
+
+        plan = json.dumps({"rationale": "Because X.", "tasks": []})
+        self.assertEqual(extract_plan_rationale(plan), "Because X.")
+
+    def test_extract_plan_rationale_missing_field(self):
+        from orchestrator.metrics import extract_plan_rationale
+
+        self.assertEqual(extract_plan_rationale(json.dumps({"tasks": []})), "")
+
+    def test_extract_plan_rationale_non_dict_json(self):
+        """A plan that parses to a non-dict (list/scalar) degrades to ''."""
+        from orchestrator.metrics import extract_plan_rationale
+
+        self.assertEqual(extract_plan_rationale("[]"), "")
+        self.assertEqual(extract_plan_rationale('"a string"'), "")
+        self.assertEqual(extract_plan_rationale("123"), "")
+
+    def test_extract_plan_rationale_non_string_rationale(self):
+        """A non-string rationale value degrades to '' rather than leaking it."""
+        from orchestrator.metrics import extract_plan_rationale
+
+        self.assertEqual(extract_plan_rationale(json.dumps({"rationale": 42})), "")
+        self.assertEqual(extract_plan_rationale(json.dumps({"rationale": None})), "")
+
+    def test_extract_plan_rationale_invalid_json(self):
+        from orchestrator.metrics import extract_plan_rationale
+
+        self.assertEqual(extract_plan_rationale("not json"), "")
+        self.assertEqual(extract_plan_rationale(None), "")
+
 
 class TestMergeNode(unittest.TestCase):
     @staticmethod
