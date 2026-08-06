@@ -385,12 +385,7 @@ class TestTelemetryIntegration(unittest.TestCase):
             mock_simple.assert_called_once()
 
     def test_verify_bineval_nests_under_verify_phase(self):
-        """BinEval phase span must be a child of the verify phase span (ADR-0016).
-
-        Named to sort after the langfuse/telemetry tests so that the first
-        init_telemetry call in the session remains test_langfuse_endpoint_precedence
-        (which registers the BaggageSpanProcessor this file's other tests rely on).
-        """
+        """BinEval phase span must be a child of the verify phase span (ADR-0016)."""
         if not HAS_OTEL:
             self.skipTest("OpenTelemetry is not installed in the current environment.")
 

@@ -75,6 +75,26 @@ def _is_langfuse_configured() -> bool:
     )
 
 
+def _attach_langfuse_processors(provider) -> None:
+    """Attach the Langfuse session-level SpanProcessor(s) to *provider*.
+
+    The BaggageSpanProcessor copies ``langfuse.session.id`` from OTel baggage
+    to span attributes, enabling trace grouping in the Langfuse UI. It is
+    attached whenever Langfuse is configured, on **both** the fresh-provider
+    path and the already-set-provider path of ``init_telemetry``, so the
+    processor set is independent of which ``init_telemetry`` call runs first
+    (issue #75: the early-return branch previously skipped it, making
+    ``test_langfuse_session_id_in_spans`` order-dependent).
+
+    Re-attachment on an already-configured provider is idempotent in effect —
+    the processor sets the same attribute to the same value — which is the
+    accepted cost of not inspecting a provider's registered processors
+    (the OTel SDK exposes no public way to enumerate them).
+    """
+    if _is_langfuse_configured():
+        provider.add_span_processor(BaggageSpanProcessor())
+
+
 def _build_langfuse_auth_header() -> dict[str, str]:
     """Build the Authorization header for Langfuse Cloud OTLP export.
 
@@ -363,8 +383,13 @@ def init_telemetry(
 
     # If a real TracerProvider is already set (e.g., in repeated test setUps),
     # attach the new in-memory exporter to it instead of trying to replace it.
+    # The global provider can only be set once per process (OTel's Once() guard),
+    # so re-initialization augments the existing provider rather than replacing it.
     current_provider = trace.get_tracer_provider()
     if isinstance(current_provider, TracerProvider):
+        # Attach session-level processors identically to the fresh-provider
+        # path so outcomes are independent of call order (issue #75).
+        _attach_langfuse_processors(current_provider)
         if in_memory_exporter is not None:
             current_provider.add_span_processor(SimpleSpanProcessor(in_memory_exporter))
         return
@@ -384,6 +409,10 @@ def init_telemetry(
     # Register our crash-resistant local logging SpanProcessor
     provider.add_span_processor(LocalJSONLFileSpanProcessor())
 
+    # Attach Langfuse session-level processors identically to the already-set
+    # provider path so outcomes are independent of call order (issue #75).
+    _attach_langfuse_processors(provider)
+
     if in_memory_exporter is not None:
         provider.add_span_processor(SimpleSpanProcessor(in_memory_exporter))
     else:
@@ -397,9 +426,6 @@ def init_telemetry(
                 or _LANGFUSE_DEFAULT_OTLP_ENDPOINT
             )
             headers = _build_langfuse_auth_header()
-            # Attach BaggageSpanProcessor so langfuse.session.id propagates from
-            # baggage to span attributes on every span (Langfuse v4 pattern).
-            provider.add_span_processor(BaggageSpanProcessor())
         else:
             # Generic OTLP export (Docker default or explicit endpoint)
             configure_otlp_endpoint()
