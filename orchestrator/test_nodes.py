@@ -2389,6 +2389,153 @@ class TestMergeNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "done")
         self.assertEqual(new_state["attempts"].get("merge"), 0)
 
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_fix_escalation_comment_includes_findings(
+        self, mock_api, mock_commit_time
+    ):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+
+        review_body = (
+            "## Security\n"
+            "- `[CRITICAL]` SQL injection in `foo.py:12`.\n"
+            "<!-- llm-pr-review-verdicts\n"
+            "syntax_lint: PASS\n"
+            "test_coverage: PASS\n"
+            "architecture: PASS\n"
+            "security: FAIL\n"
+            "-->"
+        )
+        posted_comments = []
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": review_body,
+                            "user": {"login": "test-judge-user"},
+                        }
+                    ]
+            elif method == "POST" and path.endswith("/comments"):
+                posted_comments.append(body)
+                return {}
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state["attempts"] = {"merge": 1, "verify": 0}
+        state_module.save(state)
+
+        os.environ["AGENT_PR_FIX_MAX"] = "1"
+        try:
+            from orchestrator.nodes import merge_node
+
+            new_state = merge_node(state)
+        finally:
+            os.environ.pop("AGENT_PR_FIX_MAX", None)
+
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(len(posted_comments), 1)
+        # The escalation comment includes the extracted [SEVERITY] findings.
+        self.assertIn("Unresolved findings:", posted_comments[0]["body"])
+        self.assertIn("[CRITICAL]", posted_comments[0]["body"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_fix_escalation_tolerates_comment_post_failure(
+        self, mock_api, mock_commit_time
+    ):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            "body": self._hidden_block_body(
+                                {
+                                    "syntax_lint": "PASS",
+                                    "test_coverage": "PASS",
+                                    "architecture": "PASS",
+                                    "security": "FAIL",
+                                }
+                            ),
+                            "user": {"login": "test-judge-user"},
+                        }
+                    ]
+            elif method == "POST" and path.endswith("/comments"):
+                # Posting the escalation comment fails — must not crash the node.
+                raise RuntimeError("comment post unavailable")
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state["attempts"] = {"merge": 1, "verify": 0}
+        state_module.save(state)
+
+        os.environ["AGENT_PR_FIX_MAX"] = "1"
+        try:
+            from orchestrator.nodes import merge_node
+
+            new_state = merge_node(state)
+        finally:
+            os.environ.pop("AGENT_PR_FIX_MAX", None)
+
+        # Comment failure is tolerated; the node still transitions to recovery.
+        self.assertEqual(new_state["status"], "failed")
+
+    def test_merge_node_requires_issue_number(self):
+        from orchestrator.nodes import merge_node
+
+        state = DEFAULT_STATE.copy()
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+
+        with self.assertRaises(ValueError):
+            merge_node(state)
+
+    @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_exception_path_sets_failed_and_reraises(self, mock_api):
+        # An unexpected API error inside the try block takes the exception path.
+        mock_api.side_effect = RuntimeError("github API down")
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+
+        from orchestrator.nodes import merge_node
+
+        with self.assertRaises(RuntimeError):
+            merge_node(state)
+
+        loaded = state_module.load()
+        self.assertEqual(loaded["status"], "failed")
+        self.assertEqual(loaded["phase"], "merging")
+        assert loaded["feedback"] is not None
+        self.assertIn("github API down", loaded["feedback"])
+
 
 class TestRouteAfterMerge(unittest.TestCase):
     """route_after_merge closes the post-PR judge-feedback loop (ADR-0036)."""
