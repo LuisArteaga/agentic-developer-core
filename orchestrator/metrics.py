@@ -177,6 +177,30 @@ def extract_planned_files(plan_json: str | None) -> list[str]:
     return files
 
 
+def extract_plan_rationale(plan_json: str | None) -> str:
+    """Extract the ``rationale`` field from a serialized ``DevelopmentPlan``.
+
+    ``DevelopmentPlan`` is stored in state as ``model_dump_json()``; its
+    ``rationale`` is the high-level architectural reasoning produced by the
+    Plan-Node. Used to populate the Summary section of the PR body without an
+    additional LLM call (deterministic enrichment). Mirrors
+    :func:`extract_planned_files` for error handling: a missing/invalid plan
+    yields an empty string so the PR body degrades gracefully rather than
+    raising — the PR must always be created.
+    """
+    if not plan_json:
+        return ""
+    try:
+        data = json.loads(plan_json)
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.debug("extract_plan_rationale failed to parse plan JSON: %s", e)
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    rationale = data.get("rationale")
+    return rationale if isinstance(rationale, str) else ""
+
+
 class MetricsCollector:
     """In-memory accumulator for one issue cycle's Run Observability metrics.
 

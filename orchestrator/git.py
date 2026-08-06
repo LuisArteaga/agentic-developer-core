@@ -174,6 +174,36 @@ def diff_name_only(repo_dir: Path | str, base: str = "origin/main...HEAD") -> st
         return ""
 
 
+def diff_stat(repo_dir: Path | str, base: str = "origin/main...HEAD") -> str:
+    """Return the ``--stat`` diff between ``base`` and HEAD.
+
+    Uses the three-dot range ``origin/main...HEAD`` by default so the stat
+    summarizes every file changed on the feature branch since it diverged from
+    the default branch (the same range :func:`diff_name_only` uses for Plan
+    Alignment). The stat is re-derived at PR time from the committed branch
+    state — no in-flight data is carried through :class:`AgentState` for it.
+
+    Returns the raw ``git diff --stat`` stdout (one line per changed file plus
+    a trailing ``N files changed`` summary), or an empty string if the
+    directory is not a git repository or the range ref is unavailable. Never
+    raises: a failed stat degrades the PR body's Key Changes section to a note.
+    """
+    try:
+        result = _run_git(repo_dir, ["diff", "--stat", base], check=False)
+        if result.returncode != 0:
+            logger.debug(
+                "diff_stat(%s) failed (rc=%d): %s",
+                base,
+                result.returncode,
+                result.stderr.strip(),
+            )
+            return ""
+        return result.stdout
+    except GitError as e:
+        logger.debug("diff_stat failed in %s: %s", repo_dir, e)
+        return ""
+
+
 def push(
     repo_dir: Path | str, branch: str, remote: str = "origin", force: bool = False
 ) -> None:

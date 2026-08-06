@@ -263,6 +263,98 @@ class TestGitSubprocessHelper(unittest.TestCase):
         with tempfile.TemporaryDirectory() as non_repo:
             self.assertEqual(diff_name_only(Path(non_repo)), "")
 
+    def test_diff_stat_local_base_summarizes_changed_files(self):
+        """diff_stat returns a --stat summary between a local base and HEAD."""
+        from orchestrator.git import diff_stat
+
+        # Branch off main, modify + add files, commit.
+        subprocess.run(
+            ["git", "checkout", "-b", "feat-stat"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+        (self.repo_path / "initial.txt").write_text("changed", encoding="utf-8")
+        (self.repo_path / "new_file.txt").write_text("brand new", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(self.repo_path), check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "branch work"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+
+        stat = diff_stat(self.repo_path, base="main...HEAD")
+        # Both changed files appear in the stat, plus a trailing summary line.
+        self.assertIn("initial.txt", stat)
+        self.assertIn("new_file.txt", stat)
+        self.assertIn("files changed", stat)
+        self.assertIn("insertions(+)", stat)
+
+    def test_diff_stat_origin_main_path(self):
+        """diff_stat resolves origin/main...HEAD when an origin remote exists."""
+        from orchestrator.git import diff_stat
+
+        origin_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(origin_temp.cleanup)
+        origin_path = Path(origin_temp.name).resolve() / "origin.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(origin_path)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(origin_path)],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "push", "origin", "main"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+
+        subprocess.run(
+            ["git", "checkout", "-b", "feat-obs-stat"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+        (self.repo_path / "added.py").write_text("x = 1", encoding="utf-8")
+        subprocess.run(["git", "add", "added.py"], cwd=str(self.repo_path), check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add file"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+        )
+
+        stat = diff_stat(self.repo_path, base="origin/main...HEAD")
+        self.assertIn("added.py", stat)
+
+    def test_diff_stat_empty_on_missing_ref(self):
+        """diff_stat returns '' (never raises) when the base ref is absent."""
+        from orchestrator.git import diff_stat
+
+        self.assertEqual(
+            diff_stat(self.repo_path, base="origin/nonexistent...HEAD"), ""
+        )
+
+    def test_diff_stat_empty_in_non_repository(self):
+        """diff_stat never raises on a non-repo dir."""
+        from orchestrator.git import diff_stat
+
+        with tempfile.TemporaryDirectory() as non_repo:
+            self.assertEqual(diff_stat(Path(non_repo)), "")
+
     def test_clean_and_reset_hard(self):
         """Test workspace hygiene commands: clean and reset_hard."""
         # Modify an existing tracked file

@@ -34,6 +34,7 @@ class AgentState(TypedDict):
     updated_at: str
     feedback: str | None
     pushed_at: str | None
+    verify_output: str | None
 
 
 DEFAULT_STATE: AgentState = {
@@ -48,6 +49,7 @@ DEFAULT_STATE: AgentState = {
     "updated_at": "",
     "feedback": None,
     "pushed_at": None,
+    "verify_output": None,
 }
 
 VALID_STATUSES = {
@@ -163,6 +165,8 @@ def load(filepath: str | Path | None = None) -> AgentState:
             data["feedback"] = None
         if "pushed_at" not in data:
             data["pushed_at"] = None
+        if "verify_output" not in data:
+            data["verify_output"] = None
 
         # Validate status value
         if data["status"] not in VALID_STATUSES:
