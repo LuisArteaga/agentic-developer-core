@@ -3272,6 +3272,14 @@ class TestGithubApiRetry(unittest.TestCase):
         # Retry-After is honored (capped at 30s).
         self.assertAlmostEqual(_gh_backoff_seconds(1, "2"), 2.0)
 
+    def test_backoff_falls_back_on_malformed_retry_after(self):
+        """A malformed Retry-After header falls back to exponential backoff."""
+        from orchestrator.nodes import _gh_backoff_seconds
+
+        # Non-numeric Retry-After → ValueError → fallback to 2^(attempt-1).
+        self.assertEqual(_gh_backoff_seconds(1, "not-a-number"), 1.0)
+        self.assertEqual(_gh_backoff_seconds(3, "soon"), 4.0)
+
     @patch("orchestrator.nodes.time.sleep")
     @patch("orchestrator.nodes.urllib.request.urlopen")
     def test_does_not_retry_on_404(self, mock_urlopen, mock_sleep):
