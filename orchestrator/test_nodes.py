@@ -3226,7 +3226,7 @@ class TestGraphCompilation(unittest.TestCase):
 
 
 class TestGithubApiRetry(unittest.TestCase):
-    """ADR-0037 #7: bounded timeout + retry with backoff on transient failures."""
+    """Bounded timeout + retry with backoff on transient failures."""
 
     def _ok_response(self, payload):
         resp = MagicMock()
@@ -3296,7 +3296,7 @@ class TestGithubApiRetry(unittest.TestCase):
     @patch("orchestrator.nodes.time.sleep")
     @patch("orchestrator.nodes.urllib.request.urlopen")
     def test_retries_exhausted_on_persistent_5xx(self, mock_urlopen, mock_sleep):
-        """ADR-0037 #7: after the retry budget, a persistent 5xx raises."""
+        """After the retry budget, a persistent 5xx raises."""
         from orchestrator.nodes import _GH_API_MAX_ATTEMPTS, _github_api_request
 
         mock_urlopen.side_effect = [self._http_error(503)] * _GH_API_MAX_ATTEMPTS
@@ -3308,7 +3308,7 @@ class TestGithubApiRetry(unittest.TestCase):
     @patch("orchestrator.nodes.time.sleep")
     @patch("orchestrator.nodes.urllib.request.urlopen")
     def test_retries_exhausted_on_persistent_urlerror(self, mock_urlopen, mock_sleep):
-        """ADR-0037 #7: persistent connection errors exhaust the budget and raise."""
+        """Persistent connection errors exhaust the budget and raise."""
         import urllib.error as urlerr
 
         from orchestrator.nodes import _GH_API_MAX_ATTEMPTS, _github_api_request

@@ -44,7 +44,7 @@ omit = [
 [tool.pytest.ini_options]
 filterwarnings = [
     # create_react_agent was migrated to langchain.agents.create_agent with the
-    # `system_prompt` kwarg (ADR-0037 #8). Narrowly suppress only the
+    # `system_prompt` kwarg. Narrowly suppress only the
     # create_react_agent deprecation notice as a safety net; all other
     # LangGraph v1 deprecations are surfaced rather than blanket-ignored.
     "ignore:.*create_react_agent.*:langgraph.warnings.LangGraphDeprecatedSinceV10",

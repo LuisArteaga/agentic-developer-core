@@ -673,7 +673,7 @@ class TestFetchUrlTool(unittest.TestCase):
         self.assertIn("too many redirects", out)
 
     def test_urlerror_returns_error(self):
-        """A URLError from the opener is surfaced as an Error (ADR-0037 #4)."""
+        """A URLError from the opener is surfaced as an Error."""
         import urllib.error
 
         opener = MagicMock()
@@ -760,7 +760,7 @@ class TestFetchUrlTool(unittest.TestCase):
         cannot reach a private IP. The first resolution returns a public IP; a
         would-be second resolution returns a private IP. With DNS pinning the
         connection uses the validated public IP and there is NO second
-        resolution, so the private address is never reached (ADR-0037 #4)."""
+        resolution, so the private address is never reached."""
         captured: dict = {}
 
         def fake_opener(pinned_ip):
@@ -885,7 +885,7 @@ class TestPinnedConnections(unittest.TestCase):
 
     def test_build_pinned_opener_http_handler_uses_pinned_ip(self):
         """The opener's HTTP handler builds a _PinnedHTTPConnection carrying the
-        pinned IP when it opens a request (ADR-0037 #4)."""
+        pinned IP when it opens a request."""
         import urllib.request
 
         from orchestrator.research_tools import _build_pinned_opener
@@ -910,7 +910,7 @@ class TestPinnedConnections(unittest.TestCase):
 
     def test_build_pinned_opener_https_handler_uses_pinned_ip(self):
         """The opener's HTTPS handler builds a _PinnedHTTPSConnection with the
-        pinned IP (ADR-0037 #4)."""
+        pinned IP."""
         import urllib.request
 
         from orchestrator.research_tools import _build_pinned_opener

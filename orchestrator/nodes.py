@@ -59,7 +59,7 @@ def _safe_telemetry(func, *args, **kwargs):
         logger.debug("Non-fatal telemetry error in %s: %s", func.__name__, e)
 
 
-# GitHub API request bounds (ADR-0037 #7): a bounded per-request timeout and a
+# GitHub API request bounds: a bounded per-request timeout and a
 # bounded retry with exponential backoff on transient failures (5xx, and 403
 # carrying a Retry-After header — GitHub's secondary-rate-limit signal) so a
 # correlated OpenRouter/GitHub outage does not crash a node before recovery.
@@ -88,7 +88,7 @@ def _github_api_request(
 
     Bounded by a per-request timeout (``_GH_API_TIMEOUT``) and a bounded retry
     with backoff on transient failures (5xx, 403 with Retry-After, and
-    connection errors), per ADR-0037 #7.
+    connection errors).
     """
     token = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
 
@@ -922,7 +922,7 @@ def execute_node(state: AgentState) -> AgentState:
 
 # Truncation of command output is unified in orchestrator.tools._truncate_output
 # (imported above) and shared by run_command (Worker tool) and verify_node, so
-# both surfaces apply the same 150-line + 10 KB byte cap (ADR-0037 #5).
+# both surfaces apply the same 150-line + 10 KB byte cap.
 
 
 # ==============================================================================
@@ -1287,7 +1287,7 @@ def _run_bineval_phase(state: AgentState, issue_num: int, workspace_path: Path) 
             "(soft gate, infrastructure failure does not block).",
             e,
         )
-        # ADR-0037 #7: flag the degradation so it is surfaced in the PR body
+        # Flag the degradation so it is surfaced in the PR body
         # rather than silently passing bad code.
         state["bineval_degraded"] = True
         _reset_verify_success(state)
@@ -1302,7 +1302,7 @@ def _run_bineval_phase(state: AgentState, issue_num: int, workspace_path: Path) 
     if bineval_result is None:
         # LLM failure / malformed output → PASS (infrastructure does not block).
         _safe_telemetry(end_orchestrator_phase, exit_code=0, phase_name="bineval")
-        # ADR-0037 #7: flag the degradation (LLM/infra failure → silent PASS).
+        # Flag the degradation (LLM/infra failure → silent PASS).
         state["bineval_degraded"] = True
         _reset_verify_success(state)
         return 0
@@ -1461,7 +1461,7 @@ def _build_pr_body(
     contract, never this string.
 
     When BinEval degraded to PASS on an infrastructure failure, a visible
-    notice is appended (ADR-0037 #7) so a human reviewer sees the PR was not
+    notice is appended so a human reviewer sees the PR was not
     semantically graded — a correlated outage could otherwise hide bad code.
     """
     sections: list[str] = [f"Closes #{issue_num}", ""]
@@ -1501,7 +1501,7 @@ def _build_pr_body(
         )
     sections.append("")
 
-    # BinEval degradation notice (ADR-0037 #7): only surfaced when the soft
+    # BinEval degradation notice: only surfaced when the soft
     # gate degraded to PASS on an infrastructure failure. A genuine grade (PASS
     # or FAIL) produces no notice.
     if bineval_degraded:
@@ -1969,7 +1969,7 @@ def merge_node(state: AgentState) -> AgentState:
             # Derive actionable from the parsed verdicts dict (any FAIL /
             # NEEDS REVIEW) rather than the failure_reason log-message prefix,
             # so the signal survives wording changes to failure_reason
-            # (ADR-0037 #9 quick win).
+            # (quick win).
             actionable = verdict_review_body is not None and any(
                 v in ("FAIL", "NEEDS REVIEW") for v in verdicts.values()
             )

@@ -87,7 +87,7 @@ def _truncate_output(output: str) -> str:
     Single source of truth for command-output truncation, shared by
     ``run_command`` (Worker tool) and ``verify_node`` (orchestrator). Enforces
     the 150-line cap with a first-30 + last-100 window, then the 10 KB byte cap
-    on the (possibly already line-truncated) result. ADR-0037/#5 unified this
+    on the (possibly already line-truncated) result. This was unified
     so both surfaces apply the same bounds and the prior ``<= 130`` special case
     (which let oversized-but-short output pass untruncated) is gone.
     """
@@ -117,7 +117,7 @@ def _state_lock():
     """Exclusive flock on a dedicated lock file beside state.json.
 
     Guards the load→mutate→save critical section in read_file/patch_file
-    (ADR-0037 #6) against parallel tool calls: create_react_agent runs a batch
+    against parallel tool calls: create_react_agent runs a batch
     of tool calls concurrently, and two concurrent read_file/patch_file calls
     racing on state.json could lose a read-range mutation. The lock is held on
     a sidecar ``.lock`` file (not state.json itself) so it does not interfere
@@ -319,7 +319,7 @@ def read_file(
     # Register the read range in orchestrator state (range-scoped Read-Before-Edit, ADR-0033).
     # state.load() normalizes legacy list read_files to {}, so curr_state["read_files"] is a dict.
     # The load→mutate→save critical section is guarded by an exclusive flock
-    # (ADR-0037 #6) so two concurrent tool calls cannot lose a read-range
+    # so two concurrent tool calls cannot lose a read-range
     # mutation (create_react_agent runs a batch of tool calls concurrently).
     try:
         with _state_lock():
@@ -648,7 +648,7 @@ def run_command(command: str) -> str:
     elif not output and timed_out:
         return "Error: Command timed out after 300 seconds with no output."
 
-    # Unified truncation (ADR-0037 #5): 150-line + 10 KB byte cap, shared with
+    # Unified truncation: 150-line + 10 KB byte cap, shared with
     # verify_node via _truncate_output. The prior `<= 130` special case (which
     # let oversized-but-short output pass untruncated) is removed.
     output = _truncate_output(output)

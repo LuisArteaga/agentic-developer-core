@@ -629,7 +629,7 @@ class TestCodebaseTools(unittest.TestCase):
             args=["echo"], returncode=0, stdout=mock_stdout
         )
         res = run_command("echo hi")
-        # Unified truncation (ADR-0037 #5): 150-line cap with a first-30 +
+        # Unified truncation: 150-line cap with a first-30 +
         # last-100 window. The old "<= 130 lines" special case is gone.
         self.assertIn("Output truncated", res)
         self.assertIn("exceeded 150 lines", res)

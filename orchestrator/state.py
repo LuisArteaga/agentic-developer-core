@@ -41,7 +41,7 @@ class AgentState(TypedDict):
     # durable schema field beyond the optional defaults below.
     error: str | None
     # Set by the BinEval soft gate when it degraded to PASS on an
-    # infrastructure failure (ADR-0037 #7): a correlated outage could otherwise
+    # infrastructure failure: a correlated outage could otherwise
     # hide bad code behind a silent PASS. Surfaced in the PR body so a human
     # reviewer sees the PR was not semantically graded.
     bineval_degraded: bool | None
@@ -122,7 +122,7 @@ def save(state: AgentState, filepath: str | Path | None = None) -> None:
     try:
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
-            # Power-loss durability (ADR-0037 #6): flush the Python buffer and
+            # Power-loss durability: flush the Python buffer and
             # fsync the file descriptor so the bytes reach stable storage before
             # the atomic replace. Without this, a crash between write and
             # os.replace could leave a torn state.json that breaks Stateful Resume.
