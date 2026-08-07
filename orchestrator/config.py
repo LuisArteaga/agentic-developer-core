@@ -7,6 +7,8 @@ from typing import Any
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
+from orchestrator.openrouter_chat import OpenRouterAnnotationChatOpenAI
+
 logger = logging.getLogger("orchestrator.config")
 
 # Hardcoded fallback used when factory.json is missing/malformed or a node is
@@ -187,7 +189,7 @@ def get_chat_model_from_config(cfg: dict[str, Any]) -> ChatOpenAI:
     if options:
         extra_body.update(options)
 
-    return ChatOpenAI(
+    return OpenRouterAnnotationChatOpenAI(
         model=model_name,
         api_key=SecretStr(api_key),
         base_url="https://openrouter.ai/api/v1",

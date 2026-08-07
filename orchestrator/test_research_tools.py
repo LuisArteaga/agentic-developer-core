@@ -5,13 +5,9 @@ from unittest.mock import MagicMock, patch
 
 from orchestrator.research_tools import (
     MAX_FETCH_CHARS,
-    MAX_SNIPPET_CHARS,
     _PinnedHTTPConnection,
     _PinnedHTTPSConnection,
     _build_search_tool_parameters,
-    _coerce_text,
-    _extract_json_block,
-    _parse_search_results,
     _pin_url,
     _resolve_validated_ip,
     fetch_url,
@@ -59,97 +55,29 @@ class TestBuildSearchToolParameters(unittest.TestCase):
         self.assertNotIn("allowed_domains", params)
 
 
-class TestExtractJsonBlock(unittest.TestCase):
-    def test_fenced_json_block(self):
-        text = 'Some prose.\n```json\n[{"title": "T", "url": "u", "snippet": "s"}]\n```\nDone.'
-        self.assertEqual(
-            _extract_json_block(text),
-            '[{"title": "T", "url": "u", "snippet": "s"}]',
-        )
-
-    def test_bare_array_fallback(self):
-        text = 'Results: [{"title": "T", "url": "u"}] end'
-        self.assertEqual(_extract_json_block(text), '[{"title": "T", "url": "u"}]')
-
-    def test_returns_text_when_no_block(self):
-        self.assertEqual(_extract_json_block("[1, 2]"), "[1, 2]")
-
-
-class TestCoerceText(unittest.TestCase):
-    def test_str_passthrough(self):
-        self.assertEqual(_coerce_text("hello"), "hello")
-
-    def test_list_of_text_blocks(self):
-        self.assertEqual(
-            _coerce_text(
-                [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
-            ),
-            "ab",
-        )
-
-    def test_list_with_str_entries(self):
-        self.assertEqual(_coerce_text(["x", "y"]), "xy")
-
-    def test_none(self):
-        self.assertEqual(_coerce_text(None), "")
-
-    def test_other_type(self):
-        self.assertEqual(_coerce_text(123), "123")
-
-
-class TestParseSearchResults(unittest.TestCase):
-    def test_parses_valid_list(self):
-        text = '```json\n[{"title": "T1", "url": "u1", "snippet": "s1"}]\n```'
-        results = _parse_search_results(text)
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0], {"title": "T1", "url": "u1", "snippet": "s1"})
-
-    def test_truncates_long_snippets(self):
-        long_snippet = "x" * (MAX_SNIPPET_CHARS + 50)
-        text = json.dumps([{"title": "T", "url": "u", "snippet": long_snippet}])
-        results = _parse_search_results(text)
-        self.assertEqual(len(results), 1)
-        self.assertLessEqual(len(results[0]["snippet"]), MAX_SNIPPET_CHARS)
-        self.assertTrue(results[0]["snippet"].endswith("..."))
-
-    def test_exactly_at_limit_not_truncated(self):
-        snippet = "x" * MAX_SNIPPET_CHARS
-        text = json.dumps([{"title": "T", "url": "u", "snippet": snippet}])
-        results = _parse_search_results(text)
-        self.assertEqual(len(results[0]["snippet"]), MAX_SNIPPET_CHARS)
-
-    def test_filters_items_without_url(self):
-        text = json.dumps(
-            [
-                {"title": "T", "url": "u", "snippet": "s"},
-                {"title": "NoUrl", "snippet": "s"},
-            ]
-        )
-        results = _parse_search_results(text)
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["url"], "u")
-
-    def test_defaults_title_when_missing(self):
-        text = json.dumps([{"url": "u", "snippet": "s"}])
-        results = _parse_search_results(text)
-        self.assertEqual(results[0]["title"], "No Title")
-
-    def test_invalid_json_returns_empty(self):
-        self.assertEqual(_parse_search_results("not json at all"), [])
-
-    def test_non_list_json_returns_empty(self):
-        self.assertEqual(_parse_search_results('{"a": 1}'), [])
-
-    def test_empty_list(self):
-        self.assertEqual(_parse_search_results("[]"), [])
-
-
 class TestWebSearchTool(unittest.TestCase):
-    """End-to-end behavior of the web_search @tool with the LLM mocked."""
+    """End-to-end behavior of the web_search @tool with the LLM mocked.
 
-    def _make_response(self, content):
+    Results are derived from ``url_citation`` annotations captured into
+    ``response.additional_kwargs["annotations"]`` (ADR-0039), not from a
+    model-synthesized JSON block.
+    """
+
+    @staticmethod
+    def _url_citation(url, title="T", content="s"):
+        """Build a raw url_citation annotation dict as it appears after the
+        openai SDK's ``model_dump`` (start/end indices are irrelevant to
+        ``_extract_url_citations`` and omitted)."""
+        return {
+            "type": "url_citation",
+            "url_citation": {"title": title, "url": url, "content": content},
+        }
+
+    def _make_response(self, annotations):
+        """Build a mock LLM response whose ``additional_kwargs`` carries the
+        given raw annotations list (a real dict so ``.get`` works)."""
         resp = MagicMock()
-        resp.content = content
+        resp.additional_kwargs = {"annotations": annotations}
         return resp
 
     def _patch_stack(self, response, sources=None):
@@ -184,14 +112,14 @@ class TestWebSearchTool(unittest.TestCase):
         self.assertIn("Search the web", web_search.description)
 
     def test_returns_json_results(self):
-        response = self._make_response(
-            '```json\n[{"title": "T", "url": "https://e.com", "snippet": "s"}]\n```'
-        )
+        response = self._make_response([self._url_citation("https://e.com", "T", "s")])
         p_load, p_resolve, p_chat, llm, bound = self._patch_stack(response)
         with p_load, p_resolve, p_chat:
             out = web_search.invoke({"query": "langgraph create_react_agent"})
         parsed = json.loads(out)
         self.assertEqual(parsed[0]["url"], "https://e.com")
+        self.assertEqual(parsed[0]["title"], "T")
+        self.assertEqual(parsed[0]["snippet"], "s")
         # tool_choice forced to guarantee execution
         self.assertEqual(
             llm.bind.call_args.kwargs["tool_choice"],
@@ -203,19 +131,42 @@ class TestWebSearchTool(unittest.TestCase):
         )
         bound.invoke.assert_called_once()
 
-    def test_no_results_returns_clear_message(self):
-        response = self._make_response("```json\n[]\n```")
+    def test_sends_only_human_message(self):
+        """ADR-0039: no SystemMessage is sent (forced tool_choice guarantees
+        execution); only the HumanMessage carrying the query is sent."""
+        response = self._make_response([self._url_citation("https://e.com")])
+        p_load, p_resolve, p_chat, llm, bound = self._patch_stack(response)
+        with p_load, p_resolve, p_chat:
+            web_search.invoke({"query": "q"})
+        messages = bound.invoke.call_args.args[0]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].content, "Search Query: q")
+
+    def test_no_url_citations_returns_honest_signal(self):
+        """Annotations present but none are url_citation (e.g. only a 'file'
+        type) -> honest 'no url_citation annotations' signal, distinct from a
+        genuine results list and from an exception."""
+        response = self._make_response([{"type": "file", "file": {"url": "x"}}])
         p_load, p_resolve, p_chat, llm, bound = self._patch_stack(response)
         with p_load, p_resolve, p_chat:
             out = web_search.invoke({"query": "obscure query xyz"})
-        self.assertEqual(out, "No search results found for query: obscure query xyz")
+        self.assertEqual(
+            out,
+            "web_search failed: no url_citation annotations in response for "
+            "query: 'obscure query xyz'",
+        )
 
-    def test_unparseable_output_returns_no_results(self):
-        response = self._make_response("I could not search.")
+    def test_no_annotations_returns_honest_signal(self):
+        """Empty annotations list -> same honest signal (search produced no
+        citable results)."""
+        response = self._make_response([])
         p_load, p_resolve, p_chat, llm, bound = self._patch_stack(response)
         with p_load, p_resolve, p_chat:
             out = web_search.invoke({"query": "q"})
-        self.assertEqual(out, "No search results found for query: q")
+        self.assertEqual(
+            out,
+            "web_search failed: no url_citation annotations in response for query: 'q'",
+        )
 
     def test_invocation_error_returns_error_message(self):
         bound = MagicMock()
@@ -245,18 +196,20 @@ class TestWebSearchTool(unittest.TestCase):
         self.assertIn("boom", out)
 
     def test_strict_mode_passes_allowed_domains_in_user_message(self):
-        response = self._make_response("```json\n[]\n```")
+        response = self._make_response([self._url_citation("https://e.com")])
         sources = SourcesConfig(strict=True, domains=["arxiv.org"])
         p_load, p_resolve, p_chat, llm, bound = self._patch_stack(response, sources)
         with p_load, p_resolve, p_chat:
             web_search.invoke({"query": "q"})
-        # The HumanMessage content should mention the strict allowed domains.
-        human_msg = bound.invoke.call_args.args[0][1]
-        self.assertIn("Allowed Domains", human_msg.content)
-        self.assertIn("arxiv.org", human_msg.content)
+        # Only a HumanMessage is sent; its content should mention the strict
+        # allowed domains.
+        messages = bound.invoke.call_args.args[0]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Allowed Domains", messages[0].content)
+        self.assertIn("arxiv.org", messages[0].content)
 
     def test_strict_allowed_domains_added_to_tool_parameters(self):
-        response = self._make_response("```json\n[]\n```")
+        response = self._make_response([self._url_citation("https://e.com")])
         sources = SourcesConfig(strict=True, domains=["arxiv.org"])
         p_load, p_resolve, p_chat, llm, bound = self._patch_stack(response, sources)
         with p_load, p_resolve, p_chat:

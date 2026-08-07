@@ -6,11 +6,16 @@ the Execute phase, both sharing ``config/sources.toml`` (issues #38, #40):
 * ``web_search`` — a structured-output wrapper around OpenRouter's server-side
   ``openrouter:web_search`` tool. Binds the tool to a cheap flash model
   (resolved via ``resolve_model_config("web_search")``), forces ``tool_choice``
-  to guarantee search execution, instructs the model to append a JSON block of
-  results, and parses it into ``[{title, url, snippet}]`` with snippets
-  truncated to 300 chars. Search runs server-side at OpenRouter, so SSRF risk is
-  near-zero (the tool makes no direct outbound HTTP to retrieved URLs — that is
-  the URL Fetch tool's job). Ported from agentic-planner-core's
+  to guarantee search execution, and derives results from the ``url_citation``
+  annotations OpenRouter attaches to the assistant message
+  (``message.annotations``). The annotations are captured by the
+  ``OpenRouterAnnotationChatOpenAI`` subclass returned by
+  ``get_chat_model_from_config`` (ADR-0039) — langchain-openai would otherwise
+  discard them in Chat Completions mode — and ``_extract_url_citations``
+  filters them into ``[{title, url, snippet}]`` with snippets truncated to 300
+  chars. Search runs server-side at OpenRouter, so SSRF risk is near-zero (the
+  tool makes no direct outbound HTTP to retrieved URLs — that is the URL Fetch
+  tool's job). Ported from agentic-planner-core's
   ``planner/nodes/web_search.py`` and ``planner/tools/research.py``
   (ADR-0009 Radical Simplicity).
 
@@ -27,41 +32,23 @@ import http.client
 import ipaddress
 import json
 import logging
-import re
 import socket
 import urllib.error
 import urllib.request
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 
 from orchestrator.config import get_chat_model_from_config, resolve_model_config
+from orchestrator.openrouter_chat import (
+    MAX_SNIPPET_CHARS as MAX_SNIPPET_CHARS,  # re-exported (single source of truth)
+    _extract_url_citations,
+)
 from orchestrator.sources_config import SourcesConfig, load_sources_config
 
 logger = logging.getLogger("orchestrator.research_tools")
-
-# Match planner-core: snippets are truncated to keep tool results concise and
-# bound the tokens injected back into the Worker's ReAct context.
-MAX_SNIPPET_CHARS = 300
-
-_SYSTEM_INSTRUCTION = (
-    "You are a technical researcher. You MUST use the openrouter:web_search tool "
-    "to execute a search for the requested query. Do not try to answer without using the tool.\n\n"
-    "After you perform the search and receive the results, synthesize your findings. "
-    "At the end of your response, you MUST append a JSON block representing the list of "
-    "search results you found. Snippets must be truncated to be concise "
-    f"(max {MAX_SNIPPET_CHARS} chars per snippet).\n\n"
-    "The JSON block must start with ```json and end with ```, and look exactly like this:\n"
-    "[\n"
-    "  {\n"
-    '    "title": "Result Title",\n'
-    '    "url": "http://example.com/result",\n'
-    f'    "snippet": "A brief summary of findings (max {MAX_SNIPPET_CHARS} chars)"\n'
-    "  }\n"
-    "]"
-)
 
 
 def _build_search_tool_parameters(sources: SourcesConfig) -> dict[str, Any]:
@@ -82,68 +69,6 @@ def _build_search_tool_parameters(sources: SourcesConfig) -> dict[str, Any]:
     if sp.excluded_domains:
         params["excluded_domains"] = list(sp.excluded_domains)
     return params
-
-
-def _extract_json_block(text: str) -> str:
-    """Extract a JSON array block from Markdown output.
-
-    Prefers a fenced ```json block; falls back to the first ``[...]`` array
-    pattern. Ported verbatim from planner/nodes/web_search.py.
-    """
-    match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    match = re.search(r"(\[.*\])", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
-
-
-def _coerce_text(content: Any) -> str:
-    """Coerce an LLM response ``content`` (str or list of content blocks) to a
-    single string for JSON extraction."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                parts.append(block)
-        return "".join(parts)
-    return str(content) if content is not None else ""
-
-
-def _parse_search_results(text_content: str) -> list[dict[str, str]]:
-    """Parse the model's structured JSON output into ``[{title, url, snippet}]``,
-    truncating snippets to ``MAX_SNIPPET_CHARS``. Returns ``[]`` on parse
-    failure or when the output is not a list of URL-bearing objects."""
-    results: list[dict[str, str]] = []
-    try:
-        json_text = _extract_json_block(text_content)
-        parsed = json.loads(json_text)
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.warning("Failed to parse web_search JSON output: %s", e)
-        return []
-
-    if not isinstance(parsed, list):
-        logger.warning("web_search JSON output was not a list: %r", type(parsed))
-        return []
-
-    for item in parsed:
-        if isinstance(item, dict) and "url" in item:
-            snippet = item.get("snippet", "")
-            if len(snippet) > MAX_SNIPPET_CHARS:
-                snippet = snippet[: MAX_SNIPPET_CHARS - 3] + "..."
-            results.append(
-                {
-                    "title": item.get("title", "No Title"),
-                    "url": item.get("url", ""),
-                    "snippet": snippet,
-                }
-            )
-    return results
 
 
 @tool
@@ -183,21 +108,26 @@ def web_search(query: str) -> str:
             f"{', '.join(sources.domains)}"
         )
 
+    # No SystemMessage is sent: the forced tool_choice below guarantees the
+    # model executes the search rather than answering from memory, so the
+    # JSON-block append instruction is no longer needed (ADR-0039). Results
+    # are derived from the url_citation annotations OpenRouter attaches to
+    # the assistant message, captured by OpenRouterAnnotationChatOpenAI.
     try:
-        response = llm_with_tools.invoke(
-            [
-                SystemMessage(content=_SYSTEM_INSTRUCTION),
-                HumanMessage(content=user_message),
-            ]
-        )
+        response = llm_with_tools.invoke([HumanMessage(content=user_message)])
     except Exception as e:
         logger.error("web_search invocation failed: %s", e)
         return f"Error executing web_search for query '{query}': {e}"
 
-    text_content = _coerce_text(response.content)
-    results = _parse_search_results(text_content)
+    annotations = response.additional_kwargs.get("annotations", [])
+    results = _extract_url_citations(annotations)
     if not results:
-        return f"No search results found for query: {query}"
+        # Honest signal: distinguishes "search produced no citable results"
+        # (may be broken or genuinely empty) from an exception during invoke.
+        return (
+            f"web_search failed: no url_citation annotations in response "
+            f"for query: '{query}'"
+        )
     return json.dumps(results, ensure_ascii=False)
 
 
