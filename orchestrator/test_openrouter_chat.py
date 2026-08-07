@@ -164,9 +164,14 @@ class TestOpenRouterAnnotationChat(unittest.TestCase):
         self.assertNotIn("annotations", out.generations[0].message.additional_kwargs)
 
     def test_guarded_when_more_choices_than_generations(self):
-        """If ``choices`` outnumbers ``generations`` (defensive), the override
-        must not raise IndexError — it bounds the injection to available
-        generations."""
+        """If ``choices`` outnumbers ``generations`` (a defensive anomaly — the
+        parent normally produces one generation per choice), the override bounds
+        the injection to available generations and does not raise IndexError.
+
+        Patches the parent to return a single-generation result despite two
+        choices, forcing the generation-bounds guard (``break``) to fire on the
+        second iteration — this is the only way to exercise that guard, since
+        the real parent always builds exactly one generation per choice."""
         anns = [_url_citation("https://a.com")]
         response = {
             "choices": [
@@ -189,8 +194,15 @@ class TestOpenRouterAnnotationChat(unittest.TestCase):
             ],
             "model": "m",
         }
-        # Should not raise.
-        result = self.llm._create_chat_result(response)
+        # Patch the parent to return only ONE generation despite two choices,
+        # so the override's generation-bounds guard triggers on the 2nd choice.
+        short_result = ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content="hi"))]
+        )
+        with patch.object(ChatOpenAI, "_create_chat_result", return_value=short_result):
+            # Should not raise IndexError.
+            result = self.llm._create_chat_result(response)
+        # The first (and only) generation got the annotations.
         self.assertEqual(
             result.generations[0].message.additional_kwargs["annotations"], anns
         )
