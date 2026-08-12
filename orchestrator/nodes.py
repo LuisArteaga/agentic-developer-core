@@ -9,7 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Literal, Mapping, cast
+from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, Field
 
@@ -617,6 +617,53 @@ def _get_directory_tree(workspace_path: Path) -> str:
     return "\n".join(lines) if lines else "(empty directory)"
 
 
+def _extract_structured_output(
+    raw_result: dict, schema_name: str
+) -> tuple[Any, str | None]:
+    """Extract the parsed result from an ``include_raw=True`` structured
+    output dict, logging ``finish_reason`` when parsing failed.
+
+    Returns ``(parsed, finish_reason)``. On success, ``parsed`` is the
+    Pydantic model and ``finish_reason`` is the raw response's
+    ``finish_reason`` (or ``None`` if unavailable). On parse failure,
+    ``parsed`` is ``None``, ``finish_reason`` is logged, and the value is
+    also returned so callers may include it in error messages.
+    """
+    parsed = raw_result.get("parsed")
+    parsing_error = raw_result.get("parsing_error")
+    raw_msg = raw_result.get("raw")
+    finish_reason: str | None = None
+    if raw_msg is not None:
+        metadata = getattr(raw_msg, "response_metadata", None) or {}
+        finish_reason = metadata.get("finish_reason")
+    if parsing_error is not None:
+        logger.warning(
+            "%s structured output parse failed (finish_reason=%s): %s",
+            schema_name,
+            finish_reason or "unknown",
+            parsing_error,
+        )
+    return parsed, finish_reason
+
+
+def _invoke_structured_with_raw(
+    structured_llm,
+    prompt: str,
+    schema_name: str,
+    invoke_config: Any = None,
+) -> tuple[Any, str | None]:
+    """Invoke a structured-output LLM (built with ``include_raw=True``) and
+    extract the parsed result, logging ``finish_reason`` when parsing fails.
+
+    Convenience wrapper: invokes, then delegates to
+    :func:`_extract_structured_output`. API-level failures (network, auth,
+    rate-limit) still raise from ``invoke()`` — ``include_raw`` only
+    suppresses *parsing* errors.
+    """
+    raw_result = structured_llm.invoke(prompt, config=invoke_config)
+    return _extract_structured_output(raw_result, schema_name)
+
+
 def plan_node(state: AgentState) -> AgentState:
     """Uses the LLM with structured output to analyze the claimed issue and generate a step-by-step plan.
 
@@ -685,7 +732,9 @@ def plan_node(state: AgentState) -> AgentState:
         # (max_retries and timeout are set in get_chat_model_from_config)
         llm = get_chat_model_from_config(cfg)
 
-        structured_llm = llm.with_structured_output(DevelopmentPlan)
+        structured_llm = llm.with_structured_output(
+            DevelopmentPlan, strict=True, include_raw=True
+        )
 
         # Run Observability (ADR-0029): capture planning tokens from the
         # structured-output invoke. ``.with_structured_output()`` returns a
@@ -721,12 +770,13 @@ def plan_node(state: AgentState) -> AgentState:
         )
 
         logger.info("Invoking LLM for structured planning...")
-        plan_obj = cast(
-            DevelopmentPlan, structured_llm.invoke(prompt, config=invoke_config)
+        plan_obj, finish_reason = _invoke_structured_with_raw(
+            structured_llm, prompt, "DevelopmentPlan", invoke_config
         )
 
         if not plan_obj or not getattr(plan_obj, "tasks", None):
-            raise ValueError("LLM returned an empty or invalid plan.")
+            detail = f" (finish_reason={finish_reason})" if finish_reason else ""
+            raise ValueError(f"LLM returned an empty or invalid plan.{detail}")
 
         # 7. Plan Detail Request — bounded follow-up (ADR-0024)
         # If the planner requested outlines for truncated files, fetch them
@@ -747,14 +797,16 @@ def plan_node(state: AgentState) -> AgentState:
                     f"Using the additional outlines above, revise your plan with improved accuracy."
                 )
                 logger.info("Re-invoking LLM with enriched context...")
-                plan_obj = cast(
-                    DevelopmentPlan,
-                    structured_llm.invoke(prompt, config=invoke_config),
+                plan_obj, finish_reason = _invoke_structured_with_raw(
+                    structured_llm, prompt, "DevelopmentPlan", invoke_config
                 )
 
                 if not plan_obj or not getattr(plan_obj, "tasks", None):
+                    detail = (
+                        f" (finish_reason={finish_reason})" if finish_reason else ""
+                    )
                     raise ValueError(
-                        "LLM returned an empty or invalid plan after Plan Detail Request."
+                        f"LLM returned an empty or invalid plan after Plan Detail Request.{detail}"
                     )
 
         # 8. Validate target files in the generated plan for safety (path traversal / sensitive files)
@@ -1069,8 +1121,10 @@ def _run_bineval(
     try:
         cfg = resolve_model_config("bin_eval")
         llm = get_chat_model_from_config(cfg)
-        structured_llm = llm.with_structured_output(BinEvalResult)
-        result = cast(BinEvalResult, structured_llm.invoke(prompt))
+        structured_llm = llm.with_structured_output(
+            BinEvalResult, strict=True, include_raw=True
+        )
+        raw_result = structured_llm.invoke(prompt)
     except Exception as e:
         logger.warning(
             "BinEval LLM call failed (%s); treating as PASS (soft gate, "
@@ -1078,6 +1132,8 @@ def _run_bineval(
             e,
         )
         return None
+
+    result, _ = _extract_structured_output(raw_result, "BinEvalResult")
 
     if not result or not getattr(result, "checks", None):
         logger.warning(

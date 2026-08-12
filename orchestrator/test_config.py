@@ -134,6 +134,71 @@ class TestResolveModelConfig(unittest.TestCase):
         self.assertEqual(cfg["temperature"], 0.0)
 
     @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_factory_resolution_passes_max_tokens(self, mock_load):
+        """max_tokens from factory.json is passed through in the factory path."""
+        mock_load.return_value = {
+            "plan": {
+                "model": "deepseek/deepseek-v4-flash",
+                "routing": ["DeepInfra"],
+                "temperature": 0.0,
+                "max_tokens": 8192,
+            }
+        }
+        cfg = resolve_model_config("plan")
+        self.assertEqual(cfg["max_tokens"], 8192)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_factory_resolution_no_max_tokens_defaults_none(self, mock_load):
+        """Absent max_tokens in factory.json resolves to None."""
+        mock_load.return_value = {
+            "plan": {
+                "model": "deepseek/deepseek-v4-flash",
+                "routing": ["DeepInfra"],
+                "temperature": 0.0,
+            }
+        }
+        cfg = resolve_model_config("plan")
+        self.assertIsNone(cfg["max_tokens"])
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_env_override_inherits_max_tokens_when_model_matches(self, mock_load):
+        """When the override model matches the factory entry, max_tokens is inherited."""
+        mock_load.return_value = {
+            "plan": {
+                "model": "shared-model",
+                "routing": ["X"],
+                "temperature": 0.7,
+                "max_tokens": 4096,
+            }
+        }
+        os.environ["PLAN_MODEL"] = "shared-model"
+        cfg = resolve_model_config("plan")
+        self.assertEqual(cfg["max_tokens"], 4096)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_env_override_max_tokens_none_when_model_differs(self, mock_load):
+        """When the override model differs from factory, max_tokens is None."""
+        mock_load.return_value = {
+            "plan": {
+                "model": "factory-model",
+                "routing": ["X"],
+                "temperature": 0.9,
+                "max_tokens": 8192,
+            }
+        }
+        os.environ["PLAN_MODEL"] = "different-model"
+        cfg = resolve_model_config("plan")
+        self.assertIsNone(cfg["max_tokens"])
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_hardcoded_fallback_max_tokens_is_none(self, mock_load):
+        """Hardcoded default path has max_tokens=None."""
+        mock_load.return_value = {}
+        cfg = resolve_model_config("plan")
+        self.assertEqual(cfg["model"], DEFAULT_MODEL)
+        self.assertIsNone(cfg["max_tokens"])
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
     def test_agent_model_fallback(self, mock_load):
         """AGENT_MODEL is the fallback for all nodes when no node-specific var is set."""
         mock_load.return_value = {
@@ -457,6 +522,31 @@ class TestGetChatModelFromConfig(unittest.TestCase):
         llm = get_chat_model_from_config(cfg)
         self.assertEqual(llm.max_retries, LLM_MAX_RETRIES)
 
+    def test_max_tokens_passed_through(self):
+        """max_tokens from the config reaches the ChatOpenAI instance."""
+        cfg = {
+            "model": "test-model",
+            "routing": None,
+            "temperature": 0.0,
+            "options": None,
+            "max_tokens": 8192,
+        }
+        llm = get_chat_model_from_config(cfg)
+        self.assertEqual(llm.max_tokens, 8192)
+
+    def test_max_tokens_none_not_passed(self):
+        """When max_tokens is None, the constructor uses the model/provider default."""
+        cfg = {
+            "model": "test-model",
+            "routing": None,
+            "temperature": 0.0,
+            "options": None,
+            "max_tokens": None,
+        }
+        llm = get_chat_model_from_config(cfg)
+        # ChatOpenAI defaults max_tokens to NotGiven (not set) when not passed.
+        self.assertNotEqual(llm.max_tokens, 8192)
+
     def test_timeout_set(self):
         """The LLM client has a request_timeout to prevent indefinite hangs on OpenRouter."""
         from orchestrator.config import LLM_TIMEOUT
@@ -527,6 +617,23 @@ class TestRealFactoryJson(unittest.TestCase):
             self.assertGreater(
                 len(cfg["routing"]), 0, f"{node} routing should be non-empty"
             )
+
+    def test_plan_has_max_tokens(self):
+        """The plan node has explicit max_tokens in the shipped factory.json."""
+        cfg = resolve_model_config("plan")
+        self.assertIsNotNone(cfg["max_tokens"])
+        self.assertGreater(cfg["max_tokens"], 0)
+
+    def test_bin_eval_has_max_tokens(self):
+        """The bin_eval node has explicit max_tokens in the shipped factory.json."""
+        cfg = resolve_model_config("bin_eval")
+        self.assertIsNotNone(cfg["max_tokens"])
+        self.assertGreater(cfg["max_tokens"], 0)
+
+    def test_execute_has_no_max_tokens(self):
+        """Non-structured-output nodes (execute) do not set max_tokens."""
+        cfg = resolve_model_config("execute")
+        self.assertIsNone(cfg["max_tokens"])
 
     def test_default_routing_covers_all_nodes(self):
         """The DEFAULT_ROUTING fallback map covers every known node name."""
