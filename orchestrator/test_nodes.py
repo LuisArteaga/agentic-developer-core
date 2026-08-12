@@ -18,6 +18,17 @@ from orchestrator.nodes import (
 from orchestrator.state import DEFAULT_STATE, AgentState
 
 
+def _raw_structured_response(parsed, finish_reason="stop", parsing_error=None):
+    """Build an include_raw=True structured-output dict for test mocks.
+
+    Mirrors the dict shape returned by LangChain's
+    ``with_structured_output(..., include_raw=True).invoke(...)``.
+    """
+    raw_msg = MagicMock()
+    raw_msg.response_metadata = {"finish_reason": finish_reason}
+    return {"raw": raw_msg, "parsed": parsed, "parsing_error": parsing_error}
+
+
 class TestClaimNode(unittest.TestCase):
     def setUp(self):
         # Create temp directory for workspace
@@ -434,7 +445,7 @@ class TestPlanNode(unittest.TestCase):
                 ),
             ],
         )
-        mock_structured_llm.invoke.return_value = mock_plan
+        mock_structured_llm.invoke.return_value = _raw_structured_response(mock_plan)
 
         # Setup initial state with some pre-existing read_files to verify it gets reset per ADR-0006
         state = DEFAULT_STATE.copy()
@@ -582,7 +593,9 @@ class TestPlanNode(unittest.TestCase):
                 )
             ],
         )
-        mock_structured_llm.invoke.return_value = mock_malicious_plan
+        mock_structured_llm.invoke.return_value = _raw_structured_response(
+            mock_malicious_plan
+        )
 
         # Setup initial state
         state = DEFAULT_STATE.copy()
@@ -682,7 +695,10 @@ class TestPlanNode(unittest.TestCase):
                 )
             ],
         )
-        mock_structured_llm.invoke.side_effect = [first_plan, second_plan]
+        mock_structured_llm.invoke.side_effect = [
+            _raw_structured_response(first_plan),
+            _raw_structured_response(second_plan),
+        ]
 
         # Create the requested file so build_outlines_for_files returns content
         (self.workspace_dir / "src").mkdir(exist_ok=True)
@@ -734,7 +750,7 @@ class TestPlanNode(unittest.TestCase):
                 )
             ],
         )
-        mock_structured_llm.invoke.return_value = mock_plan
+        mock_structured_llm.invoke.return_value = _raw_structured_response(mock_plan)
 
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -751,6 +767,81 @@ class TestPlanNode(unittest.TestCase):
 
         plan = DevelopmentPlan(rationale="test", tasks=[])
         self.assertEqual(plan.requested_files, [])
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_plan_node_with_structured_output_uses_strict_and_include_raw(
+        self, mock_github_api, mock_get_chat_model
+    ):
+        """AC: with_structured_output is called with strict=True and include_raw=True."""
+        from orchestrator.nodes import DevelopmentPlan, PlanningTask
+
+        mock_github_api.return_value = {"title": "t", "body": "b"}
+
+        mock_llm = unittest.mock.MagicMock()
+        mock_structured_llm = unittest.mock.MagicMock()
+        mock_get_chat_model.return_value = mock_llm
+        mock_llm.with_structured_output.return_value = mock_structured_llm
+
+        mock_plan = DevelopmentPlan(
+            rationale="r",
+            tasks=[
+                PlanningTask(
+                    step_number=1,
+                    action="patch",
+                    description="d",
+                    target_files=["a.py"],
+                )
+            ],
+        )
+        mock_structured_llm.invoke.return_value = _raw_structured_response(mock_plan)
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state_module.save(state)
+
+        plan_node(state)
+
+        mock_llm.with_structured_output.assert_called_once_with(
+            DevelopmentPlan, strict=True, include_raw=True
+        )
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_plan_node_parse_failure_logs_finish_reason(
+        self, mock_github_api, mock_get_chat_model
+    ):
+        """AC: parse-failure log includes finish_reason; plan failure still
+        routes to recovery (status=failed)."""
+        from orchestrator.nodes import DevelopmentPlan
+
+        mock_github_api.return_value = {"title": "t", "body": "b"}
+
+        mock_llm = unittest.mock.MagicMock()
+        mock_structured_llm = unittest.mock.MagicMock()
+        mock_get_chat_model.return_value = mock_llm
+        mock_llm.with_structured_output.return_value = mock_structured_llm
+
+        # Simulate a truncation: parsed is None, parsing_error set, finish_reason=length.
+        mock_structured_llm.invoke.return_value = _raw_structured_response(
+            None, finish_reason="length", parsing_error=ValueError("truncated JSON")
+        )
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state_module.save(state)
+
+        result = plan_node(state)
+
+        # Failure still routes to recovery (ADR-0038).
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["phase"], "planning")
+        # finish_reason appears in the error message.
+        self.assertIn("length", result["error"] or "")
+        # finish_reason is logged.
+        mock_llm.with_structured_output.assert_called_once_with(
+            DevelopmentPlan, strict=True, include_raw=True
+        )
 
 
 class TestExecuteNode(unittest.TestCase):
@@ -1492,13 +1583,14 @@ class TestBinEvalHelpers(unittest.TestCase):
 
     def _fake_llm(self, invoke_return):
         """Build a fake LLM whose invoke() captures its prompt and returns the
-        configured value, mimicking with_structured_output(...).invoke(prompt).
+        configured value wrapped in an include_raw=True dict, mimicking
+        with_structured_output(..., include_raw=True).invoke(prompt).
         """
         captured = {}
 
         def invoke(prompt):
             captured["prompt"] = prompt
-            return invoke_return
+            return _raw_structured_response(invoke_return)
 
         llm = unittest.mock.MagicMock()
         structured = unittest.mock.MagicMock()
@@ -1613,6 +1705,48 @@ class TestBinEvalHelpers(unittest.TestCase):
         llm, _ = self._fake_llm(BinEvalResult(checks=[], summary="empty"))
         mock_get_llm.return_value = llm
 
+        self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_uses_strict_and_include_raw(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC: with_structured_output is called with strict=True and include_raw=True."""
+        from orchestrator.nodes import BinEvalResult, _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm, _ = self._fake_llm(_all_pass_result())
+        mock_get_llm.return_value = llm
+
+        _run_bineval("issue body", "plan", "diff", "ADR TEXT")
+
+        llm.with_structured_output.assert_called_once_with(
+            BinEvalResult, strict=True, include_raw=True
+        )
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_parse_failure_returns_none(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC: BinEval truncation is distinguishable from soft-gate PASS —
+        parse failure (finish_reason=length) returns None (soft-gate PASS)
+        but the finish_reason is logged."""
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m"}
+        llm = unittest.mock.MagicMock()
+        structured = unittest.mock.MagicMock()
+        structured.invoke.return_value = _raw_structured_response(
+            None, finish_reason="length", parsing_error=ValueError("truncated")
+        )
+        llm.with_structured_output.return_value = structured
+        mock_get_llm.return_value = llm
+
+        # Parse failure still soft-gates to PASS (returns None).
         self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
 
 

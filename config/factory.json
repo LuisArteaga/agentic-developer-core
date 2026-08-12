@@ -2,7 +2,8 @@
   "plan": {
     "model": "deepseek/deepseek-v4-flash",
     "routing": ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
-    "temperature": 0.0
+    "temperature": 0.0,
+    "max_tokens": 8192
   },
   "test_writer": {
     "model": "moonshotai/kimi-k2.7-code",
@@ -47,6 +48,7 @@
   "bin_eval": {
     "model": "deepseek/deepseek-v4-flash",
     "routing": ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
-    "temperature": 0.0
+    "temperature": 0.0,
+    "max_tokens": 4096
   }
 }

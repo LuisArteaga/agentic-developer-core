@@ -529,7 +529,10 @@ class TestPlanNodeTokenCapture(unittest.TestCase):
                         ]
                     )
                 )
-            return plan
+            # include_raw=True returns a dict with raw/parsed/parsing_error.
+            raw_msg = MagicMock()
+            raw_msg.response_metadata = {"finish_reason": "stop"}
+            return {"raw": raw_msg, "parsed": plan, "parsing_error": None}
 
         mock_structured_llm.invoke.side_effect = fake_invoke
 

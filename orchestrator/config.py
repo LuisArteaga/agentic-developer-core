@@ -125,14 +125,17 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
         if factory_cfg and factory_cfg.get("model") == overridden_model:
             temperature = factory_cfg.get("temperature", 0.0)
             options = factory_cfg.get("options")
+            max_tokens = factory_cfg.get("max_tokens")
         else:
             temperature = 0.0
             options = None
+            max_tokens = None
         return {
             "model": overridden_model,
             "routing": None,
             "temperature": temperature,
             "options": options,
+            "max_tokens": max_tokens,
             "fallback_model": factory_cfg.get("fallback_model")
             if factory_cfg
             else None,
@@ -145,6 +148,7 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
             "routing": factory_cfg.get("routing"),
             "temperature": factory_cfg.get("temperature", 0.0),
             "options": factory_cfg.get("options"),
+            "max_tokens": factory_cfg.get("max_tokens"),
             "fallback_model": factory_cfg.get("fallback_model"),
         }
 
@@ -159,6 +163,7 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
         "routing": DEFAULT_ROUTING.get(node_name),
         "temperature": 0.0,
         "options": None,
+        "max_tokens": None,
         "fallback_model": None,
     }
 
@@ -178,6 +183,7 @@ def get_chat_model_from_config(cfg: dict[str, Any]) -> ChatOpenAI:
     routing = cfg.get("routing")
     temperature = cfg.get("temperature", 0.0)
     options = cfg.get("options")
+    max_tokens = cfg.get("max_tokens")
 
     extra_body: dict[str, Any] = {}
 
@@ -198,4 +204,5 @@ def get_chat_model_from_config(cfg: dict[str, Any]) -> ChatOpenAI:
         max_retries=LLM_MAX_RETRIES,
         request_timeout=LLM_TIMEOUT,
         use_responses_api=False,
+        **({"max_tokens": max_tokens} if max_tokens is not None else {}),
     )
