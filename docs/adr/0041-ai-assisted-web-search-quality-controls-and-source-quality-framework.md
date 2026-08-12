@@ -102,13 +102,33 @@ Considered but deferred. Logging every search query and result to a dedicated au
 
 ## Inspiration & References
 
-- **CiteCheck: Retrieval-Grounded Detection of LLM Citation Hallucinations in Scientific Text** (arXiv:2605.27700, Khajavi et al., 2026) — Demonstrates that citation hallucination detection requires external retrieval, not parametric knowledge alone; even strong LLMs (GPT-class, Claude, Gemini) improve substantially when web search is enabled but still cannot match a retrieval-grounded framework. Directly informs Pillar 3's verification protocol. https://arxiv.org/html/2605.27700v1
-- **arXiv tightens policy on hallucinated references** (SMU Library, 2026) — Documents the scale of the problem: Zhao et al. audited 111 million references, estimated 146,932 hallucinated citations in 2025; GhostCite found a 1.07% rate at top-tier AI venues, an 80.9% jump. Establishes that hallucinated citations are a documented, growing systemic risk, not a one-off. https://library.smu.edu.sg/topics-insights/arxiv-tightens-policy-hallucinated-references
-- **Four Tiers of Sources** (Oregon State University, open.oregonstate.education) — The academic source-tier model adapted for Pillar 1: T1 peer-reviewed → T2 credible secondary → T3 community → T4 unverified. The principle that "if a Tier 3 source describes a study, find the original Tier 1 source" directly informs the T1 requirement for critical decisions. https://open.oregonstate.education/goodargument/chapter/four-tiers-of-sources
-- **Levels of evidence in research** (Elsevier Author Services) — The evidence hierarchy pyramid from systematic reviews down to expert opinion. Confirms the academic precedent for tiered source credibility frameworks. https://scientific-publishing.webshop.elsevier.com/research-process/levels-of-evidence-in-research
-- **How Perplexity Chooses Which Sources To Cite: 5 Key Signals** (Addlly, 2026) — Perplexity's cross-referencing approach: verifies information across multiple independent sources, looks for agreement patterns, favors sources with domain authority and editorial quality. Directly informs Pillar 3's "at least 2 independent sources" rule. https://addlly.ai/blog/how-perplexity-chooses-which-sources-to-cite
-- **Detect hallucinations for RAG-based systems** (AWS Machine Learning Blog) — RAG hallucination detection via embedding similarity, consistency checks across multiple generations, and citation verification. Confirms that "check how well the model's statements match what was actually found in the source documentation" is the canonical verification pattern. https://aws.amazon.com/blogs/machine-learning/detect-hallucinations-for-rag-based-systems
-- **Graceful Degradation Patterns in AI Agent Systems** (Zylos Research, 2026) — Establishes the principle that when capabilities are unavailable, agents should "enter a degraded mode with reduced but still useful capabilities" and explicitly categorize capabilities as essential vs. non-essential. Directly informs Pillar 2's fail-closed protocol. https://zylos.ai/research/2026-02-20-graceful-degradation-ai-agent-systems
-- **Reduce hallucinations when using search-grounded LLM responses** (Firecrawl) — "Require citations for every claim to create a verifiable chain from search result to output. Validate outputs against sources programmatically." Concise statement of the grounding principle underlying Pillar 3. https://www.firecrawl.dev/glossary/web-search-apis/reduce-hallucinations-search-grounded-llm-responses
-- **ADR-0039** (OpenRouter URL Citation Annotation Capture) — The in-codebase control that ensures the Worker Tool's `web_search` returns genuine citation data. This framework operates at the complementary meta-layer. `docs/adr/0039-openrouter-url-citation-annotation-capture-via-chatopenai-subclass.md`
-- **ADR-0026** (Web Search Worker Tool via OpenRouter Server-Side Search) — Established the server-side search approach and the honest error signal pattern (distinguishing "search broken" from "genuinely empty"). Pillar 2 extends this principle to the meta-layer. `docs/adr/0026-web-search-worker-tool-via-openrouter-server-side-search.md`
+- **CiteCheck: Retrieval-Grounded Detection of LLM Citation Hallucinations in Scientific Text** (Khajavi et al., 2026) — T1
+  https://arxiv.org/html/2605.27700v1
+  Accessed: 2026-07-14. Verified: fetched via web search; confirmed the macro-F1 improvement figures (62.7 → 73.1 for GPT-class with web search enabled) in §4. Directly informs Pillar 3's verification protocol — demonstrates that citation hallucination detection requires external retrieval, not parametric knowledge alone.
+- **arXiv tightens policy on hallucinated references** (SMU Library, 2026) — T2
+  https://library.smu.edu.sg/topics-insights/arxiv-tightens-policy-hallucinated-references
+  Accessed: 2026-07-14. Verified: fetched via web search; confirmed the Zhao et al. audit figures (111M references, 146,932 hallucinated citations in 2025) and GhostCite 1.07% rate. Cross-referenced with the CiteCheck paper's citation-integrity literature review. Establishes that hallucinated citations are a documented, growing systemic risk.
+- **Four Tiers of Sources** (Oregon State University, open.oregonstate.education) — T2
+  https://open.oregonstate.education/goodargument/chapter/four-tiers-of-sources
+  Accessed: 2026-07-14. Verified: fetched via web search; confirmed the T1–T4 tier definitions and the "find the original Tier 1 source" principle. The academic source-tier model adapted for Pillar 1.
+- **Levels of evidence in research** (Elsevier Author Services) — T2
+  https://scientific-publishing.webshop.elsevier.com/research-process/levels-of-evidence-in-research
+  Accessed: 2026-07-14. Verified: fetched via web search; confirmed the evidence hierarchy pyramid (systematic reviews → expert opinion). Cross-referenced with Oregon State's tier model. Confirms the academic precedent for tiered source credibility frameworks.
+- **How Perplexity Chooses Which Sources To Cite: 5 Key Signals** (Addlly, 2026) — T3
+  https://addlly.ai/blog/how-perplexity-chooses-which-sources-to-cite
+  Accessed: 2026-07-14. Verified: fetched via web search; confirmed the cross-referencing and agreement-pattern description. Directly informs Pillar 3's "at least 2 independent sources" rule.
+- **Detect hallucinations for RAG-based systems** (AWS Machine Learning Blog) — T2
+  https://aws.amazon.com/blogs/machine-learning/detect-hallucinations-for-rag-based-systems
+  Accessed: 2026-07-14. Verified: fetched via web search; confirmed the citation-verification and embedding-similarity detection methods. Confirms the canonical RAG verification pattern.
+- **Graceful Degradation Patterns in AI Agent Systems** (Zylos Research, 2026) — T3
+  https://zylos.ai/research/2026-02-20-graceful-degradation-ai-agent-systems
+  Accessed: 2026-07-14. Verified: fetched via web search; confirmed the "degraded mode with reduced but still useful capabilities" principle and essential/non-essential capability categorization. Directly informs Pillar 2's fail-closed protocol.
+- **Reduce hallucinations when using search-grounded LLM responses** (Firecrawl) — T3
+  https://www.firecrawl.dev/glossary/web-search-apis/reduce-hallucinations-search-grounded-llm-responses
+  Accessed: 2026-07-14. Verified: fetched via web search; confirmed the "require citations for every claim" and "validate outputs against sources programmatically" guidance. Concise statement of the grounding principle underlying Pillar 3.
+- **ADR-0039** (OpenRouter URL Citation Annotation Capture) — T1
+  `docs/adr/0039-openrouter-url-citation-annotation-capture-via-chatopenai-subclass.md`
+  Accessed: 2026-07-14. Verified: source code in repository; confirmed the annotation-capture subclass design and the honest error signal pattern. The in-codebase control that ensures the Worker Tool's `web_search` returns genuine citation data; this framework operates at the complementary meta-layer.
+- **ADR-0026** (Web Search Worker Tool via OpenRouter Server-Side Search) — T1
+  `docs/adr/0026-web-search-worker-tool-via-openrouter-server-side-search.md`
+  Accessed: 2026-07-14. Verified: source code in repository; confirmed the server-side search approach and the "search broken" vs "genuinely empty" distinction. Pillar 2 extends this honest-error-signal principle to the meta-layer.

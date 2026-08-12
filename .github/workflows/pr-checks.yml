@@ -41,6 +41,38 @@ jobs:
           pip install -e .[dev]
           pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp openinference-semantic-conventions
 
+      - name: Cache tree-sitter parsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: tree-sitter-${{ runner.os }}-py3.12-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            tree-sitter-${{ runner.os }}-py3.12-
+
+      - name: Prefetch tree-sitter parsers
+        # tree-sitter-language-pack downloads parser binaries at runtime from
+        # GitHub releases. In CI, a fresh checkout has no cache, and the
+        # releases endpoint can return 503 (rate-limiting/transient outage),
+        # causing cascading test failures in outline-dependent tests
+        # (ADR-0017). Prefetch the required languages (Python, TypeScript)
+        # with retries so tests have parsers available locally.
+        run: |
+          python3 -c "
+          import tree_sitter_language_pack as tsp
+          import time, sys
+          langs = ['python', 'tsx', 'typescript']
+          for attempt in range(3):
+              try:
+                  tsp.prefetch(languages=langs)
+                  print(f'Prefetched: {tsp.downloaded_languages()}')
+                  sys.exit(0)
+              except Exception as e:
+                  print(f'Attempt {attempt+1} failed: {e}')
+                  time.sleep(5)
+          print('ERROR: Failed to prefetch tree-sitter parsers after 3 attempts')
+          sys.exit(1)
+          "
+
       - name: Run secret scan
         run: python3 scripts/secret_scan.py
 
