@@ -27,6 +27,12 @@ _FORBIDDEN_DIRS = {".git", ".venv", ".agent_logs", ".agents", "node_modules"}
 # bypass a case-sensitive blocklist (ADR-0037 quick win).
 _FORBIDDEN_EXTENSIONS = (".pem", ".key", ".pkcs12", ".pfx")
 
+# Committed template/skeleton suffixes — safe even when the stem would
+# otherwise match a forbidden name (e.g. ``.env.example``).  These are
+# placeholder files that contain no real secrets and are explicitly meant
+# to be committed to version control (OWASP / dotenv convention).
+_SAFE_TEMPLATE_SUFFIXES = (".example", ".template", ".dist", ".sample")
+
 
 def is_safe_path(path_str: str) -> bool:
     """Verifies that a path is safe and does not point to sensitive configuration or credential files."""
@@ -42,7 +48,12 @@ def is_safe_path(path_str: str) -> bool:
             return False
         stem_lower = Path(part_lower).stem
         if part_lower in _FORBIDDEN_NAMES or stem_lower in _FORBIDDEN_NAMES:
-            return False
+            # Allow committed template variants (e.g. ``.env.example``)
+            # whose stem would otherwise match a forbidden name.  The
+            # forbidden-extension check below still runs, so a file like
+            # ``.env.example.key`` is still blocked.
+            if not part_lower.endswith(_SAFE_TEMPLATE_SUFFIXES):
+                return False
         if part_lower.endswith(_FORBIDDEN_EXTENSIONS):
             return False
 
