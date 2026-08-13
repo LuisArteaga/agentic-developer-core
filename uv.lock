@@ -17,6 +17,7 @@ dependencies = [
     { name = "langchain-core" },
     { name = "langchain-openai" },
     { name = "langgraph" },
+    { name = "python-dotenv" },
     { name = "tree-sitter-language-pack" },
 ]
 
@@ -42,6 +43,7 @@ requires-dist = [
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
     { name = "semgrep", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "tree-sitter-language-pack", specifier = ">=1.14.0" },

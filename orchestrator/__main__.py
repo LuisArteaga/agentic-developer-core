@@ -1,6 +1,8 @@
 import logging
 import sys
 
+from dotenv import load_dotenv
+
 from orchestrator import state as state_module
 from orchestrator.graph import graph
 from orchestrator.metrics import get_collector
@@ -21,6 +23,17 @@ def main():
     setup_logging()
     logger = logging.getLogger("orchestrator.main")
     logger.info("Initializing Orchestrator...")
+
+    # Load .env (issue #107) before anything reads target-repo environment
+    # variables (state_module.load reads AGENT_LOG_PATH; nodes read
+    # GITHUB_REPOSITORY/GITHUB_WORKSPACE). override=False (the default) so
+    # already-exported shell variables take precedence; .env only fills the
+    # gaps. This prevents the orchestrator from silently falling back to
+    # polling its own repository when target-repo env vars are not exported.
+    if load_dotenv():
+        logger.info(".env file loaded into environment.")
+    else:
+        logger.debug("No .env file found; relying on exported environment variables.")
 
     # Load state (handles resuming from state.json if present)
     state = state_module.load()

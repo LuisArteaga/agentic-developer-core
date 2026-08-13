@@ -198,6 +198,61 @@ def _remove_label(github_repo: str, issue_num: int, label: str) -> None:
         )
 
 
+def _parse_owner_repo_from_url(url: str) -> str:
+    """Parse an 'owner/repo' string from a git remote URL (SSH or HTTPS form)."""
+    # Parse owner/repo from SSH (git@github.com:owner/repo.git) or HTTPS (https://github.com/owner/repo.git)
+    if "github.com/" in url:
+        part = url.split("github.com/", 1)[1]
+    elif "github.com:" in url:
+        part = url.split("github.com:", 1)[1]
+    else:
+        # Fallback for other formats
+        part = url.split(":")[-1]
+
+    return part.removesuffix(".git")
+
+
+# Issue #107: dedup flag so the self-target warning fires at most once per
+# process, even though _get_github_repository is called from many nodes.
+_SELF_TARGET_WARNED = False
+
+
+def _resolve_own_repo_remote() -> str | None:
+    """Best-effort resolution of the orchestrator's own 'owner/repo' from its git remote origin.
+
+    Returns None if the remote cannot be resolved. Does not emit the self-target
+    warning (avoids recursion through _get_github_repository).
+    """
+    try:
+        url = get_remote_url(Path(__file__).resolve().parent.parent, "origin")
+        return _parse_owner_repo_from_url(url)
+    except Exception:
+        return None
+
+
+def _warn_if_self_target(resolved_repo: str) -> None:
+    """Warn once when the fallback target repo equals the orchestrator's own repo.
+
+    Triggered only on the env-unset fallback path of _get_github_repository.
+    Surfaces the issue #107 footgun: when GITHUB_REPOSITORY is not configured the
+    orchestrator silently polls its own repository instead of the intended target.
+    """
+    global _SELF_TARGET_WARNED
+    if _SELF_TARGET_WARNED:
+        return
+    own_repo = _resolve_own_repo_remote()
+    if own_repo and own_repo == resolved_repo:
+        logger.warning(
+            "GITHUB_REPOSITORY is not set; resolved target repository '%s' "
+            "matches the orchestrator's own repository '%s'. The orchestrator "
+            "will poll its own repository for issues. Set GITHUB_REPOSITORY "
+            "(or configure a .env file) to target a different repository.",
+            resolved_repo,
+            own_repo,
+        )
+        _SELF_TARGET_WARNED = True
+
+
 def _get_github_repository(workspace_path: Path) -> str:
     """Resolve the target owner/repo string, falling back to git remote origin if GITHUB_REPOSITORY is empty."""
     repo = os.getenv("GITHUB_REPOSITORY", "").strip()
@@ -206,21 +261,15 @@ def _get_github_repository(workspace_path: Path) -> str:
 
     try:
         url = get_remote_url(workspace_path, "origin")
-        # Parse owner/repo from SSH (git@github.com:owner/repo.git) or HTTPS (https://github.com/owner/repo.git)
-        if "github.com/" in url:
-            part = url.split("github.com/", 1)[1]
-        elif "github.com:" in url:
-            part = url.split("github.com:", 1)[1]
-        else:
-            # Fallback for other formats
-            part = url.split(":")[-1]
-
-        part = part.removesuffix(".git")
-        return part
+        repo = _parse_owner_repo_from_url(url)
     except Exception as e:
         raise ValueError(
             f"GITHUB_REPOSITORY environment variable is not set and could not be resolved from git remote origin: {e}"
         )
+
+    # Issue #107: surface the silent self-polling misconfiguration.
+    _warn_if_self_target(repo)
+    return repo
 
 
 def _parse_dependencies(body: str | None) -> list[int]:

@@ -12,6 +12,13 @@ class TestMainTelemetryWiring(unittest.TestCase):
     is constructed correctly on both fresh runs and stateful resumes.
     """
 
+    def setUp(self):
+        # Issue #107: main() now calls load_dotenv(). Patch it so the real
+        # project .env does not leak into os.environ and pollute other tests.
+        patcher = patch("orchestrator.__main__.load_dotenv", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @patch("orchestrator.__main__.end_orchestrator_loop")
     @patch("orchestrator.__main__.init_telemetry")
     @patch("orchestrator.__main__.graph")
@@ -81,6 +88,13 @@ class TestMainMetricsOrchestration(unittest.TestCase):
     (ADR-0029): the cycle-level reset + conditional write path that the
     MetricsCollector unit tests do not exercise.
     """
+
+    def setUp(self):
+        # Issue #107: main() now calls load_dotenv(). Patch it so the real
+        # project .env does not leak into os.environ and pollute other tests.
+        patcher = patch("orchestrator.__main__.load_dotenv", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_reset_called_before_graph_invoke(self):
         """get_collector().reset() is called before graph.invoke()."""
@@ -283,6 +297,48 @@ class TestMainMetricsOrchestration(unittest.TestCase):
 
         collector.reset.assert_called_once_with()
         collector.write_record.assert_not_called()
+
+
+class TestMainDotenvLoading(unittest.TestCase):
+    """Issue #107: main() must load .env at startup so target-repo env vars
+    (GITHUB_REPOSITORY, GITHUB_WORKSPACE, ...) take effect without requiring the
+    calling shell to export them manually."""
+
+    @patch("orchestrator.__main__.end_orchestrator_loop")
+    @patch("orchestrator.__main__.init_telemetry")
+    @patch("orchestrator.__main__.graph")
+    @patch("orchestrator.__main__.state_module")
+    @patch("orchestrator.__main__.setup_logging")
+    @patch("orchestrator.__main__.load_dotenv", return_value=True)
+    def test_load_dotenv_called_before_graph_invoke(
+        self,
+        mock_load_dotenv,
+        mock_setup_logging,
+        mock_state_module,
+        mock_graph,
+        mock_init_telemetry,
+        mock_end_loop,
+    ):
+        """main() invokes load_dotenv() exactly once, before the graph runs."""
+        call_order = []
+
+        def record_load(*args, **kwargs):
+            call_order.append("load_dotenv")
+            return True
+
+        def record_invoke(*args, **kwargs):
+            call_order.append("graph.invoke")
+            return state
+
+        mock_load_dotenv.side_effect = record_load
+        mock_graph.invoke.side_effect = record_invoke
+        state = {"issue_number": None, "branch": None, "status": "idle"}
+        mock_state_module.load.return_value = state
+
+        main()
+
+        mock_load_dotenv.assert_called_once_with()
+        self.assertEqual(call_order, ["load_dotenv", "graph.invoke"])
 
 
 if __name__ == "__main__":
