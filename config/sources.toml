@@ -2,18 +2,31 @@
 # Tools. Loaded once at orchestrator startup and cached
 # (orchestrator/sources_config.py).
 #
-# strict = false  => search is unrestricted (no domain allowlisting). Appropriate
-#   for the general-purpose Worker, which may need to research arbitrary library
-#   APIs, docs, and error messages across any domain.
-# strict = true   => search is restricted to the listed urls/domains. When strict
+# strict = true  => search is restricted to the listed urls/domains. When strict
 #   is true, at least one of urls/domains MUST be non-empty (validated at load,
 #   raising ValueError otherwise). See config/sources.example.toml.
+#
+# Adopted from agentic-planner-core's strict allowlist profile (domains + search
+# budgets). The [security]/[zero_tolerance] tables of the planner are NOT ported:
+# this project's SourcesConfig schema does not model them, so they would have no
+# effect here.
 
-strict = false
+strict = true
 urls = []
-domains = []
+domains = [
+    "arxiv.org",
+    "dl.acm.org",
+    "pypi.org",
+    "npmjs.com",
+    "python.langchain.com",
+    "langgraph.org",
+    "openrouter.ai",
+    "github.com",
+]
 
 [search]
-engine = "auto"
+engine = "exa"
 search_context_size = "medium"
-max_results = 5
+max_results = 10
+max_total_results = 15
+excluded_domains = ["reddit.com", "stackoverflow.com"]
