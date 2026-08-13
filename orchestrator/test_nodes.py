@@ -4084,5 +4084,70 @@ class TestGetGithubRepositorySelfTargetWarning(unittest.TestCase):
         self.assertEqual(repo, "other/project")
 
 
+class TestParseOwnerRepoFromUrl(unittest.TestCase):
+    """Direct unit tests for _parse_owner_repo_from_url (issue #107).
+
+    Exercises the URL-parsing helper that the SelfTargetWarning tests mock away,
+    covering SSH, HTTPS, and the generic fallback branch.
+    """
+
+    def test_https_url(self):
+        from orchestrator.nodes import _parse_owner_repo_from_url
+
+        self.assertEqual(
+            _parse_owner_repo_from_url("https://github.com/owner/repo.git"),
+            "owner/repo",
+        )
+
+    def test_ssh_url(self):
+        from orchestrator.nodes import _parse_owner_repo_from_url
+
+        self.assertEqual(
+            _parse_owner_repo_from_url("git@github.com:owner/repo.git"),
+            "owner/repo",
+        )
+
+    def test_strips_no_git_suffix(self):
+        from orchestrator.nodes import _parse_owner_repo_from_url
+
+        self.assertEqual(
+            _parse_owner_repo_from_url("https://github.com/owner/repo"),
+            "owner/repo",
+        )
+
+    def test_generic_fallback(self):
+        from orchestrator.nodes import _parse_owner_repo_from_url
+
+        self.assertEqual(
+            _parse_owner_repo_from_url("somehost:owner/repo.git"),
+            "owner/repo",
+        )
+
+
+class TestResolveOwnRepoRemote(unittest.TestCase):
+    """Direct unit tests for _resolve_own_repo_remote (issue #107, [Q4]).
+
+    Exercises the helper that resolves the orchestrator's own owner/repo from
+    its git remote origin. The SelfTargetWarning tests mock this away; these
+    tests cover it directly so the production code path is exercised.
+    """
+
+    @patch("orchestrator.nodes.get_remote_url")
+    def test_resolves_own_repo_from_remote(self, mock_remote):
+        from orchestrator.nodes import _resolve_own_repo_remote
+
+        mock_remote.return_value = "git@github.com:me/myself.git"
+        result = _resolve_own_repo_remote()
+        self.assertEqual(result, "me/myself")
+
+    @patch("orchestrator.nodes.get_remote_url")
+    def test_returns_none_on_failure(self, mock_remote):
+        from orchestrator.nodes import _resolve_own_repo_remote
+
+        mock_remote.side_effect = RuntimeError("no remote")
+        result = _resolve_own_repo_remote()
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()
