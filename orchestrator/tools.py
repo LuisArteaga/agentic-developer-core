@@ -1,7 +1,6 @@
 import contextlib
 import fcntl
 import os
-import re
 from pathlib import Path
 
 from orchestrator import state
@@ -11,7 +10,8 @@ from orchestrator.path_safety import is_safe_path
 _PROJECT_ROOT: Path | None = None
 
 # ---------------------------------------------------------------------------
-# ADR-0037 layer 1: run_command command allowlist + secret-stripped env.
+# ADR-0037 layer 1: run_command command allowlist + minimal allowlist env
+# (ADR-0043: denylist replaced with an explicit env-var allowlist).
 # ---------------------------------------------------------------------------
 
 # Curated set of binaries the Worker may execute via run_command. Network
@@ -39,14 +39,30 @@ DEFAULT_RUN_COMMAND_ALLOWLIST = frozenset(
     }
 )
 
-# Env vars that must never leak into a Worker subprocess: the named
-# orchestrator secrets plus any var whose name ends in KEY/TOKEN/SECRET/
-# PASSWORD (case-insensitive). A prompt-injected Worker cannot then exfiltrate
-# credentials via `printenv`/`env` or inherit them into a child process.
-_SECRET_ENV_NAMES = frozenset(
-    {"GH_PAT", "GH_TOKEN", "GITHUB_TOKEN", "OPENROUTER_API_KEY"}
+# Minimal allowlist of env vars the Worker subprocess may inherit (ADR-0043).
+# Replaces the former denylist (_SECRET_ENV_NAME_RE) which was name-based and
+# leaked any secret not ending in KEY/TOKEN/SECRET/PASSWORD (e.g. DATABASE_URL,
+# *_CREDENTIAL, *_CONN). An allowlist fails closed: a new secret var is absent
+# from the child by default unless explicitly added here or via
+# AGENT_SUBPROCESS_ENV_ALLOWLIST.
+_DEFAULT_SUBPROCESS_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPYCACHEPREFIX",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "AGENT_LABEL_READY",
+        "AGENT_LABEL_IN_PROGRESS",
+        "AGENT_LABEL_BLOCKED",
+        "AGENT_POLL_INTERVAL",
+    }
 )
-_SECRET_ENV_NAME_RE = re.compile(r"(?i).*(?:KEY|TOKEN|SECRET|PASSWORD)$")
 
 # ---------------------------------------------------------------------------
 # ADR-0037 layer 6: bounded reads — prevent a planted oversized file from
@@ -69,16 +85,19 @@ def _resolve_run_command_allowlist() -> frozenset[str]:
     return frozenset(name.strip() for name in override.split(",") if name.strip())
 
 
-def _sanitize_subprocess_env() -> dict[str, str]:
-    """Return a copy of os.environ with secret-bearing variables removed."""
-    sanitized: dict[str, str] = {}
-    for name, value in os.environ.items():
-        if name in _SECRET_ENV_NAMES:
-            continue
-        if _SECRET_ENV_NAME_RE.match(name):
-            continue
-        sanitized[name] = value
-    return sanitized
+def _build_subprocess_env() -> dict[str, str]:
+    """Return a minimal allowlisted environment for a Worker subprocess.
+
+    Only vars in ``_DEFAULT_SUBPROCESS_ENV_ALLOWLIST`` (plus any names added via
+    the ``AGENT_SUBPROCESS_ENV_ALLOWLIST`` override) are passed to the child.
+    Every other ``os.environ`` var — including any secret regardless of naming
+    — is absent, so a prompt-injected Worker cannot exfiltrate credentials via
+    ``printenv``/``env`` or inherit them into a child process (ADR-0043).
+    """
+    allow = set(_DEFAULT_SUBPROCESS_ENV_ALLOWLIST)
+    extra = os.getenv("AGENT_SUBPROCESS_ENV_ALLOWLIST", "")
+    allow.update(x.strip() for x in extra.split(",") if x.strip())
+    return {k: v for k, v in os.environ.items() if k in allow}
 
 
 def _truncate_output(output: str) -> str:
@@ -589,8 +608,8 @@ def run_command(command: str) -> str:
 
     Security (ADR-0037 layer 1): only a curated allowlist of binaries may run
     (network binaries are excluded — outbound research must use fetch_url),
-    and the child receives a secret-stripped environment so a prompt-injected
-    Worker cannot exfiltrate credentials via `printenv`/`env`.
+    and the child receives a minimal allowlist environment (ADR-0043) so a
+    prompt-injected Worker cannot exfiltrate credentials via `printenv`/`env`.
     """
     import shlex
     import subprocess
@@ -621,15 +640,16 @@ def run_command(command: str) -> str:
 
     try:
         # Run the command with a 300 second timeout, capturing stdout and
-        # stderr together. The child receives a sanitized env with all
-        # secret-bearing variables removed (ADR-0037 layer 1).
+        # stderr together. The child receives a minimal allowlist env
+        # (ADR-0043): only explicitly permitted vars are present, so no
+        # os.environ secret reaches the subprocess regardless of naming.
         result = subprocess.run(
             args,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=project_root,
             timeout=300,
-            env=_sanitize_subprocess_env(),
+            env=_build_subprocess_env(),
         )
         output_bytes = result.stdout
         timed_out = False
