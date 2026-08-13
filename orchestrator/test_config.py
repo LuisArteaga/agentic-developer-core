@@ -390,7 +390,7 @@ class TestResolveJudgeConfigs(unittest.TestCase):
         )
 
         sec = resolve_model_config("security")
-        self.assertEqual(sec["model"], "deepseek/deepseek-v4-pro")
+        self.assertEqual(sec["model"], "deepseek/deepseek-v4-pro-0813")
         self.assertEqual(
             sec["routing"],
             ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
@@ -406,7 +406,7 @@ class TestResolveJudgeConfigs(unittest.TestCase):
         self.assertEqual(test_cov["fallback_model"], "z-ai/glm-5.2")
 
         arch = resolve_model_config("architecture")
-        self.assertEqual(arch["fallback_model"], "deepseek/deepseek-v4-pro")
+        self.assertEqual(arch["fallback_model"], "deepseek/deepseek-v4-pro-0813")
 
         sec = resolve_model_config("security")
         self.assertEqual(sec["fallback_model"], "z-ai/glm-5.2")
@@ -595,9 +595,9 @@ class TestRealFactoryJson(unittest.TestCase):
         self.assertTrue(FACTORY_JSON_PATH.exists(), f"{FACTORY_JSON_PATH} should exist")
 
     def test_plan_uses_flash(self):
-        """The plan node resolves to deepseek-v4-flash in the shipped factory.json."""
+        """The plan node resolves to deepseek-v4-flash-0731 in the shipped factory.json."""
         cfg = resolve_model_config("plan")
-        self.assertEqual(cfg["model"], "deepseek/deepseek-v4-flash")
+        self.assertEqual(cfg["model"], "deepseek/deepseek-v4-flash-0731")
 
     def test_execute_uses_kimi(self):
         """The execute node resolves to kimi-k2.7-code in the shipped factory.json."""
