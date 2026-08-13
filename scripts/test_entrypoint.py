@@ -260,5 +260,174 @@ class EntrypointTests(unittest.TestCase):
         mock_sleep.assert_not_called()
 
 
+class SecurityBlockTrackerTests(unittest.TestCase):
+    """Tests for the SecurityBlockTracker circuit breaker (ADR-0044)."""
+
+    def setUp(self):
+        self.original_env = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.original_env)
+
+    def test_defaults(self):
+        """Threshold defaults to 5, window to 3600s, per env-var contract."""
+        os.environ.pop("AGENT_SECURITY_BLOCK_THRESHOLD", None)
+        os.environ.pop("AGENT_SECURITY_BLOCK_WINDOW", None)
+        tracker = entrypoint.SecurityBlockTracker()
+        self.assertEqual(tracker.threshold, 5)
+        self.assertEqual(tracker.window, 3600.0)
+
+    def test_env_override(self):
+        """Threshold and window should be configurable via env vars."""
+        os.environ["AGENT_SECURITY_BLOCK_THRESHOLD"] = "3"
+        os.environ["AGENT_SECURITY_BLOCK_WINDOW"] = "600"
+        tracker = entrypoint.SecurityBlockTracker()
+        self.assertEqual(tracker.threshold, 3)
+        self.assertEqual(tracker.window, 600.0)
+
+    def test_record_and_count(self):
+        """record_block increments the count within the window."""
+        tracker = entrypoint.SecurityBlockTracker(threshold=5, window=3600)
+        tracker.record_block(now=100.0)
+        tracker.record_block(now=200.0)
+        self.assertEqual(tracker.count(now=200.0), 2)
+
+    def test_eviction_removes_old_entries(self):
+        """Entries older than the window are evicted on count/record."""
+        tracker = entrypoint.SecurityBlockTracker(threshold=5, window=100)
+        tracker.record_block(now=100.0)
+        tracker.record_block(now=150.0)
+        # At t=250, the first entry (t=100) is outside the [150, 250] window
+        self.assertEqual(tracker.count(now=250.0), 1)
+
+    def test_is_tripped_at_threshold(self):
+        """is_tripped returns True when count reaches the threshold."""
+        tracker = entrypoint.SecurityBlockTracker(threshold=3, window=3600)
+        tracker.record_block(now=100.0)
+        tracker.record_block(now=200.0)
+        self.assertFalse(tracker.is_tripped(now=200.0))
+        tracker.record_block(now=300.0)
+        self.assertTrue(tracker.is_tripped(now=300.0))
+
+
+class RunIterationSecurityBlockTests(unittest.TestCase):
+    """Tests for run_iteration handling of security-block exit codes (ADR-0044)."""
+
+    def setUp(self):
+        self.original_env = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.original_env)
+
+    @patch("entrypoint.read_agent_status")
+    @patch("subprocess.Popen")
+    @patch("time.sleep")
+    def test_security_block_no_backoff(self, mock_sleep, mock_popen, mock_status):
+        """A security-block exit (42) resets consecutive_crashes and does NOT
+        apply exponential backoff — it is a deliberate termination, not a crash."""
+        mock_status.return_value = "idle"
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = entrypoint.SECURITY_BLOCK_EXIT_CODE
+        mock_popen.return_value = mock_proc
+
+        tracker = entrypoint.SecurityBlockTracker(threshold=5, window=3600)
+        crashes, should_exit, code = entrypoint.run_iteration(
+            consecutive_crashes=3,
+            run_once=False,
+            poll_interval=10.0,
+            security_tracker=tracker,
+        )
+
+        # Crashes reset (not a crash), no exit, code is None (continue polling)
+        self.assertEqual(crashes, 0)
+        self.assertFalse(should_exit)
+        self.assertIsNone(code)
+        # Should have slept for poll_interval (idle status), NOT backoff
+        mock_sleep.assert_called_once_with(10.0)
+        self.assertEqual(tracker.count(), 1)
+
+    @patch("entrypoint.read_agent_status")
+    @patch("subprocess.Popen")
+    @patch("time.time")
+    @patch("time.sleep")
+    def test_security_block_circuit_breaker_trips(
+        self, mock_sleep, mock_time, mock_popen, mock_status
+    ):
+        """5 security blocks in the window → supervisor halts with exit code 2
+        and a CIRCUIT_BREAKER log."""
+        mock_status.return_value = "idle"
+        # Fix time.time so pre-filled blocks (t=100-103) are within the window
+        # when record_block/count use the default now=time.time().
+        mock_time.return_value = 200.0
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = entrypoint.SECURITY_BLOCK_EXIT_CODE
+        mock_popen.return_value = mock_proc
+
+        tracker = entrypoint.SecurityBlockTracker(threshold=5, window=3600)
+        # Pre-fill 4 blocks so the 5th trips the breaker
+        for i in range(4):
+            tracker.record_block(now=float(100 + i))
+
+        crashes, should_exit, code = entrypoint.run_iteration(
+            consecutive_crashes=0,
+            run_once=False,
+            poll_interval=10.0,
+            security_tracker=tracker,
+        )
+
+        self.assertTrue(should_exit)
+        self.assertEqual(code, 2)
+        self.assertEqual(tracker.count(), 5)
+
+    @patch("subprocess.Popen")
+    @patch("time.sleep")
+    def test_security_block_run_once_exits_1(self, mock_sleep, mock_popen):
+        """In run_once mode, a security block exits with code 1 (failure)."""
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = entrypoint.SECURITY_BLOCK_EXIT_CODE
+        mock_popen.return_value = mock_proc
+
+        tracker = entrypoint.SecurityBlockTracker(threshold=5, window=3600)
+        crashes, should_exit, code = entrypoint.run_iteration(
+            consecutive_crashes=0,
+            run_once=True,
+            poll_interval=10.0,
+            security_tracker=tracker,
+        )
+
+        self.assertEqual(crashes, 0)
+        self.assertTrue(should_exit)
+        self.assertEqual(code, 1)
+
+    @patch("random.uniform")
+    @patch("time.time")
+    @patch("subprocess.Popen")
+    @patch("time.sleep")
+    def test_non_security_crash_still_backs_off(
+        self, mock_sleep, mock_popen, mock_time, mock_random
+    ):
+        """A generic crash (exit 1) still uses exponential backoff (unchanged)."""
+        mock_random.return_value = 0.0
+        mock_time.side_effect = [0.0, 5.0]
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = 1  # generic crash, not security block
+        mock_popen.return_value = mock_proc
+
+        tracker = entrypoint.SecurityBlockTracker(threshold=5, window=3600)
+        crashes, should_exit, code = entrypoint.run_iteration(
+            consecutive_crashes=0,
+            run_once=False,
+            poll_interval=10.0,
+            security_tracker=tracker,
+        )
+
+        self.assertEqual(crashes, 1)
+        self.assertFalse(should_exit)
+        self.assertIsNone(code)
+        mock_sleep.assert_called_once_with(1.0)  # backoff, not poll_interval
+
+
 if __name__ == "__main__":
     unittest.main()

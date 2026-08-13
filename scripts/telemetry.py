@@ -318,6 +318,7 @@ _state: dict[str, Any] = {
     "loop_exit_code": None,
     "loop_issue_number": None,
     "phases": {},
+    "security_blocks": [],
 }
 
 
@@ -368,6 +369,7 @@ def init_telemetry(
             "loop_exit_code": None,
             "loop_issue_number": None,
             "phases": {},
+            "security_blocks": [],
         }
         state_file = _get_state_file_path()
         if os.path.exists(state_file):
@@ -489,6 +491,7 @@ def start_orchestrator_loop(issue_number=None, branch=None):
         "loop_exit_code": None,
         "loop_issue_number": None,
         "phases": {},
+        "security_blocks": [],
     }
     state_file = _get_state_file_path()
     if os.path.exists(state_file):
@@ -580,6 +583,40 @@ def end_orchestrator_phase(
     _save_state()
 
 
+def record_security_block(
+    layer: str, blocked_path: str, issue_number: int | None = None
+):
+    """Record a security-block event for retrospective span enrichment (ADR-0044).
+
+    Appends a record to the telemetry ``_state`` so ``_export_recorded_spans`` can
+    attach a ``security.block`` span event, set the span status to ERROR, and set
+    the ``langfuse.trace.tags`` attribute (``["security-block"]``) on the matching
+    phase span — making the breach searchable in Langfuse via ``tag:security-block``.
+
+    This is the adapted form of the issue's proposed ``trace.get_current_span()``
+    helper, which would be a **no-op** in this project: spans are created
+    retrospectively in ``_export_recorded_spans`` (ADR-0016), not live via
+    ``start_as_current_span``. There is no active recording span at the time the
+    tools or nodes run, so the event must be buffered and attached during export
+    (Framework-First Research, ADR-0042).
+
+    ``layer`` is ``"plan"`` (Plan-Node pre-flight) or ``"runtime"`` (Worker Tool
+    path-safety refusal). Safe to call when telemetry is not initialized — the
+    record is simply buffered and ignored if no spans are exported.
+    """
+    _load_state()
+    blocks = _state.setdefault("security_blocks", [])
+    blocks.append(
+        {
+            "layer": layer,
+            "blocked_path": blocked_path,
+            "issue_number": issue_number or 0,
+            "timestamp": datetime.datetime.now(datetime.UTC).timestamp(),
+        }
+    )
+    _save_state()
+
+
 def _export_recorded_spans():
     if not HAS_OTEL:
         return
@@ -622,6 +659,9 @@ def _export_recorded_spans():
     # Maps phase_name -> OTel context carrying that phase's span, so a later
     # nested phase can link to its parent. Filled in insertion order.
     phase_contexts: dict[str, Context] = {}
+    # Maps phase_name -> the Span object itself, so security-block events can
+    # be attached to the correct phase span before it is ended (ADR-0044).
+    phase_spans: dict[str, Any] = {}
 
     for phase_name, phase_data in _state.get("phases", {}).items():
         p_start = phase_data.get("start_time")
@@ -680,9 +720,63 @@ def _export_recorded_spans():
         phase_span.set_status(
             trace.Status(status_code, f"exit code {p_exit}" if p_exit != 0 else None)
         )
-        phase_span.end(end_time=p_end_nano)
 
+        # Deferred end: security-block events (ADR-0044) must be attached
+        # before the span is ended, so ending is moved past the enrichment
+        # step below.
         phase_contexts[phase_name] = set_span_in_context(phase_span)
+        phase_spans[phase_name] = (phase_span, p_start, p_end, p_end_nano)
+
+    # --- Security-block span enrichment (ADR-0044) ---
+    # Attach a ``security.block`` span event + ERROR status + the
+    # ``langfuse.trace.tags`` attribute to the phase span that was active when
+    # the block occurred (matched by timestamp interval), falling back to the
+    # loop span. The ``langfuse.trace.tags`` attribute is the filterable signal
+    # in Langfuse (tag:security-block) — per the Langfuse OTel attribute mapping
+    # (T1: langfuse.com/integrations/native/opentelemetry), ``langfuse.trace.tags``
+    # maps to the trace-level tags field; ``langfuse.tags`` (as proposed in the
+    # issue) would land in the unfilterable metadata.attributes catch-all.
+    security_blocks = _state.get("security_blocks", [])
+    has_security_block = bool(security_blocks)
+
+    for block in security_blocks:
+        b_ts = block.get("timestamp")
+        b_layer = block.get("layer", "unknown")
+        b_path = block.get("blocked_path", "")
+        b_issue = block.get("issue_number", 0)
+
+        # Find the phase span whose [start, end] interval contains the block.
+        target_span = loop_span
+        for p_name, (p_span, p_start, p_end, _) in phase_spans.items():
+            if p_start and p_start <= b_ts <= p_end:
+                target_span = p_span
+                break
+
+        target_span.add_event(
+            "security.block",
+            attributes={
+                "security.layer": b_layer,
+                "security.blocked_path": b_path,
+                "security.issue_number": b_issue,
+                "security.severity": "high",
+            },
+        )
+        # A security block is always an ERROR, regardless of the phase's own
+        # exit code (a runtime refusal during an otherwise-successful execute
+        # is still a security breach).
+        target_span.set_status(
+            trace.Status(trace.StatusCode.ERROR, f"security block: {b_path}")
+        )
+        target_span.set_attribute("langfuse.trace.tags", ["security-block"])
+
+    # Tag the loop (root) span so the whole trace is filterable in Langfuse
+    # via tag:security-block, regardless of which phase span the event landed on.
+    if has_security_block:
+        loop_span.set_attribute("langfuse.trace.tags", ["security-block"])
+
+    # End all phase spans now that enrichment is complete.
+    for p_name, (p_span, _, _, p_end_nano) in phase_spans.items():
+        p_span.end(end_time=p_end_nano)
 
     exit_code = _state.get("loop_exit_code", 0)
     loop_span.set_attribute("command.exit_code", exit_code)

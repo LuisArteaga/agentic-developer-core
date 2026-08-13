@@ -301,6 +301,43 @@ class TestMainMetricsOrchestration(unittest.TestCase):
         collector.reset.assert_called_once_with()
         collector.write_record.assert_not_called()
 
+    @patch("orchestrator.__main__.end_orchestrator_loop")
+    @patch("orchestrator.__main__.init_telemetry")
+    @patch("orchestrator.__main__.get_collector")
+    @patch("orchestrator.__main__.graph")
+    @patch("orchestrator.__main__.state_module")
+    @patch("orchestrator.__main__.setup_logging")
+    def test_security_block_exits_with_code_42(
+        self,
+        mock_setup_logging,
+        mock_state_module,
+        mock_graph,
+        mock_get_collector,
+        mock_init_telemetry,
+        mock_end_loop,
+    ):
+        """ADR-0044: a security_block:-prefixed failure exits with code 42,
+        distinct from the generic crash exit 1."""
+        from orchestrator.constants import SECURITY_BLOCK_EXIT_CODE
+
+        collector = mock_get_collector.return_value
+        security_block_state = {
+            "issue_number": 42,
+            "branch": "feat/issue-42",
+            "status": "failed",
+            "error": "security_block: .env",
+            "model": "m",
+        }
+        mock_state_module.load.return_value = security_block_state
+        mock_graph.invoke.return_value = security_block_state
+
+        with self.assertRaises(SystemExit) as ctx:
+            main()
+        self.assertEqual(ctx.exception.code, SECURITY_BLOCK_EXIT_CODE)
+        self.assertEqual(SECURITY_BLOCK_EXIT_CODE, 42)
+        # No metrics record for a failed cycle (same as generic failure).
+        collector.write_record.assert_not_called()
+
 
 class TestMainDotenvLoading(unittest.TestCase):
     """Issue #107: main() must load .env at startup so target-repo env vars

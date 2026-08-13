@@ -1,10 +1,33 @@
 import contextlib
 import fcntl
+import logging
 import os
 from pathlib import Path
 
 from orchestrator import state
 from orchestrator.path_safety import is_safe_path
+from scripts.telemetry import record_security_block
+
+_logger = logging.getLogger("orchestrator.tools")
+
+
+def _record_runtime_security_block(rel_str: str) -> None:
+    """Record a runtime path-safety refusal for Langfuse telemetry (ADR-0044).
+
+    Called at every Worker Tool path-safety refusal site so the breach is
+    searchable in Langfuse via ``tag:security-block``. Best-effort: a telemetry
+    failure must never break a tool call (the error string is still returned to
+    the agent regardless).
+    """
+    try:
+        issue = state.load().get("issue_number")
+    except Exception:
+        issue = None
+    try:
+        record_security_block("runtime", rel_str, issue)
+    except Exception as e:
+        _logger.debug("Non-fatal security-block telemetry error: %s", e)
+
 
 # Can be overridden for testing purposes
 _PROJECT_ROOT: Path | None = None
@@ -270,6 +293,7 @@ def read_file(
     # blocked path is never registered in read_files (closing the
     # read-then-patch bypass of ADR-0012's pre-flight-only validation).
     if not is_safe_path(rel_str):
+        _record_runtime_security_block(rel_str)
         return f"Error: Path '{path}' is blocked by the path-safety policy and cannot be read."
 
     if not abs_path.exists():
@@ -369,6 +393,7 @@ def list_directory(path: str) -> str:
     # relative path against the sensitive-path blocklist before listing, so
     # `list_directory(path=".git")` returns the policy error, not contents.
     if not is_safe_path(rel_str):
+        _record_runtime_security_block(rel_str)
         return f"Error: Path '{path}' is blocked by the path-safety policy and cannot be listed."
 
     if not abs_path.exists():
@@ -415,6 +440,7 @@ def grep_search(query: str, path: str) -> str:
     # path before any read, so `grep_search(query="x", path=".env")` returns
     # the policy error, not live secrets.
     if not is_safe_path(rel_str):
+        _record_runtime_security_block(rel_str)
         return f"Error: Path '{path}' is blocked by the path-safety policy and cannot be searched."
 
     if not abs_path.exists():
@@ -510,6 +536,7 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
     #    hard stop even if it was somehow registered in read_files, closing the
     #    bypass of ADR-0012's pre-flight-only validation (defense in depth).
     if not is_safe_path(rel_str):
+        _record_runtime_security_block(rel_str)
         return f"Error: Path '{path}' is blocked by the path-safety policy and cannot be modified."
 
     # 1. Read-Before-Edit Constraint (path-level): the file must have been read at least

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from orchestrator import state as state_module
+from orchestrator.constants import SECURITY_BLOCK_EXIT_CODE
 from orchestrator.graph import graph
 from orchestrator.metrics import get_collector
 from scripts.telemetry import end_orchestrator_loop, init_telemetry
@@ -118,7 +119,20 @@ def main():
             final_state.get("status"),
         )
         if final_state.get("status") == "failed":
-            exit_code = 1
+            # ADR-0044: a security-block failure (error prefix
+            # "security_block:") exits with a distinct code (42) so the
+            # process supervisor can branch it into the circuit-breaker path
+            # instead of the generic exponential-backoff crash path.
+            error = final_state.get("error") or ""
+            if error.startswith("security_block:"):
+                exit_code = SECURITY_BLOCK_EXIT_CODE
+                logger.warning(
+                    "Security block detected (exit code %d). Issue will be "
+                    "quarantined by recovery.",
+                    SECURITY_BLOCK_EXIT_CODE,
+                )
+            else:
+                exit_code = 1
         # Run Observability (ADR-0029): write one metrics record per completed
         # issue cycle. Only a fully completed (status == "done") cycle
         # contributes — crashed or failed runs produce no record, so the trend

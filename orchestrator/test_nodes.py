@@ -660,15 +660,19 @@ class TestPlanNode(unittest.TestCase):
         state["issue_number"] = 10
         state_module.save(state)
 
-        # ADR-0038: a security-block ValueError is caught by the node's
-        # exception handler, recorded, and routed to recovery via a failed
-        # status (no re-raise). The root-cause message survives in state.
+        # ADR-0044: a security block is now handled directly at the block site
+        # (not raised as a ValueError caught by the generic except handler).
+        # The error carries the ``security_block:`` prefix so recovery and
+        # __main__ can branch on it (quarantine label + exit code 42).
         result = plan_node(state)
         self.assertIs(result, state)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["phase"], "planning")
-        self.assertIn("Security Block", result["error"] or "")
-        self.assertIn("'.env'", result["error"] or "")
+        self.assertTrue(
+            (result["error"] or "").startswith("security_block:"),
+            f"Expected 'security_block:' prefix, got: {result['error']!r}",
+        )
+        self.assertIn(".env", result["error"] or "")
 
         # Verify state is persisted as 'failed' at 'planning' phase
         saved_state = state_module.load()
@@ -3244,6 +3248,56 @@ class TestRecoveryNode(unittest.TestCase):
             and "agent-in-progress" in str(call)
         ]
         self.assertTrue(len(add_label_call) > 0)
+        self.assertTrue(len(remove_label_call) > 0)
+
+    @patch("orchestrator.nodes._github_api_request")
+    def test_recovery_node_security_block_quarantine(self, mock_api):
+        """ADR-0044: a security-block failure quarantines the issue with the
+        agent-blocked label instead of agent-ready, so the claim scan skips it."""
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 42
+        state["error"] = "security_block: .env"
+        state_module.save(state)
+
+        from orchestrator.nodes import recovery_node
+
+        new_state = recovery_node(state)
+
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(new_state["phase"], "recovery")
+
+        # Verify agent-blocked was added (quarantine), NOT agent-ready
+        blocked_label_call = [
+            call
+            for call in mock_api.mock_calls
+            if "labels" in str(call)
+            and "POST" in str(call)
+            and "agent-blocked" in str(call)
+        ]
+        ready_label_call = [
+            call
+            for call in mock_api.mock_calls
+            if "labels" in str(call)
+            and "POST" in str(call)
+            and "agent-ready" in str(call)
+        ]
+        self.assertTrue(
+            len(blocked_label_call) > 0,
+            "Expected agent-blocked label to be added on security block.",
+        )
+        self.assertTrue(
+            len(ready_label_call) == 0,
+            "agent-ready must NOT be added on a security block (quarantine).",
+        )
+
+        # agent-in-progress should still be removed
+        remove_label_call = [
+            call
+            for call in mock_api.mock_calls
+            if "labels" in str(call)
+            and "DELETE" in str(call)
+            and "agent-in-progress" in str(call)
+        ]
         self.assertTrue(len(remove_label_call) > 0)
 
 
