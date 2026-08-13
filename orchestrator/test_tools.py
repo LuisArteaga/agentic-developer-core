@@ -956,6 +956,40 @@ class TestCodebaseTools(unittest.TestCase):
             self.assertIn("blocked by the path-safety policy", res)
             mock_record.assert_called_once()
 
+    def test_record_runtime_security_block_state_load_failure(self):
+        """ADR-0044: _record_runtime_security_block handles a state.load()
+        exception gracefully (issue is set to None, telemetry still recorded)."""
+        env_file = self.temp_dir_path / ".env"
+        env_file.write_text("SECRET=leak", encoding="utf-8")
+
+        with (
+            unittest.mock.patch(
+                "orchestrator.tools.state.load", side_effect=OSError("disk error")
+            ),
+            unittest.mock.patch(
+                "orchestrator.tools.record_security_block"
+            ) as mock_record,
+        ):
+            res = read_file(str(env_file))
+            self.assertIn("blocked by the path-safety policy", res)
+            # telemetry was still called with issue=None (state.load failed)
+            mock_record.assert_called_once()
+            self.assertIsNone(mock_record.call_args.args[2])
+
+    def test_record_runtime_security_block_telemetry_failure_swallowed(self):
+        """ADR-0044: a record_security_block exception is swallowed (best-effort)
+        and does not break the tool call — the error string is still returned."""
+        env_file = self.temp_dir_path / ".env"
+        env_file.write_text("SECRET=leak", encoding="utf-8")
+
+        with unittest.mock.patch(
+            "orchestrator.tools.record_security_block",
+            side_effect=RuntimeError("telemetry down"),
+        ):
+            # Must not raise — the error string is still returned to the agent.
+            res = read_file(str(env_file))
+            self.assertIn("blocked by the path-safety policy", res)
+
 
 if __name__ == "__main__":
     unittest.main()
