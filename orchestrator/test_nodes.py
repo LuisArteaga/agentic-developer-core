@@ -4149,5 +4149,35 @@ class TestResolveOwnRepoRemote(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestGetGithubRepositoryErrorBranch(unittest.TestCase):
+    """Direct unit tests for _get_github_repository's fallback error branch
+    (issue #107, [Q4]). Exercises the `except` path that raises ValueError when
+    get_remote_url fails — the SelfTargetWarning tests mock get_remote_url to
+    succeed, leaving this branch uncovered."""
+
+    def setUp(self):
+        self.original_repo = os.environ.get("GITHUB_REPOSITORY")
+        os.environ.pop("GITHUB_REPOSITORY", None)
+
+    def tearDown(self):
+        if self.original_repo is None:
+            os.environ.pop("GITHUB_REPOSITORY", None)
+        else:
+            os.environ["GITHUB_REPOSITORY"] = self.original_repo
+
+    @patch("orchestrator.nodes.get_remote_url")
+    def test_raises_value_error_when_remote_resolution_fails(self, mock_remote):
+        """When get_remote_url raises and GITHUB_REPOSITORY is unset, _get_github_repository raises ValueError."""
+        from orchestrator.nodes import _get_github_repository
+
+        mock_remote.side_effect = RuntimeError("no remote configured")
+
+        with self.assertRaises(ValueError) as ctx:
+            _get_github_repository(Path("/some/workspace"))
+
+        self.assertIn("GITHUB_REPOSITORY", str(ctx.exception))
+        self.assertIn("no remote configured", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
