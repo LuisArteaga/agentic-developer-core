@@ -595,9 +595,9 @@ class TestRealFactoryJson(unittest.TestCase):
         self.assertTrue(FACTORY_JSON_PATH.exists(), f"{FACTORY_JSON_PATH} should exist")
 
     def test_plan_uses_flash(self):
-        """The plan node resolves to deepseek-v4-flash in the shipped factory.json."""
+        """The plan node resolves to deepseek-v4-flash-0731 in the shipped factory.json."""
         cfg = resolve_model_config("plan")
-        self.assertEqual(cfg["model"], "deepseek/deepseek-v4-flash")
+        self.assertEqual(cfg["model"], "deepseek/deepseek-v4-flash-0731")
 
     def test_execute_uses_kimi(self):
         """The execute node resolves to kimi-k2.7-code in the shipped factory.json."""

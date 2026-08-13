@@ -171,12 +171,14 @@ class TestLoadSourcesConfig(unittest.TestCase):
         self.assertEqual(second.search.engine, "exa")
 
     @patch("orchestrator.sources_config._sources_cache", None)
-    def test_project_default_sources_toml_is_non_strict(self):
-        """The shipped config/sources.toml is a valid non-strict default."""
+    def test_project_default_sources_toml_is_strict(self):
+        """The shipped config/sources.toml is a strict allowlist (ported from
+        agentic-planner-core)."""
         reset_sources_config_cache()
         cfg = load_sources_config()
-        self.assertFalse(cfg.strict)
-        self.assertEqual(cfg.search.engine, "auto")
+        self.assertTrue(cfg.strict)
+        self.assertIn("arxiv.org", cfg.domains)
+        self.assertEqual(cfg.search.engine, "exa")
 
 
 if __name__ == "__main__":
