@@ -583,6 +583,13 @@ class TestPlanNode(unittest.TestCase):
         self.assertTrue(_is_safe_path("orchestrator/nodes.py"))
         self.assertTrue(_is_safe_path("tests/test_something.py"))
 
+        # Safe paths: committed template variants whose stem matches a
+        # forbidden name (e.g. .env.example — placeholder, no secrets)
+        self.assertTrue(_is_safe_path(".env.example"))
+        self.assertTrue(_is_safe_path(".env.template"))
+        self.assertTrue(_is_safe_path(".env.dist"))
+        self.assertTrue(_is_safe_path("config/.env.sample"))
+
         # Unsafe paths: absolute paths
         self.assertFalse(_is_safe_path("/etc/passwd"))
         self.assertFalse(_is_safe_path("/absolute/path/file.txt"))
@@ -602,7 +609,9 @@ class TestPlanNode(unittest.TestCase):
         # Unsafe paths: forbidden filenames / credentials
         self.assertFalse(_is_safe_path(".env"))
         self.assertFalse(_is_safe_path("src/.env"))
+        self.assertFalse(_is_safe_path(".env.production"))
         self.assertFalse(_is_safe_path("ssh_keys/id_rsa"))
+        self.assertFalse(_is_safe_path("id_rsa.pub"))
         self.assertFalse(_is_safe_path("credentials.txt"))
         self.assertFalse(_is_safe_path("config/id_ed25519"))
 
