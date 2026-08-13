@@ -35,6 +35,16 @@ DEFAULT_ROUTING: dict[str, list[str]] = {
 LLM_MAX_RETRIES = 3
 LLM_TIMEOUT = 600.0
 
+# Default Worker Recursion Budget (ADR-0045). LangGraph's own default of 25 is a
+# crash guard for infinite loops, not a real task budget — "complex graphs may
+# hit the default limit naturally" (official LangGraph docs). In a create_agent
+# ReAct loop each think→tool round consumes 2 supersteps (agent node + tools
+# node), so 50 ≈ 25 tool iterations: enough headroom for non-trivial tasks
+# (e.g. scaffolding) while still bounding runaway loops. Overridable per node
+# via factory.json ("recursion_limit") or env ({NODE}_RECURSION_LIMIT /
+# AGENT_RECURSION_LIMIT), mirroring the Model Config override precedence.
+DEFAULT_RECURSION_LIMIT = 50
+
 # Path resolution: config/factory.json relative to the project root
 # (the parent of this module's package directory).
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +95,49 @@ def _load_factory_config(filepath: Path = FACTORY_JSON_PATH) -> dict[str, Any]:
     return data
 
 
+def _resolve_recursion_limit(node_name: str, factory_cfg: dict | None) -> int:
+    """Resolve the per-node Worker Recursion Budget (ADR-0045).
+
+    Precedence (mirrors the model resolution precedence so the budget is
+    co-located with the rest of the per-node config, not a magic constant):
+      1. Node-specific env var: f"{node_name.upper()}_RECURSION_LIMIT"
+         (e.g. EXECUTE_RECURSION_LIMIT)
+      2. General env var: AGENT_RECURSION_LIMIT
+      3. factory.json "recursion_limit" for the node
+      4. Hardcoded DEFAULT_RECURSION_LIMIT constant
+
+    Distinct budgets per node are supported (e.g. execute vs test_writer) by
+    setting a per-node env var or a per-node factory.json entry. A malformed
+    env value is logged and ignored, degrading to the next precedence tier
+    rather than crashing the run.
+    """
+    env_val = os.getenv(f"{node_name.upper()}_RECURSION_LIMIT") or os.getenv(
+        "AGENT_RECURSION_LIMIT"
+    )
+    if env_val:
+        try:
+            return int(env_val)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid recursion_limit env value %r for node '%s'; ignoring "
+                "and falling back to factory/default.",
+                env_val,
+                node_name,
+            )
+    if factory_cfg and factory_cfg.get("recursion_limit") is not None:
+        try:
+            return int(factory_cfg["recursion_limit"])
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid recursion_limit in factory.json for node '%s' (%r); "
+                "falling back to default %d.",
+                node_name,
+                factory_cfg["recursion_limit"],
+                DEFAULT_RECURSION_LIMIT,
+            )
+    return DEFAULT_RECURSION_LIMIT
+
+
 def resolve_model_config(node_name: str) -> dict[str, Any]:
     """Resolve the Model Config for a given orchestrator node.
 
@@ -102,7 +155,8 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
     Returns:
         {"model": str, "routing": List[str] | None,
          "temperature": float, "options": Dict[str, Any] | None,
-         "fallback_model": str | None}
+         "max_tokens": int | None, "fallback_model": str | None,
+         "recursion_limit": int}
     """
     factory = _load_factory_config()
     factory_cfg = factory.get(node_name) if isinstance(factory, dict) else None
@@ -139,6 +193,7 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
             "fallback_model": factory_cfg.get("fallback_model")
             if factory_cfg
             else None,
+            "recursion_limit": _resolve_recursion_limit(node_name, factory_cfg),
         }
 
     # 3. Factory configuration
@@ -150,6 +205,7 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
             "options": factory_cfg.get("options"),
             "max_tokens": factory_cfg.get("max_tokens"),
             "fallback_model": factory_cfg.get("fallback_model"),
+            "recursion_limit": _resolve_recursion_limit(node_name, factory_cfg),
         }
 
     # 4. Hardcoded fallback (factory missing/malformed or node absent)
@@ -165,6 +221,7 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
         "options": None,
         "max_tokens": None,
         "fallback_model": None,
+        "recursion_limit": _resolve_recursion_limit(node_name, factory_cfg),
     }
 
 

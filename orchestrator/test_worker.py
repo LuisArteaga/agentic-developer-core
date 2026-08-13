@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.errors import GraphRecursionError
 
 from orchestrator.worker import execute_worker, get_worker_tools
 
@@ -89,7 +90,7 @@ class TestWorkerAgent(unittest.TestCase):
         """The full message trajectory is serialized to worker_trace_<issue>_<attempt>.jsonl."""
         messages = self._build_trajectory_messages()
         mock_agent = MagicMock()
-        mock_agent.invoke.return_value = {"messages": messages}
+        mock_agent.stream.return_value = iter([{"messages": messages}])
         mock_create_agent.return_value = mock_agent
 
         execute_worker(
@@ -132,7 +133,7 @@ class TestWorkerAgent(unittest.TestCase):
     ):
         """test_writer traces use the test_writer_trace_<issue>_<attempt>.jsonl name."""
         mock_agent = MagicMock()
-        mock_agent.invoke.return_value = {"messages": [AIMessage(content="ok")]}
+        mock_agent.stream.return_value = iter([{"messages": [AIMessage(content="ok")]}])
         mock_create_agent.return_value = mock_agent
 
         execute_worker(
@@ -150,7 +151,7 @@ class TestWorkerAgent(unittest.TestCase):
     def test_execute_worker_skips_trace_without_issue_number(self, mock_create_agent):
         """No trace file is written when issue_number/attempt are not provided."""
         mock_agent = MagicMock()
-        mock_agent.invoke.return_value = {"messages": [AIMessage(content="ok")]}
+        mock_agent.stream.return_value = iter([{"messages": [AIMessage(content="ok")]}])
         mock_create_agent.return_value = mock_agent
 
         execute_worker(issue_description="x", plan="y")
@@ -265,3 +266,215 @@ class TestWorkerAgent(unittest.TestCase):
             side_effect=RuntimeError("no log dir"),
         ):
             _write_worker_trace([MagicMock()], 1, 1, "execute")  # must not raise
+
+    # ------------------------------------------------------------------
+    # Graceful GraphRecursionError handling (ADR-0045, issue #117)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _stream_then_recursion_error(partial_state):
+        """Return a side_effect for agent.stream that yields one partial state
+        chunk then raises GraphRecursionError (mirrors real exhaustion)."""
+
+        def _gen(*_args, **_kwargs):
+            yield partial_state
+            raise GraphRecursionError("Recursion limit reached")
+
+        return _gen
+
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    def test_graceful_exhaustion_returns_message_not_raise(self, mock_create_agent):
+        """GraphRecursionError is caught and a deterministic budget-exhausted
+        message is returned instead of propagating (ADR-0045 layer 3)."""
+        messages = self._build_trajectory_messages()
+        mock_agent = MagicMock()
+        mock_agent.stream.side_effect = self._stream_then_recursion_error(
+            {"messages": messages}
+        )
+        mock_create_agent.return_value = mock_agent
+
+        result = execute_worker(
+            issue_description="x",
+            plan="y",
+            node_name="execute",
+            issue_number=5,
+            attempt=2,
+        )
+
+        self.assertIsInstance(result, str)
+        self.assertIn("[RECURSION_LIMIT_EXHAUSTED]", result)
+        self.assertIn("node=execute", result)
+        self.assertIn("attempt=2", result)
+
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    def test_graceful_exhaustion_writes_partial_trace(self, mock_create_agent):
+        """The Worker Trace sidecar is still written on graceful exhaustion,
+        containing the partial trajectory (ADR-0016 / ADR-0045)."""
+        messages = self._build_trajectory_messages()
+        mock_agent = MagicMock()
+        mock_agent.stream.side_effect = self._stream_then_recursion_error(
+            {"messages": messages}
+        )
+        mock_create_agent.return_value = mock_agent
+
+        execute_worker(
+            issue_description="x",
+            plan="y",
+            node_name="execute",
+            issue_number=9,
+            attempt=1,
+        )
+
+        trace_path = Path(os.environ["AGENT_LOG_PATH"]) / "worker_trace_9_1.jsonl"
+        self.assertTrue(trace_path.exists())
+        records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+        # All 4 partial messages are persisted.
+        self.assertEqual(len(records), 4)
+        self.assertEqual(records[2]["role"], "tool")
+        self.assertEqual(records[2]["tool_name"], "read_file")
+
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    def test_graceful_exhaustion_records_partial_metrics(self, mock_create_agent):
+        """Run Observability metrics still run on the partial trajectory of a
+        gracefully-exhausted run (ADR-0029 / ADR-0045). TL is recorded for the
+        execute node from the partial ToolMessage count."""
+        from orchestrator.metrics import MetricsCollector
+
+        messages = self._build_trajectory_messages()  # 1 ToolMessage -> TL=1
+        mock_agent = MagicMock()
+        mock_agent.stream.side_effect = self._stream_then_recursion_error(
+            {"messages": messages}
+        )
+        mock_create_agent.return_value = mock_agent
+
+        collector = MetricsCollector()
+        with patch("orchestrator.metrics.get_collector", return_value=collector):
+            execute_worker(
+                issue_description="x",
+                plan="y",
+                node_name="execute",
+                issue_number=3,
+                attempt=1,
+            )
+
+        # TL recorded from the partial trajectory (1 tool invocation).
+        self.assertEqual(collector.trajectory_lengths, [1])
+
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    def test_graceful_exhaustion_zero_tool_calls_does_not_raise(
+        self, mock_create_agent
+    ):
+        """Exhaustion on the very first step (no productive tool calls — possible
+        LangGraph v1 infinite-loop regression) still degrades gracefully rather
+        than masking the failure as a crash (ADR-0045 edge case)."""
+        # Only the input HumanMessage made it through before the cap was hit.
+        partial = {"messages": [HumanMessage(content="go")]}
+        mock_agent = MagicMock()
+        mock_agent.stream.side_effect = self._stream_then_recursion_error(partial)
+        mock_create_agent.return_value = mock_agent
+
+        result = execute_worker(issue_description="x", plan="y", node_name="execute")
+
+        self.assertIsInstance(result, str)
+        self.assertIn("[RECURSION_LIMIT_EXHAUSTED]", result)
+        self.assertIn("0 tool", result)
+
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    def test_configurable_recursion_limit_honored(self, mock_create_agent):
+        """The per-node recursion_limit resolved via resolve_model_config() is
+        passed into the LangGraph run config (no hardcoded magic constant)."""
+        mock_agent = MagicMock()
+        mock_agent.stream.return_value = iter(
+            [{"messages": [AIMessage(content="done")]}]
+        )
+        mock_create_agent.return_value = mock_agent
+
+        with patch.dict(os.environ, {"EXECUTE_RECURSION_LIMIT": "7"}):
+            execute_worker(issue_description="x", plan="y", node_name="execute")
+
+        config = mock_agent.stream.call_args.kwargs["config"]
+        self.assertEqual(config["recursion_limit"], 7)
+
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    def test_success_path_uses_default_recursion_limit(self, mock_create_agent):
+        """Without overrides, the default recursion_limit (50) is applied."""
+        mock_agent = MagicMock()
+        mock_agent.stream.return_value = iter(
+            [{"messages": [AIMessage(content="done")]}]
+        )
+        mock_create_agent.return_value = mock_agent
+
+        # Clear any stray env override so the default is used.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("EXECUTE_RECURSION_LIMIT", None)
+            os.environ.pop("AGENT_RECURSION_LIMIT", None)
+            execute_worker(issue_description="x", plan="y", node_name="execute")
+
+        config = mock_agent.stream.call_args.kwargs["config"]
+        self.assertEqual(config["recursion_limit"], 50)
+
+    # ------------------------------------------------------------------
+    # _summarize_last_action branch coverage (ADR-0045)
+    # ------------------------------------------------------------------
+
+    def test_summarize_last_action_empty_messages(self):
+        """Empty message list returns 'none (no steps taken)'."""
+        from orchestrator.worker import _summarize_last_action
+
+        self.assertEqual(_summarize_last_action([]), "none (no steps taken)")
+
+    def test_summarize_last_action_tool_calls(self):
+        """Last message with tool_calls returns the tool-call summary."""
+        from orchestrator.worker import _summarize_last_action
+
+        msg = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "read_file", "args": {}, "id": "c1", "type": "tool_call"},
+                {"name": "patch_file", "args": {}, "id": "c2", "type": "tool_call"},
+            ],
+        )
+        result = _summarize_last_action([HumanMessage(content="go"), msg])
+        self.assertIn("read_file", result)
+        self.assertIn("patch_file", result)
+
+    def test_summarize_last_action_content_snippet(self):
+        """Last message with content returns a truncated snippet."""
+        from orchestrator.worker import _summarize_last_action
+
+        msg = AIMessage(content="I have finished editing the file.")
+        result = _summarize_last_action([msg])
+        self.assertEqual(result, "I have finished editing the file.")
+
+    def test_summarize_last_action_long_content_truncated(self):
+        """Content longer than 200 chars is truncated with '...'."""
+        from orchestrator.worker import _summarize_last_action
+
+        long_text = "x" * 300
+        msg = AIMessage(content=long_text)
+        result = _summarize_last_action([msg])
+        self.assertTrue(result.endswith("..."))
+        self.assertEqual(len(result), 203)  # 200 + "..."
+
+    def test_summarize_last_action_no_content_no_tool_calls(self):
+        """Last message with empty content and no tool_calls returns
+        'no further action'."""
+        from orchestrator.worker import _summarize_last_action
+
+        msg = AIMessage(content="")
+        self.assertEqual(_summarize_last_action([msg]), "no further action")
+
+    def test_summarize_last_action_exception_returns_unknown(self):
+        """Any exception inside the helper returns 'unknown' (must not raise,
+        per ADR-0045 graceful-exhaustion path safety)."""
+        from orchestrator.worker import _summarize_last_action
+
+        # A mock that raises on getattr(last, "tool_calls", None) — simulates
+        # a broken message object. The except clause catches it.
+        broken = MagicMock()
+        # Make .tool_calls property access raise via a side-effecting spec.
+        type(broken).tool_calls = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        broken.content = ""
+        self.assertEqual(_summarize_last_action([broken]), "unknown")
