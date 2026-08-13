@@ -412,3 +412,69 @@ class TestWorkerAgent(unittest.TestCase):
 
         config = mock_agent.stream.call_args.kwargs["config"]
         self.assertEqual(config["recursion_limit"], 50)
+
+    # ------------------------------------------------------------------
+    # _summarize_last_action branch coverage (ADR-0045)
+    # ------------------------------------------------------------------
+
+    def test_summarize_last_action_empty_messages(self):
+        """Empty message list returns 'none (no steps taken)'."""
+        from orchestrator.worker import _summarize_last_action
+
+        self.assertEqual(_summarize_last_action([]), "none (no steps taken)")
+
+    def test_summarize_last_action_tool_calls(self):
+        """Last message with tool_calls returns the tool-call summary."""
+        from orchestrator.worker import _summarize_last_action
+
+        msg = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "read_file", "args": {}, "id": "c1", "type": "tool_call"},
+                {"name": "patch_file", "args": {}, "id": "c2", "type": "tool_call"},
+            ],
+        )
+        result = _summarize_last_action([HumanMessage(content="go"), msg])
+        self.assertIn("read_file", result)
+        self.assertIn("patch_file", result)
+
+    def test_summarize_last_action_content_snippet(self):
+        """Last message with content returns a truncated snippet."""
+        from orchestrator.worker import _summarize_last_action
+
+        msg = AIMessage(content="I have finished editing the file.")
+        result = _summarize_last_action([msg])
+        self.assertEqual(result, "I have finished editing the file.")
+
+    def test_summarize_last_action_long_content_truncated(self):
+        """Content longer than 200 chars is truncated with '...'."""
+        from orchestrator.worker import _summarize_last_action
+
+        long_text = "x" * 300
+        msg = AIMessage(content=long_text)
+        result = _summarize_last_action([msg])
+        self.assertTrue(result.endswith("..."))
+        self.assertEqual(len(result), 203)  # 200 + "..."
+
+    def test_summarize_last_action_no_content_no_tool_calls(self):
+        """Last message with empty content and no tool_calls returns
+        'no further action'."""
+        from orchestrator.worker import _summarize_last_action
+
+        msg = AIMessage(content="")
+        self.assertEqual(_summarize_last_action([msg]), "no further action")
+
+    def test_summarize_last_action_exception_returns_unknown(self):
+        """Any exception inside the helper returns 'unknown' (must not raise,
+        per ADR-0045 graceful-exhaustion path safety)."""
+        from orchestrator.worker import _summarize_last_action
+
+        # A mock that raises on getattr(last, "tool_calls", None) — simulates
+        # a broken message object. The except clause catches it.
+        broken = MagicMock()
+        # Make .tool_calls property access raise via a side-effecting spec.
+        type(broken).tool_calls = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        broken.content = ""
+        self.assertEqual(_summarize_last_action([broken]), "unknown")

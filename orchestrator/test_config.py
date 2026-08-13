@@ -446,6 +446,16 @@ class TestResolveRecursionLimit(unittest.TestCase):
         self.assertEqual(cfg["recursion_limit"], DEFAULT_RECURSION_LIMIT)
 
     @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_invalid_factory_recursion_limit_falls_back_to_default(self, mock_load):
+        """A malformed recursion_limit in factory.json is ignored, falling back
+        to DEFAULT_RECURSION_LIMIT (ADR-0045)."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "recursion_limit": "bad"}
+        }
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], DEFAULT_RECURSION_LIMIT)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
     def test_distinct_budgets_per_node(self, mock_load):
         """Execute and test_writer can carry distinct recursion_limits (ADR-0045)."""
         mock_load.return_value = {
