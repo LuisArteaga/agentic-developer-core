@@ -374,6 +374,55 @@ class TestClaimNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "claimed")
         self.assertEqual(new_state["branch"], "feat/issue-11")
 
+    @patch("orchestrator.nodes.start_orchestrator_loop")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_claim_oldest_lowest_numbered_issue(self, mock_api, mock_start_loop):
+        """Claim Scan claims the lowest-numbered non-blocked ready issue.
+
+        Regression test for issue #109: the GitHub REST API default sort is
+        ``created`` + ``desc`` (newest first). The ready issues are returned
+        here in that non-ascending order to verify the defensive in-code sort
+        enforces oldest-first claiming regardless of API ordering.
+        """
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if "/issues" in path and "labels=agent-blocked" in path:
+                    return []
+                elif "/issues" in path and "labels=agent-ready" in path:
+                    # API default sort (desc) returns newest first; the claim
+                    # node must re-sort to oldest-first and claim #10.
+                    return [
+                        {"number": 30, "title": "Task 30", "body": ""},
+                        {"number": 20, "title": "Task 20", "body": ""},
+                        {"number": 10, "title": "Task 10", "body": ""},
+                    ]
+                elif path.endswith("/issues/10"):
+                    # Concurrency check: #10 still has the ready label
+                    return {"labels": [{"name": "agent-ready"}]}
+            elif method in ("POST", "DELETE"):
+                if "/issues/10/labels" in path:
+                    return {}
+            raise ValueError(f"Unexpected API call: {method} {path} {body}")
+
+        mock_api.side_effect = api_side_effect
+
+        new_state = claim_node(DEFAULT_STATE.copy())
+
+        # The lowest-numbered ready issue (#10) must be claimed, not #30.
+        self.assertEqual(new_state["issue_number"], 10)
+        self.assertEqual(new_state["status"], "claimed")
+        self.assertEqual(new_state["branch"], "feat/issue-10")
+
+        # No label-transition edits should have touched the higher-numbered
+        # issues (#20, #30) since the loop breaks on the first claim.
+        non_claimed_edits = [
+            call
+            for call in mock_api.mock_calls
+            if ("/issues/20/labels" in str(call) or "/issues/30/labels" in str(call))
+        ]
+        self.assertEqual(non_claimed_edits, [])
+
 
 class TestPlanNode(unittest.TestCase):
     def setUp(self):

@@ -461,11 +461,16 @@ def claim_node(state: AgentState) -> AgentState:
         try:
             issues_data = _github_api_request(
                 "GET",
-                f"/repos/{github_repo}/issues?labels={urllib.parse.quote(label_ready)}&state=open&per_page=100",
+                f"/repos/{github_repo}/issues?labels={urllib.parse.quote(label_ready)}"
+                f"&state=open&sort=created&direction=asc&per_page=100",
             )
             ready_issues = [
                 issue for issue in issues_data if "pull_request" not in issue
             ]
+            # Defensive: enforce oldest-first (lowest number) regardless of API
+            # sort semantics or pagination, so the lowest-numbered non-blocked
+            # ready issue is always claimed.
+            ready_issues.sort(key=lambda i: i["number"])
         except Exception as e:
             logger.error("Failed to poll ready issues: %s", e)
             ready_issues = []
