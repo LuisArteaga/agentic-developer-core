@@ -390,7 +390,7 @@ class TestResolveJudgeConfigs(unittest.TestCase):
         )
 
         sec = resolve_model_config("security")
-        self.assertEqual(sec["model"], "deepseek/deepseek-v4-pro-0813")
+        self.assertEqual(sec["model"], "deepseek/deepseek-v4-pro")
         self.assertEqual(
             sec["routing"],
             ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
@@ -406,7 +406,7 @@ class TestResolveJudgeConfigs(unittest.TestCase):
         self.assertEqual(test_cov["fallback_model"], "z-ai/glm-5.2")
 
         arch = resolve_model_config("architecture")
-        self.assertEqual(arch["fallback_model"], "deepseek/deepseek-v4-pro-0813")
+        self.assertEqual(arch["fallback_model"], "deepseek/deepseek-v4-pro")
 
         sec = resolve_model_config("security")
         self.assertEqual(sec["fallback_model"], "z-ai/glm-5.2")
