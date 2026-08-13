@@ -730,27 +730,62 @@ class TestCodebaseTools(unittest.TestCase):
             del os.environ["AGENT_RUN_COMMAND_ALLOWLIST"]
 
     @unittest.mock.patch("subprocess.run")
-    def test_run_command_env_strips_secrets(self, mock_run):
-        """The child env drops named secrets and *_KEY/*_TOKEN vars."""
+    def test_run_command_env_allowlist(self, mock_run):
+        """The child env contains only allowlisted vars; secrets are absent
+        regardless of naming (ADR-0043: denylist replaced with allowlist)."""
         mock_run.return_value = unittest.mock.MagicMock(stdout=b"", returncode=0)
+        # Secret-bearing vars that the old denylist missed (no KEY/TOKEN/
+        # SECRET/PASSWORD suffix) must now be absent.
+        os.environ["DATABASE_URL"] = "postgres://user:pw@host/db"
+        os.environ["FOO_CREDENTIAL"] = "leak"
+        os.environ["MY_CONN"] = "conn-string"
+        # Named orchestrator secrets must still be absent.
         os.environ["GH_PAT"] = "ghp_" + "a" * 36
         os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-" + "b" * 24
-        os.environ["MY_DB_PASSWORD"] = "hunter2"
+        # A non-secret var not in the allowlist must also be absent.
         os.environ["KEEP_ME"] = "kept"
         try:
             run_command("echo hi")
         finally:
-            for k in ("GH_PAT", "OPENROUTER_API_KEY", "MY_DB_PASSWORD", "KEEP_ME"):
+            for k in (
+                "DATABASE_URL",
+                "FOO_CREDENTIAL",
+                "MY_CONN",
+                "GH_PAT",
+                "OPENROUTER_API_KEY",
+                "KEEP_ME",
+            ):
                 os.environ.pop(k, None)
         _, kwargs = mock_run.call_args
         child_env = kwargs["env"]
+        # Secrets absent regardless of naming.
+        self.assertNotIn("DATABASE_URL", child_env)
+        self.assertNotIn("FOO_CREDENTIAL", child_env)
+        self.assertNotIn("MY_CONN", child_env)
         self.assertNotIn("GH_PAT", child_env)
         self.assertNotIn("OPENROUTER_API_KEY", child_env)
-        self.assertNotIn("MY_DB_PASSWORD", child_env)
-        # Non-secret vars survive.
-        self.assertEqual(child_env["KEEP_ME"], "kept")
-        # PATH is preserved so binaries remain resolvable.
+        # Non-allowlisted non-secret vars are also absent (fail-closed).
+        self.assertNotIn("KEEP_ME", child_env)
+        # Allowlisted essentials are present.
         self.assertIn("PATH", child_env)
+        self.assertIn("HOME", child_env)
+        self.assertIn("LANG", child_env)
+
+    @unittest.mock.patch("subprocess.run")
+    def test_run_command_env_allowlist_override(self, mock_run):
+        """AGENT_SUBPROCESS_ENV_ALLOWLIST adds project-specific vars to the
+        child env (ADR-0043)."""
+        mock_run.return_value = unittest.mock.MagicMock(stdout=b"", returncode=0)
+        os.environ["DB_URL"] = "postgres://user:pw@host/db"
+        os.environ["AGENT_SUBPROCESS_ENV_ALLOWLIST"] = "DB_URL"
+        try:
+            run_command("echo hi")
+        finally:
+            os.environ.pop("DB_URL", None)
+            os.environ.pop("AGENT_SUBPROCESS_ENV_ALLOWLIST", None)
+        _, kwargs = mock_run.call_args
+        child_env = kwargs["env"]
+        self.assertIn("DB_URL", child_env)
 
     # ------------------------------------------------------------------
     # ADR-0037 layer 2: is_safe_path on grep_search / list_directory

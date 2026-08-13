@@ -146,6 +146,7 @@ Copy [`.env.example`](.env.example) to `.env` for the full environment surface. 
 | `GITHUB_WORKSPACE` | Local directory the Worker edits inside ([Workspace Isolation](CONTEXT.md)). |
 | `AGENT_LOG_PATH` | Where state, traces, and metrics are written (default `.agent_logs`). |
 | `AGENT_LABEL_READY` / `AGENT_LABEL_IN_PROGRESS` / `AGENT_LABEL_BLOCKED` | Issue label lifecycle (defaults: `agent-ready` / `agent-in-progress` / `agent-blocked`). |
+| `AGENT_SUBPROCESS_ENV_ALLOWLIST` | Comma-separated extra env vars to pass to `run_command` subprocesses beyond the default minimal allowlist (ADR-0043). |
 
 **Issue label lifecycle**: `agent-ready` → `agent-in-progress` (claimed) / `agent-blocked` (open dependencies) → `agent-ready` (dependencies closed, or recovery after failure).
 
