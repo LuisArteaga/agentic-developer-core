@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import collections
 import json
 import os
 import pathlib
@@ -8,6 +9,14 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+
+# ADR-0044: distinct exit code for security-block failures. Mirrored from
+# orchestrator/constants.py (the supervisor is a zero-dependency process that
+# does not import the orchestrator package, ADR-0015). The orchestrator exits
+# with this code when a path-safety block is detected, so the supervisor can
+# branch it into the circuit-breaker path instead of exponential backoff.
+SECURITY_BLOCK_EXIT_CODE = 42
 
 
 def log(msg, level="INFO"):
@@ -36,6 +45,53 @@ def read_agent_status():
     except Exception as e:
         log(f"Failed to read agent status from {filepath}: {e}", "WARN")
         return "idle"
+
+
+class SecurityBlockTracker:
+    """Rolling-window circuit breaker for security-block exits (ADR-0044).
+
+    Tracks security-block exit codes (42) over a configurable rolling time
+    window using a ``collections.deque`` of timestamps — the standard sliding-
+    window pattern (deque ``append`` + ``popleft`` eviction, O(1) amortized,
+    thread-safe in CPython). If the count of security blocks within the window
+    reaches the threshold, the circuit breaker trips and the supervisor halts,
+    preventing an active prompt-injection attack from churning across multiple
+    quarantined issues.
+
+    In-memory only: a supervisor restart resets the window. This is acceptable
+    because a restart is itself a reset event, and persisting the counter would
+    require filesystem state (violating the supervisor's zero-dependency,
+    stateless design).
+    """
+
+    def __init__(self, threshold=None, window=None):
+        self.threshold = threshold or int(
+            os.getenv("AGENT_SECURITY_BLOCK_THRESHOLD", "5")
+        )
+        self.window = window or float(os.getenv("AGENT_SECURITY_BLOCK_WINDOW", "3600"))
+        self._timestamps: collections.deque[float] = collections.deque()
+
+    def _evict(self, now):
+        """Remove timestamps older than the rolling window."""
+        cutoff = now - self.window
+        while self._timestamps and self._timestamps[0] < cutoff:
+            self._timestamps.popleft()
+
+    def record_block(self, now=None):
+        """Record a security-block exit at the given (or current) time."""
+        now = now if now is not None else time.time()
+        self._timestamps.append(now)
+        self._evict(now)
+
+    def count(self, now=None):
+        """Return the number of security blocks within the current window."""
+        now = now if now is not None else time.time()
+        self._evict(now)
+        return len(self._timestamps)
+
+    def is_tripped(self, now=None):
+        """Return True if the security-block count has reached the threshold."""
+        return self.count(now) >= self.threshold
 
 
 def validate_environment():
@@ -95,7 +151,12 @@ def verify_reachability():
 
 
 def run_iteration(
-    consecutive_crashes, run_once, poll_interval, initial_delay=1.0, max_delay=60.0
+    consecutive_crashes,
+    run_once,
+    poll_interval,
+    initial_delay=1.0,
+    max_delay=60.0,
+    security_tracker=None,
 ):
     log("Spawning orchestrator process...")
     start_time = time.time()
@@ -132,6 +193,42 @@ def run_iteration(
                 "Agent successfully processed a task. Rerunning immediately for next task..."
             )
             time.sleep(1.0)  # brief pause to prevent tight CPU looping
+    elif exit_code == SECURITY_BLOCK_EXIT_CODE:
+        # ADR-0044: a security block is a deliberate, non-retriable termination
+        # (the issue is quarantined as agent-blocked by recovery). It is NOT a
+        # crash — consecutive_crashes is reset and no exponential backoff is
+        # applied. The circuit breaker tracks the rate of security blocks
+        # across iterations; if the threshold is exceeded within the rolling
+        # window, the supervisor halts to prevent an active prompt-injection
+        # attack from churning.
+        consecutive_crashes = 0
+        if security_tracker is None:
+            security_tracker = SecurityBlockTracker()
+        security_tracker.record_block()
+        count = security_tracker.count()
+        if security_tracker.is_tripped():
+            log(
+                f"CIRCUIT_BREAKER: security blocks exceeded threshold "
+                f"({count} in {security_tracker.window}s window, threshold "
+                f"{security_tracker.threshold}). Halting supervisor.",
+                "ERROR",
+            )
+            return consecutive_crashes, True, 2
+
+        log(
+            f"Security block exit (code {exit_code}). Issue quarantined. "
+            f"Security blocks in window: {count}/{security_tracker.threshold}."
+        )
+
+        if run_once:
+            log("RUN_ONCE is enabled. Exiting supervisor with code 1.")
+            return consecutive_crashes, True, 1
+
+        status = read_agent_status()
+        if status == "idle":
+            time.sleep(poll_interval)
+        else:
+            time.sleep(1.0)
     else:
         # Orchestrator crashed
         if duration > 30.0:
@@ -168,13 +265,19 @@ def main():
     initial_delay = 1.0
     max_delay = 60.0
     consecutive_crashes = 0
+    security_tracker = SecurityBlockTracker()
 
     run_once = os.getenv("RUN_ONCE", "0").lower() in ("1", "true", "yes")
     poll_interval = float(os.getenv("AGENT_POLL_INTERVAL", "10.0"))
 
     while True:
         consecutive_crashes, should_exit, exit_code = run_iteration(
-            consecutive_crashes, run_once, poll_interval, initial_delay, max_delay
+            consecutive_crashes,
+            run_once,
+            poll_interval,
+            initial_delay,
+            max_delay,
+            security_tracker=security_tracker,
         )
         if should_exit:
             sys.exit(exit_code)

@@ -917,6 +917,45 @@ class TestCodebaseTools(unittest.TestCase):
                 with _state_lock():
                     pass
 
+    def test_runtime_security_block_telemetry_recorded(self):
+        """ADR-0044: a runtime path-safety refusal records telemetry via
+        record_security_block so the breach is searchable in Langfuse.
+
+        Verifies that _record_runtime_security_block is called at each refusal
+        site (read_file, list_directory, grep_search, patch_file) and that it
+        does not interfere with the error string returned to the agent.
+        """
+        env_file = self.temp_dir_path / ".env"
+        env_file.write_text("SECRET=leak", encoding="utf-8")
+
+        with unittest.mock.patch(
+            "orchestrator.tools.record_security_block"
+        ) as mock_record:
+            # read_file refusal
+            res = read_file(str(env_file))
+            self.assertIn("blocked by the path-safety policy", res)
+            mock_record.assert_called_once()
+            self.assertEqual(mock_record.call_args.args[0], "runtime")
+            self.assertEqual(mock_record.call_args.args[1], ".env")
+
+            # list_directory refusal
+            mock_record.reset_mock()
+            res = list_directory(str(env_file))
+            self.assertIn("blocked by the path-safety policy", res)
+            mock_record.assert_called_once()
+
+            # grep_search refusal
+            mock_record.reset_mock()
+            res = grep_search("SECRET", str(env_file))
+            self.assertIn("blocked by the path-safety policy", res)
+            mock_record.assert_called_once()
+
+            # patch_file refusal
+            mock_record.reset_mock()
+            res = patch_file(str(env_file), "SECRET=leak", "SECRET=pwned")
+            self.assertIn("blocked by the path-safety policy", res)
+            mock_record.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

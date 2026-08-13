@@ -15,6 +15,7 @@ from scripts.telemetry import (
     end_orchestrator_phase,
     get_agent_logs_dir,
     init_telemetry,
+    record_security_block,
     start_orchestrator_loop,
     start_orchestrator_phase,
 )
@@ -523,6 +524,85 @@ class TestTelemetryIntegration(unittest.TestCase):
         model_attr = str(attrs.get("llm.model_name", ""))
         self.assertNotIn(secret_model, model_attr)
         self.assertIn("[REDACTED:sk-or-v1]", model_attr)
+
+    def test_record_security_block_persists_to_state(self):
+        """record_security_block appends a record to _state['security_blocks'] (ADR-0044)."""
+        init_telemetry(reset_state=True)
+        start_orchestrator_loop(issue_number=77)
+
+        record_security_block(layer="plan", blocked_path=".env", issue_number=77)
+        record_security_block(
+            layer="runtime", blocked_path=".git/config", issue_number=77
+        )
+
+        state_file = self.test_dir_path / "telemetry_state.json"
+        with open(state_file, "r") as f:
+            state_data = json.load(f)
+
+        blocks = state_data.get("security_blocks", [])
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0]["layer"], "plan")
+        self.assertEqual(blocks[0]["blocked_path"], ".env")
+        self.assertEqual(blocks[0]["issue_number"], 77)
+        self.assertEqual(blocks[1]["layer"], "runtime")
+        self.assertEqual(blocks[1]["blocked_path"], ".git/config")
+
+    def test_record_security_block_resets_on_new_loop(self):
+        """security_blocks is wiped on start_orchestrator_loop (fresh cycle)."""
+        init_telemetry(reset_state=True)
+        start_orchestrator_loop(issue_number=1)
+        record_security_block(layer="plan", blocked_path=".env", issue_number=1)
+
+        # Start a new loop — should wipe prior security blocks
+        start_orchestrator_loop(issue_number=2)
+        state_file = self.test_dir_path / "telemetry_state.json"
+        with open(state_file, "r") as f:
+            state_data = json.load(f)
+        self.assertEqual(state_data.get("security_blocks", []), [])
+
+    def test_security_block_span_enrichment(self):
+        """_export_recorded_spans attaches security.block event + langfuse.trace.tags
+        + ERROR status on the matching phase span (ADR-0044).
+
+        Verifies the three Langfuse-searchability signals:
+        - tag:security-block (via langfuse.trace.tags attribute)
+        - security.block span event
+        - ERROR span status
+        """
+        if not HAS_OTEL:
+            self.skipTest("OpenTelemetry is not installed in the current environment.")
+
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        exporter = InMemorySpanExporter()
+        init_telemetry(in_memory_exporter=exporter, reset_state=True)
+
+        start_orchestrator_loop(issue_number=100)
+        start_orchestrator_phase("plan")
+        # Record a security block during the plan phase
+        record_security_block(layer="plan", blocked_path=".env", issue_number=100)
+        end_orchestrator_phase(exit_code=1)
+        end_orchestrator_loop(exit_code=42)
+
+        spans = exporter.get_finished_spans()
+        spans_by_name = {span.name: span for span in spans}
+
+        # The plan phase span should carry the security.block event + tag + ERROR
+        plan_span = spans_by_name["orchestrator_phase_plan"]
+        plan_attrs = plan_span.attributes or {}
+        self.assertEqual(plan_attrs.get("langfuse.trace.tags"), ("security-block",))
+
+        # Span status should be ERROR
+        from opentelemetry.trace import StatusCode
+
+        self.assertEqual(plan_span.status.status_code, StatusCode.ERROR)
+
+        # The loop span should also carry the tag (trace-level filterability)
+        loop_span = spans_by_name["orchestrator_loop"]
+        loop_attrs = loop_span.attributes or {}
+        self.assertEqual(loop_attrs.get("langfuse.trace.tags"), ("security-block",))
 
 
 if __name__ == "__main__":

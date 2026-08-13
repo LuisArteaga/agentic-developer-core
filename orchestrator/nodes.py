@@ -42,6 +42,7 @@ from orchestrator.state import AgentState
 from orchestrator.tools import _truncate_output
 from scripts.telemetry import (
     end_orchestrator_phase,
+    record_security_block,
     start_orchestrator_loop,
     start_orchestrator_phase,
 )
@@ -867,9 +868,33 @@ def plan_node(state: AgentState) -> AgentState:
         for task in plan_obj.tasks:
             for file_path in task.target_files:
                 if not _is_safe_path(file_path):
-                    raise ValueError(
-                        f"Security Block: Plan contains unsafe or forbidden target path '{file_path}'."
+                    # Security Block (ADR-0044): a planned target path is
+                    # blocked by the path-safety policy. This is a permanent,
+                    # non-retriable failure — the issue is quarantined (labelled
+                    # agent-blocked by recovery) and the supervisor exits with a
+                    # distinct code (42) so it is not retried with backoff.
+                    # Record telemetry for Langfuse observability (searchable
+                    # via tag:security-block) before setting the error prefix
+                    # that recovery and __main__ branch on.
+                    issue_num = state.get("issue_number")
+                    _safe_telemetry(
+                        record_security_block,
+                        layer="plan",
+                        blocked_path=file_path,
+                        issue_number=issue_num,
                     )
+                    logger.error(
+                        "Security Block: Plan contains unsafe or forbidden "
+                        "target path '%s'. Quarantining issue #%s.",
+                        file_path,
+                        issue_num,
+                    )
+                    state["status"] = "failed"
+                    state["phase"] = "planning"
+                    state["error"] = f"security_block: {file_path}"
+                    state_module.save(state)
+                    _safe_telemetry(end_orchestrator_phase, exit_code=1)
+                    return state
 
         # 9. Serialize plan and update state
         plan_json = plan_obj.model_dump_json(indent=2)
@@ -2194,16 +2219,34 @@ def recovery_node(state: AgentState) -> AgentState:
         logger.info("Workspace hygiene completed in Recovery.")
 
         # 2. Reset GitHub labels
+        # ADR-0044: a security-block failure is permanent and non-retriable.
+        # Quarantine the issue with the agent-blocked label (instead of
+        # agent-ready) so the claim scan skips it on subsequent iterations,
+        # preventing a tight loop on a permanently-failing issue. A human can
+        # manually remove agent-blocked to re-queue the issue after remediation.
         github_repo = _get_github_repository(workspace_path)
         label_ready = os.getenv("AGENT_LABEL_READY", "agent-ready").strip()
         label_in_progress = os.getenv(
             "AGENT_LABEL_IN_PROGRESS", "agent-in-progress"
         ).strip()
+        label_blocked = os.getenv("AGENT_LABEL_BLOCKED", "agent-blocked").strip()
 
-        logger.info(
-            "Resetting issue #%d label back to ready '%s'...", issue_num, label_ready
-        )
-        _add_label(github_repo, issue_num, label_ready)
+        is_security_block = (state.get("error") or "").startswith("security_block:")
+        if is_security_block:
+            logger.warning(
+                "Security block detected for issue #%d. Quarantining with "
+                "label '%s' (skipping agent-ready).",
+                issue_num,
+                label_blocked,
+            )
+            _add_label(github_repo, issue_num, label_blocked)
+        else:
+            logger.info(
+                "Resetting issue #%d label back to ready '%s'...",
+                issue_num,
+                label_ready,
+            )
+            _add_label(github_repo, issue_num, label_ready)
         _remove_label(github_repo, issue_num, label_in_progress)
 
     except Exception as e:
