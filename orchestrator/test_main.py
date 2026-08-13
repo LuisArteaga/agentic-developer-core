@@ -1,4 +1,7 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator.__main__ import main
@@ -11,6 +14,13 @@ class TestMainTelemetryWiring(unittest.TestCase):
     state's issue_number and branch to init_telemetry so the Langfuse session ID
     is constructed correctly on both fresh runs and stateful resumes.
     """
+
+    def setUp(self):
+        # Issue #107: main() now calls _load_env_file(). Patch it so the real
+        # project .env does not leak into os.environ and pollute other tests.
+        patcher = patch("orchestrator.__main__._load_env_file", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @patch("orchestrator.__main__.end_orchestrator_loop")
     @patch("orchestrator.__main__.init_telemetry")
@@ -81,6 +91,13 @@ class TestMainMetricsOrchestration(unittest.TestCase):
     (ADR-0029): the cycle-level reset + conditional write path that the
     MetricsCollector unit tests do not exercise.
     """
+
+    def setUp(self):
+        # Issue #107: main() now calls _load_env_file(). Patch it so the real
+        # project .env does not leak into os.environ and pollute other tests.
+        patcher = patch("orchestrator.__main__._load_env_file", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_reset_called_before_graph_invoke(self):
         """get_collector().reset() is called before graph.invoke()."""
@@ -283,6 +300,147 @@ class TestMainMetricsOrchestration(unittest.TestCase):
 
         collector.reset.assert_called_once_with()
         collector.write_record.assert_not_called()
+
+
+class TestMainDotenvLoading(unittest.TestCase):
+    """Issue #107: main() must load .env at startup so target-repo env vars
+    (GITHUB_REPOSITORY, GITHUB_WORKSPACE, ...) take effect without requiring the
+    calling shell to export them manually. Uses a stdlib loader (ADR-0017)."""
+
+    @patch("orchestrator.__main__.end_orchestrator_loop")
+    @patch("orchestrator.__main__.init_telemetry")
+    @patch("orchestrator.__main__.graph")
+    @patch("orchestrator.__main__.state_module")
+    @patch("orchestrator.__main__.setup_logging")
+    @patch("orchestrator.__main__._load_env_file", return_value=True)
+    def test_load_env_called_before_graph_invoke(
+        self,
+        mock_load_env,
+        mock_setup_logging,
+        mock_state_module,
+        mock_graph,
+        mock_init_telemetry,
+        mock_end_loop,
+    ):
+        """main() invokes _load_env_file() exactly once, before the graph runs."""
+        call_order = []
+
+        def record_load(*args, **kwargs):
+            call_order.append("load_env")
+            return True
+
+        def record_invoke(*args, **kwargs):
+            call_order.append("graph.invoke")
+            return state
+
+        mock_load_env.side_effect = record_load
+        mock_graph.invoke.side_effect = record_invoke
+        state = {"issue_number": None, "branch": None, "status": "idle"}
+        mock_state_module.load.return_value = state
+
+        main()
+
+        mock_load_env.assert_called_once_with()
+        self.assertEqual(call_order, ["load_env", "graph.invoke"])
+
+
+class TestLoadEnvFile(unittest.TestCase):
+    """Direct unit tests for the stdlib _load_env_file loader (issue #107).
+
+    Covers override=False semantics, comment/blank-line handling, quote
+    stripping, the `export` directive, and directory walk-up. Replaces the
+    python-dotenv dependency per ADR-0017's minimal-dependency philosophy.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name).resolve()
+        # Snapshot keys we may touch so tearDown can restore them.
+        self._snap = {}
+        for k in ("FOO", "BAR", "BAZ", "QUOTED", "EXPORTED"):
+            self._snap[k] = os.environ.get(k)
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._snap.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmpdir.cleanup()
+
+    def test_loads_key_value_pairs(self):
+        """Basic KEY=VALUE lines are loaded into os.environ."""
+        (self.dir / ".env").write_text("FOO=1\nBAR=hello\n", encoding="utf-8")
+        from orchestrator.__main__ import _load_env_file
+
+        result = _load_env_file(self.dir)
+        self.assertTrue(result)
+        self.assertEqual(os.environ["FOO"], "1")
+        self.assertEqual(os.environ["BAR"], "hello")
+
+    def test_does_not_override_existing(self):
+        """override=False: an already-set env var is not overwritten."""
+        os.environ["FOO"] = "from-shell"
+        (self.dir / ".env").write_text("FOO=from-file\n", encoding="utf-8")
+        from orchestrator.__main__ import _load_env_file
+
+        _load_env_file(self.dir)
+        self.assertEqual(os.environ["FOO"], "from-shell")
+
+    def test_skips_comments_and_blanks(self):
+        """Comment lines and blank lines are ignored."""
+        (self.dir / ".env").write_text(
+            "# a comment\n\nFOO=1\n   # indented comment\nBAR=2\n",
+            encoding="utf-8",
+        )
+        from orchestrator.__main__ import _load_env_file
+
+        _load_env_file(self.dir)
+        self.assertEqual(os.environ["FOO"], "1")
+        self.assertEqual(os.environ["BAR"], "2")
+
+    def test_strips_surrounding_quotes(self):
+        """Matching surrounding single/double quotes are stripped."""
+        (self.dir / ".env").write_text(
+            "QUOTED=\"double value\"\nBAZ='single value'\n", encoding="utf-8"
+        )
+        from orchestrator.__main__ import _load_env_file
+
+        _load_env_file(self.dir)
+        self.assertEqual(os.environ["QUOTED"], "double value")
+        self.assertEqual(os.environ["BAZ"], "single value")
+
+    def test_handles_export_directive(self):
+        """A leading `export ` directive is stripped."""
+        (self.dir / ".env").write_text("export EXPORTED=yes\n", encoding="utf-8")
+        from orchestrator.__main__ import _load_env_file
+
+        _load_env_file(self.dir)
+        self.assertEqual(os.environ["EXPORTED"], "yes")
+
+    def test_returns_false_when_no_env_file(self):
+        """Returns False when no .env file is found anywhere up the tree."""
+        from orchestrator.__main__ import _load_env_file
+
+        # Use a fresh empty subdir with no .env anywhere up to / .
+        sub = self.dir / "deep" / "nested"
+        sub.mkdir(parents=True)
+        # This may still find a .env higher up on the host; assert against a
+        # path guaranteed empty by pointing at the tmpdir itself (no .env).
+        (self.dir / ".env").unlink(missing_ok=True)
+        self.assertFalse(_load_env_file(self.dir))
+
+    def test_walks_up_to_find_env(self):
+        """Finds .env in a parent directory when start_path is a subdirectory."""
+        (self.dir / ".env").write_text("FOO=found\n", encoding="utf-8")
+        sub = self.dir / "sub" / "inner"
+        sub.mkdir(parents=True)
+        from orchestrator.__main__ import _load_env_file
+
+        result = _load_env_file(sub)
+        self.assertTrue(result)
+        self.assertEqual(os.environ["FOO"], "found")
 
 
 if __name__ == "__main__":

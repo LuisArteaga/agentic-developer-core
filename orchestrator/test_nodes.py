@@ -4000,5 +4000,184 @@ class TestIsinstanceGuardCoverage(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
 
 
+class TestGetGithubRepositorySelfTargetWarning(unittest.TestCase):
+    """Issue #107: when GITHUB_REPOSITORY is unset and the fallback resolves to
+    the orchestrator's own repository, a warning naming both repos must be logged
+    exactly once (deduped) so the silent self-polling footgun surfaces."""
+
+    def setUp(self):
+        self.original_repo = os.environ.get("GITHUB_REPOSITORY")
+        os.environ.pop("GITHUB_REPOSITORY", None)
+        # Reset the module-level dedup flag before each test.
+        import orchestrator.nodes as nodes_mod
+
+        nodes_mod._SELF_TARGET_WARNED = False
+
+    def tearDown(self):
+        if self.original_repo is None:
+            os.environ.pop("GITHUB_REPOSITORY", None)
+        else:
+            os.environ["GITHUB_REPOSITORY"] = self.original_repo
+
+    @patch("orchestrator.nodes._resolve_own_repo_remote", return_value="me/myself")
+    @patch("orchestrator.nodes.get_remote_url")
+    def test_warns_when_env_unset_and_resolved_equals_own_repo(
+        self, mock_remote, mock_own
+    ):
+        """A warning naming both repos is logged on the self-target fallback."""
+        from orchestrator.nodes import _get_github_repository
+
+        mock_remote.return_value = "git@github.com:me/myself.git"
+
+        with self.assertLogs("orchestrator.nodes", level="WARNING") as cm:
+            repo = _get_github_repository(Path("/some/workspace"))
+
+        self.assertEqual(repo, "me/myself")
+        self.assertTrue(any("me/myself" in msg for msg in cm.output))
+        self.assertTrue(any("GITHUB_REPOSITORY is not set" in msg for msg in cm.output))
+
+    @patch("orchestrator.nodes._resolve_own_repo_remote", return_value="me/myself")
+    @patch("orchestrator.nodes.get_remote_url")
+    def test_no_warn_when_github_repository_env_set(self, mock_remote, mock_own):
+        """When GITHUB_REPOSITORY is set explicitly, no fallback (and no warning) occurs."""
+        from orchestrator.nodes import _get_github_repository
+
+        os.environ["GITHUB_REPOSITORY"] = "explicit/target"
+
+        with self.assertNoLogs("orchestrator.nodes", level="WARNING"):
+            repo = _get_github_repository(Path("/some/workspace"))
+
+        self.assertEqual(repo, "explicit/target")
+        mock_remote.assert_not_called()
+
+    @patch("orchestrator.nodes._resolve_own_repo_remote", return_value="me/myself")
+    @patch("orchestrator.nodes.get_remote_url")
+    def test_warning_deduped_across_calls(self, mock_remote, mock_own):
+        """The self-target warning fires at most once per process."""
+        from orchestrator.nodes import _get_github_repository
+
+        mock_remote.return_value = "git@github.com:me/myself.git"
+
+        with self.assertLogs("orchestrator.nodes", level="WARNING") as cm:
+            _get_github_repository(Path("/some/workspace"))
+            _get_github_repository(Path("/some/workspace"))
+            _get_github_repository(Path("/some/workspace"))
+
+        warning_msgs = [m for m in cm.output if "GITHUB_REPOSITORY is not set" in m]
+        self.assertEqual(
+            len(warning_msgs),
+            1,
+            "self-target warning must be deduped to a single emission",
+        )
+
+    @patch("orchestrator.nodes._resolve_own_repo_remote", return_value="me/myself")
+    @patch("orchestrator.nodes.get_remote_url")
+    def test_no_warn_when_resolved_repo_differs_from_own(self, mock_remote, mock_own):
+        """No warning when the fallback resolves to a repo other than the orchestrator's own."""
+        from orchestrator.nodes import _get_github_repository
+
+        mock_remote.return_value = "git@github.com:other/project.git"
+
+        with self.assertNoLogs("orchestrator.nodes", level="WARNING"):
+            repo = _get_github_repository(Path("/some/workspace"))
+
+        self.assertEqual(repo, "other/project")
+
+
+class TestParseOwnerRepoFromUrl(unittest.TestCase):
+    """Direct unit tests for _parse_owner_repo_from_url (issue #107).
+
+    Exercises the URL-parsing helper that the SelfTargetWarning tests mock away,
+    covering SSH, HTTPS, and the generic fallback branch.
+    """
+
+    def test_https_url(self):
+        from orchestrator.nodes import _parse_owner_repo_from_url
+
+        self.assertEqual(
+            _parse_owner_repo_from_url("https://github.com/owner/repo.git"),
+            "owner/repo",
+        )
+
+    def test_ssh_url(self):
+        from orchestrator.nodes import _parse_owner_repo_from_url
+
+        self.assertEqual(
+            _parse_owner_repo_from_url("git@github.com:owner/repo.git"),
+            "owner/repo",
+        )
+
+    def test_strips_no_git_suffix(self):
+        from orchestrator.nodes import _parse_owner_repo_from_url
+
+        self.assertEqual(
+            _parse_owner_repo_from_url("https://github.com/owner/repo"),
+            "owner/repo",
+        )
+
+    def test_generic_fallback(self):
+        from orchestrator.nodes import _parse_owner_repo_from_url
+
+        self.assertEqual(
+            _parse_owner_repo_from_url("somehost:owner/repo.git"),
+            "owner/repo",
+        )
+
+
+class TestResolveOwnRepoRemote(unittest.TestCase):
+    """Direct unit tests for _resolve_own_repo_remote (issue #107, [Q4]).
+
+    Exercises the helper that resolves the orchestrator's own owner/repo from
+    its git remote origin. The SelfTargetWarning tests mock this away; these
+    tests cover it directly so the production code path is exercised.
+    """
+
+    @patch("orchestrator.nodes.get_remote_url")
+    def test_resolves_own_repo_from_remote(self, mock_remote):
+        from orchestrator.nodes import _resolve_own_repo_remote
+
+        mock_remote.return_value = "git@github.com:me/myself.git"
+        result = _resolve_own_repo_remote()
+        self.assertEqual(result, "me/myself")
+
+    @patch("orchestrator.nodes.get_remote_url")
+    def test_returns_none_on_failure(self, mock_remote):
+        from orchestrator.nodes import _resolve_own_repo_remote
+
+        mock_remote.side_effect = RuntimeError("no remote")
+        result = _resolve_own_repo_remote()
+        self.assertIsNone(result)
+
+
+class TestGetGithubRepositoryErrorBranch(unittest.TestCase):
+    """Direct unit tests for _get_github_repository's fallback error branch
+    (issue #107, [Q4]). Exercises the `except` path that raises ValueError when
+    get_remote_url fails — the SelfTargetWarning tests mock get_remote_url to
+    succeed, leaving this branch uncovered."""
+
+    def setUp(self):
+        self.original_repo = os.environ.get("GITHUB_REPOSITORY")
+        os.environ.pop("GITHUB_REPOSITORY", None)
+
+    def tearDown(self):
+        if self.original_repo is None:
+            os.environ.pop("GITHUB_REPOSITORY", None)
+        else:
+            os.environ["GITHUB_REPOSITORY"] = self.original_repo
+
+    @patch("orchestrator.nodes.get_remote_url")
+    def test_raises_value_error_when_remote_resolution_fails(self, mock_remote):
+        """When get_remote_url raises and GITHUB_REPOSITORY is unset, _get_github_repository raises ValueError."""
+        from orchestrator.nodes import _get_github_repository
+
+        mock_remote.side_effect = RuntimeError("no remote configured")
+
+        with self.assertRaises(ValueError) as ctx:
+            _get_github_repository(Path("/some/workspace"))
+
+        self.assertIn("GITHUB_REPOSITORY", str(ctx.exception))
+        self.assertIn("no remote configured", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

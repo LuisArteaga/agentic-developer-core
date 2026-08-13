@@ -1,10 +1,58 @@
 import logging
+import os
 import sys
+from pathlib import Path
 
 from orchestrator import state as state_module
 from orchestrator.graph import graph
 from orchestrator.metrics import get_collector
 from scripts.telemetry import end_orchestrator_loop, init_telemetry
+
+
+def _load_env_file(start_path: Path | None = None) -> bool:
+    """Load a .env file into os.environ using override=False semantics.
+
+    Walks up from ``start_path`` (default: CWD) looking for a ``.env`` file,
+    mirroring python-dotenv's ``find_dotenv`` behavior. For each KEY=VALUE line
+    the variable is set only if not already present in the environment, so
+    already-exported shell variables take precedence — the same contract as
+    ``load_dotenv(override=False)``.
+
+    Implemented in the stdlib (ADR-0017 minimal-dependency philosophy) rather
+    than adding python-dotenv as a direct dependency for startup infrastructure.
+
+    Returns True if a .env file was found and loaded, False otherwise.
+    """
+    search_dir = (start_path or Path.cwd()).resolve()
+    env_path: Path | None = None
+    for parent in (search_dir, *search_dir.parents):
+        candidate = parent / ".env"
+        if candidate.is_file():
+            env_path = candidate
+            break
+    if env_path is None:
+        return False
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Strip an optional leading `export ` directive.
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        # Strip matching surrounding single or double quotes.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key not in os.environ:
+            os.environ[key] = value
+    return True
 
 
 def setup_logging():
@@ -21,6 +69,18 @@ def main():
     setup_logging()
     logger = logging.getLogger("orchestrator.main")
     logger.info("Initializing Orchestrator...")
+
+    # Load .env (issue #107) before anything reads target-repo environment
+    # variables (state_module.load reads AGENT_LOG_PATH; nodes read
+    # GITHUB_REPOSITORY/GITHUB_WORKSPACE). override=False semantics so
+    # already-exported shell variables take precedence; .env only fills the
+    # gaps. This prevents the orchestrator from silently falling back to
+    # polling its own repository when target-repo env vars are not exported.
+    # Implemented in the stdlib per ADR-0017 (minimal-dependency philosophy).
+    if _load_env_file():
+        logger.info(".env file loaded into environment.")
+    else:
+        logger.debug("No .env file found; relying on exported environment variables.")
 
     # Load state (handles resuming from state.json if present)
     state = state_module.load()
