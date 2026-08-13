@@ -7,6 +7,7 @@ from pathlib import Path
 
 from orchestrator.config import (
     DEFAULT_MODEL,
+    DEFAULT_RECURSION_LIMIT,
     DEFAULT_ROUTING,
     FACTORY_JSON_PATH,
     _load_factory_config,
@@ -344,6 +345,125 @@ class TestResolveModelConfig(unittest.TestCase):
         cfg = resolve_model_config("execute")
         self.assertEqual(cfg["model"], DEFAULT_MODEL)
         self.assertIsNone(cfg["fallback_model"])
+
+
+class TestResolveRecursionLimit(unittest.TestCase):
+    """Tests for the per-node Worker Recursion Budget resolution (ADR-0045)."""
+
+    # Env vars that can override recursion_limit (and the model env touched by
+    # the env-override-path test); isolated per-test.
+    _ENV_VARS = [
+        "AGENT_RECURSION_LIMIT",
+        "EXECUTE_RECURSION_LIMIT",
+        "TEST_WRITER_RECURSION_LIMIT",
+        "PLAN_RECURSION_LIMIT",
+        "EXECUTE_MODEL",
+    ]
+
+    def setUp(self):
+        self.original_env = {}
+        for var in self._ENV_VARS:
+            self.original_env[var] = os.environ.get(var)
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        for var, val in self.original_env.items():
+            if val is not None:
+                os.environ[var] = val
+            else:
+                os.environ.pop(var, None)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_default_when_factory_has_no_recursion_limit(self, mock_load):
+        """Absent recursion_limit in factory.json resolves to DEFAULT_RECURSION_LIMIT."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "temperature": 0.0}
+        }
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], DEFAULT_RECURSION_LIMIT)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_default_on_hardcoded_fallback_path(self, mock_load):
+        """Hardcoded fallback path (node absent) still resolves recursion_limit."""
+        mock_load.return_value = {}
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], DEFAULT_RECURSION_LIMIT)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_factory_recursion_limit_honored(self, mock_load):
+        """factory.json recursion_limit is passed through in the factory path."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "recursion_limit": 99}
+        }
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], 99)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_node_specific_env_overrides_factory(self, mock_load):
+        """EXECUTE_RECURSION_LIMIT takes precedence over factory.json."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "recursion_limit": 99}
+        }
+        os.environ["EXECUTE_RECURSION_LIMIT"] = "7"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], 7)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_agent_recursion_limit_general_fallback(self, mock_load):
+        """AGENT_RECURSION_LIMIT applies when no node-specific var is set."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "recursion_limit": 99}
+        }
+        os.environ["AGENT_RECURSION_LIMIT"] = "42"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], 42)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_node_specific_overrides_agent_recursion_limit(self, mock_load):
+        """Node-specific var wins over AGENT_RECURSION_LIMIT."""
+        mock_load.return_value = {}
+        os.environ["AGENT_RECURSION_LIMIT"] = "42"
+        os.environ["EXECUTE_RECURSION_LIMIT"] = "11"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], 11)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_invalid_env_falls_back_to_factory(self, mock_load):
+        """A malformed env value is ignored, falling back to factory.json."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "recursion_limit": 80}
+        }
+        os.environ["EXECUTE_RECURSION_LIMIT"] = "not-a-number"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], 80)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_invalid_env_falls_back_to_default(self, mock_load):
+        """A malformed env value with no factory entry falls back to default."""
+        mock_load.return_value = {"execute": {"model": "m", "routing": ["X"]}}
+        os.environ["EXECUTE_RECURSION_LIMIT"] = "not-a-number"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], DEFAULT_RECURSION_LIMIT)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_distinct_budgets_per_node(self, mock_load):
+        """Execute and test_writer can carry distinct recursion_limits (ADR-0045)."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "recursion_limit": 60},
+            "test_writer": {"model": "m", "routing": ["X"], "recursion_limit": 40},
+        }
+        self.assertEqual(resolve_model_config("execute")["recursion_limit"], 60)
+        self.assertEqual(resolve_model_config("test_writer")["recursion_limit"], 40)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_env_override_path_still_resolves_recursion_limit(self, mock_load):
+        """The model env-override path also returns a recursion_limit."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "recursion_limit": 55}
+        }
+        os.environ["EXECUTE_MODEL"] = "other-model"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], 55)
 
 
 class TestResolveJudgeConfigs(unittest.TestCase):

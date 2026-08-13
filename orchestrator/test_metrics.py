@@ -429,7 +429,7 @@ class TestRunMetricsWiring(unittest.TestCase):
 
         messages = self._trajectory_messages()
         mock_agent = MagicMock()
-        mock_agent.invoke.return_value = {"messages": messages}
+        mock_agent.stream.return_value = iter([{"messages": messages}])
         mock_create_agent.return_value = mock_agent
 
         execute_worker("x", "y", node_name="execute", issue_number=42, attempt=1)
@@ -445,7 +445,7 @@ class TestRunMetricsWiring(unittest.TestCase):
 
         messages = self._trajectory_messages()
         mock_agent = MagicMock()
-        mock_agent.invoke.return_value = {"messages": messages}
+        mock_agent.stream.return_value = iter([{"messages": messages}])
         mock_create_agent.return_value = mock_agent
 
         execute_worker("x", "y", node_name="test_writer", issue_number=42, attempt=1)
