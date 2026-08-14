@@ -113,7 +113,7 @@ def main():
         # partial metrics from a previous (crashed) run.
         get_collector().reset()
         logger.info("Invoking LangGraph execution workflow...")
-        final_state = graph.invoke(state)
+        final_state = graph.invoke(state)  # type: ignore[arg-type]
         logger.info(
             "Workflow execution finished successfully. Final status: '%s'",
             final_state.get("status"),
