@@ -6,6 +6,9 @@ import unittest.mock
 from pathlib import Path
 
 from orchestrator.config import (
+    DEFAULT_LOOP_HARD_LIMIT,
+    DEFAULT_LOOP_WARN_THRESHOLD,
+    DEFAULT_LOOP_WINDOW_SIZE,
     DEFAULT_MODEL,
     DEFAULT_RECURSION_LIMIT,
     DEFAULT_ROUTING,
@@ -474,6 +477,156 @@ class TestResolveRecursionLimit(unittest.TestCase):
         os.environ["EXECUTE_MODEL"] = "other-model"
         cfg = resolve_model_config("execute")
         self.assertEqual(cfg["recursion_limit"], 55)
+
+
+class TestResolveLoopConfig(unittest.TestCase):
+    """Tests for the per-node Tool Loop Detection config (issue #121 / ADR-0046)."""
+
+    _ENV_VARS = [
+        "AGENT_LOOP_WARN_THRESHOLD",
+        "AGENT_LOOP_HARD_LIMIT",
+        "AGENT_LOOP_WINDOW_SIZE",
+        "EXECUTE_LOOP_WARN_THRESHOLD",
+        "EXECUTE_LOOP_HARD_LIMIT",
+        "EXECUTE_LOOP_WINDOW_SIZE",
+        "TEST_WRITER_LOOP_HARD_LIMIT",
+        "EXECUTE_MODEL",
+    ]
+
+    def setUp(self):
+        self.original_env = {}
+        for var in self._ENV_VARS:
+            self.original_env[var] = os.environ.get(var)
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        for var, val in self.original_env.items():
+            if val is not None:
+                os.environ[var] = val
+            else:
+                os.environ.pop(var, None)
+
+    def _loop(self, cfg):
+        return (
+            cfg["loop_warn_threshold"],
+            cfg["loop_hard_limit"],
+            cfg["loop_window_size"],
+        )
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_defaults_when_factory_has_no_loop_keys(self, mock_load):
+        """Absent loop keys resolve to the defaults."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "temperature": 0.0}
+        }
+        cfg = resolve_model_config("execute")
+        self.assertEqual(
+            self._loop(cfg),
+            (
+                DEFAULT_LOOP_WARN_THRESHOLD,
+                DEFAULT_LOOP_HARD_LIMIT,
+                DEFAULT_LOOP_WINDOW_SIZE,
+            ),
+        )
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_defaults_on_hardcoded_fallback_path(self, mock_load):
+        """Hardcoded fallback path (node absent) still resolves loop config."""
+        mock_load.return_value = {}
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["loop_hard_limit"], DEFAULT_LOOP_HARD_LIMIT)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_factory_loop_keys_honored(self, mock_load):
+        """factory.json loop keys are passed through in the factory path."""
+        mock_load.return_value = {
+            "execute": {
+                "model": "m",
+                "routing": ["X"],
+                "loop_warn_threshold": 2,
+                "loop_hard_limit": 4,
+                "loop_window_size": 8,
+            }
+        }
+        cfg = resolve_model_config("execute")
+        self.assertEqual(self._loop(cfg), (2, 4, 8))
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_node_specific_env_overrides_factory(self, mock_load):
+        """EXECUTE_LOOP_HARD_LIMIT takes precedence over factory.json."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "loop_hard_limit": 9}
+        }
+        os.environ["EXECUTE_LOOP_HARD_LIMIT"] = "3"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["loop_hard_limit"], 3)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_agent_general_env_fallback(self, mock_load):
+        """AGENT_LOOP_HARD_LIMIT applies when no node-specific var is set."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "loop_hard_limit": 9}
+        }
+        os.environ["AGENT_LOOP_HARD_LIMIT"] = "7"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["loop_hard_limit"], 7)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_node_specific_overrides_agent_env(self, mock_load):
+        """Node-specific var wins over AGENT_LOOP_*."""
+        mock_load.return_value = {}
+        os.environ["AGENT_LOOP_HARD_LIMIT"] = "7"
+        os.environ["EXECUTE_LOOP_HARD_LIMIT"] = "4"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["loop_hard_limit"], 4)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_invalid_env_falls_back_to_factory(self, mock_load):
+        """A malformed env value is ignored, falling back to factory.json."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "loop_hard_limit": 6}
+        }
+        os.environ["EXECUTE_LOOP_HARD_LIMIT"] = "not-a-number"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["loop_hard_limit"], 6)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_invalid_factory_value_falls_back_to_default(self, mock_load):
+        """A malformed loop_hard_limit in factory.json is ignored."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "loop_hard_limit": "bad"}
+        }
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["loop_hard_limit"], DEFAULT_LOOP_HARD_LIMIT)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_distinct_loop_config_per_node(self, mock_load):
+        """Execute and test_writer can carry distinct loop config."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "loop_hard_limit": 8},
+            "test_writer": {"model": "m", "routing": ["X"], "loop_hard_limit": 3},
+        }
+        self.assertEqual(resolve_model_config("execute")["loop_hard_limit"], 8)
+        self.assertEqual(resolve_model_config("test_writer")["loop_hard_limit"], 3)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_env_override_path_still_resolves_loop_config(self, mock_load):
+        """The model env-override path also returns loop config."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "loop_hard_limit": 6}
+        }
+        os.environ["EXECUTE_MODEL"] = "other-model"
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["loop_hard_limit"], 6)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_hard_limit_zero_disables(self, mock_load):
+        """loop_hard_limit=0 is a valid disabling sentinel (resolved, not crashing)."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "loop_hard_limit": 0}
+        }
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["loop_hard_limit"], 0)
 
 
 class TestResolveJudgeConfigs(unittest.TestCase):

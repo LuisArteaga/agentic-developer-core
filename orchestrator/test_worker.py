@@ -6,10 +6,17 @@ import unittest.mock
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 
-from orchestrator.worker import execute_worker, get_worker_tools
+from orchestrator.worker import (
+    LoopDetectionMiddleware,
+    ToolLoopDetector,
+    _canonicalize_args,
+    _format_loop_signature,
+    execute_worker,
+    get_worker_tools,
+)
 
 
 class TestWorkerAgent(unittest.TestCase):
@@ -478,3 +485,332 @@ class TestWorkerAgent(unittest.TestCase):
         )
         broken.content = ""
         self.assertEqual(_summarize_last_action([broken]), "unknown")
+
+
+class TestToolLoopDetector(unittest.TestCase):
+    """Unit tests for the ToolLoopDetector (issue #121 / ADR-0046)."""
+
+    def test_no_signatures_is_ok(self):
+        d = ToolLoopDetector(warn_threshold=3, hard_limit=5, window_size=10)
+        self.assertEqual(d.status(), ("ok", None, 0))
+
+    def test_warn_at_threshold(self):
+        """3 identical repeats emit a single warn."""
+        d = ToolLoopDetector(warn_threshold=3, hard_limit=5, window_size=10)
+        d.record("run_command", {"command": "pip install x"})
+        d.record("run_command", {"command": "pip install x"})
+        self.assertEqual(d.status()[0], "ok")  # 2 < 3
+        d.record("run_command", {"command": "pip install x"})
+        state, sig, cnt = d.status()
+        self.assertEqual(state, "warn")
+        self.assertEqual(cnt, 3)
+        assert sig is not None
+        self.assertEqual(sig[0], "run_command")
+
+    def test_warn_fires_once_per_episode(self):
+        """After the first warn, subsequent repeats below hard_limit do not re-warn."""
+        d = ToolLoopDetector(warn_threshold=3, hard_limit=5, window_size=10)
+        for _ in range(3):
+            d.record("run_command", {"command": "pip install x"})
+        self.assertEqual(d.status()[0], "warn")  # first warn
+        d.record("run_command", {"command": "pip install x"})
+        self.assertEqual(d.status()[0], "ok")  # already warned (count 4)
+
+    def test_terminate_at_hard_limit(self):
+        """5 identical repeats force terminate, even after a prior warn."""
+        d = ToolLoopDetector(warn_threshold=3, hard_limit=5, window_size=10)
+        for _ in range(3):
+            d.record("run_command", {"command": "pip install x"})
+        d.status()  # triggers warn
+        for _ in range(2):
+            d.record("run_command", {"command": "pip install x"})
+        state, sig, cnt = d.status()
+        self.assertEqual(state, "terminate")
+        self.assertEqual(cnt, 5)
+
+    def test_varied_args_not_flagged(self):
+        """Identical name but different arguments are distinct keys (pagination)."""
+        d = ToolLoopDetector(warn_threshold=3, hard_limit=5, window_size=10)
+        for i in range(5):
+            d.record("read_file", {"path": f"file_{i}", "start_line": i})
+        state, _, cnt = d.status()
+        self.assertEqual(state, "ok")
+        self.assertEqual(cnt, 1)  # each signature appears once
+
+    def test_different_offset_is_distinct(self):
+        """Same path, different offset (paginated read) is not a loop."""
+        d = ToolLoopDetector(warn_threshold=3, hard_limit=5, window_size=10)
+        d.record("read_file", {"path": "a", "start_line": 1})
+        d.record("read_file", {"path": "a", "start_line": 11})
+        d.record("read_file", {"path": "a", "start_line": 21})
+        state, _, cnt = d.status()
+        self.assertEqual(state, "ok")
+        self.assertEqual(cnt, 1)
+
+    def test_transient_retry_not_warned(self):
+        """A single identical retry (count 2) is not warned (warn_threshold >= 2)."""
+        d = ToolLoopDetector(warn_threshold=3, hard_limit=5, window_size=10)
+        d.record("run_command", {"command": "flake8 ."})
+        d.record("run_command", {"command": "flake8 ."})  # transient retry succeeds
+        self.assertEqual(d.status()[0], "ok")
+
+    def test_oscillation_caught_by_window(self):
+        """A->B->A->B... oscillation accumulates each signature within the window."""
+        d = ToolLoopDetector(warn_threshold=3, hard_limit=5, window_size=10)
+        # 5 As and 5 Bs interleaved -> each reaches 5 within the window of 10
+        for _ in range(5):
+            d.record("run_command", {"command": "a"})
+            d.record("run_command", {"command": "b"})
+        state, _, cnt = d.status()
+        self.assertEqual(state, "terminate")
+        self.assertEqual(cnt, 5)
+
+    def test_window_slides_and_resets(self):
+        """A signature that leaves the window is pruned from _warned, so it can
+        be re-warned if it recurs in a fresh episode."""
+        d = ToolLoopDetector(warn_threshold=2, hard_limit=10, window_size=3)
+        # Episode 1: A repeats -> warn A.
+        d.record("run_command", {"command": "a"})
+        d.record("run_command", {"command": "a"})
+        self.assertEqual(d.status()[0], "warn")
+        # Fill the window with B so A evicts out of it.
+        d.record("run_command", {"command": "b"})
+        d.record("run_command", {"command": "b"})
+        d.record("run_command", {"command": "b"})
+        # Episode 2: A recurs. It was pruned from _warned, so it warns again.
+        d.record("run_command", {"command": "a"})
+        d.record("run_command", {"command": "a"})
+        state, sig, _ = d.status()
+        self.assertEqual(state, "warn")
+        assert sig is not None
+        self.assertIn('"command": "a"', sig[1])
+
+    def test_disabled_when_hard_limit_zero(self):
+        """hard_limit <= 0 disables detection (always ok)."""
+        d = ToolLoopDetector(warn_threshold=3, hard_limit=0, window_size=10)
+        for _ in range(20):
+            d.record("run_command", {"command": "pip install x"})
+        self.assertEqual(d.status(), ("ok", None, 0))
+
+    def test_canonicalize_args_sorted_keys(self):
+        """Dict args are canonicalized with sorted keys (order-independent)."""
+        a = _canonicalize_args({"b": 1, "a": 2})
+        b = _canonicalize_args({"a": 2, "b": 1})
+        self.assertEqual(a, b)
+        self.assertIn('"a"', a)
+
+    def test_canonicalize_args_handles_non_serializable(self):
+        """A value json.dumps cannot serialize even with default=str (a circular
+        reference raises ValueError) hits the except fallback and returns repr,
+        never raising (ADR-0046)."""
+
+        circular: list = []
+        circular.append(circular)  # self-reference -> ValueError "Circular ref"
+
+        result = _canonicalize_args({"obj": circular})
+        self.assertIsInstance(result, str)
+        # repr of a list begins with '['; the fallback returned repr(args), not
+        # a JSON document, confirming the except branch was taken.
+        self.assertTrue(result.startswith("{"))  # repr of the dict {"obj": [...]}
+
+    def test_canonicalize_args_default_str_path(self):
+        """An object serializable only via default=str takes the normal
+        (non-fallback) path and still returns a JSON string."""
+
+        class Weird:
+            def __str__(self):
+                return "weird-instance"
+
+        result = _canonicalize_args({"obj": Weird()})
+        self.assertIsInstance(result, str)
+        self.assertIn("weird-instance", result)
+        # The normal path produces valid JSON; the fallback (repr) would not be.
+        import json as _json
+
+        self.assertEqual(_json.loads(result)["obj"], "weird-instance")
+
+
+class TestFormatLoopSignature(unittest.TestCase):
+    """Tests for _format_loop_signature (issue #121 / ADR-0046)."""
+
+    def test_none_signature_returns_unknown(self):
+        """A None signature (the defensive branch) returns 'unknown'."""
+        self.assertEqual(_format_loop_signature(None, 0), "unknown")
+
+    def test_short_signature_not_truncated(self):
+        """A short args string is included verbatim."""
+        sig = ("run_command", '{"command": "pip install x"}')
+        result = _format_loop_signature(sig, 5)
+        self.assertIn("run_command", result)
+        self.assertIn("pip install x", result)
+        self.assertIn("repeated 5x", result)
+
+    def test_long_signature_truncated(self):
+        """An args string over 200 chars is truncated with '...'."""
+        long_args = '{"path": "' + "x" * 250 + '"}'
+        sig = ("read_file", long_args)
+        result = _format_loop_signature(sig, 3)
+        self.assertIn("...", result)
+        self.assertIn("repeated 3x", result)
+        # The snippet is truncated to 200 chars + "..."
+        self.assertNotIn("x" * 250, result)
+
+
+class TestLoopDetectionMiddlewareIntegration(unittest.TestCase):
+    """Integration test: a real create_agent with a synthetic repeat-model
+    force-terminates via the middleware before the recursion budget is spent
+    (issue #121 / ADR-0046)."""
+
+    def test_repeating_model_terminates_early_with_partial_trajectory(self):
+        from langchain.agents import create_agent
+        from langchain_core.tools import tool
+
+        # A fake model that ALWAYS requests the same tool call — the issue #13
+        # failure pattern (repeated `pip install` until budget exhaustion).
+        class RepeatModel:
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+            def with_structured_output(self, *a, **k):
+                return self
+
+            def invoke(self, messages, config=None, **kwargs):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "run_command",
+                            "args": {"command": "pip install -e .[dev]"},
+                            "id": "c1",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+
+        @tool
+        def run_command(command: str) -> str:
+            """Run a shell command."""
+            return "usage: pip ... (no install performed)"
+
+        detector = ToolLoopDetector(warn_threshold=3, hard_limit=5, window_size=10)
+        mw = LoopDetectionMiddleware(detector, node_name="execute", attempt=1)
+        agent = create_agent(
+            RepeatModel(),
+            [run_command],
+            system_prompt="you are a worker",
+            middleware=[mw],
+        )  # type: ignore[call-overload]
+
+        last_state = None
+        try:
+            for chunk in agent.stream(
+                {"messages": [("user", "do the task")]},
+                config={"recursion_limit": 50},
+                stream_mode="values",
+            ):
+                last_state = chunk
+        except GraphRecursionError:
+            self.fail("Loop detection should have terminated before budget exhaustion")
+
+        messages = (last_state or {}).get("messages", [])
+
+        # The middleware force-terminated; the budget crash guard did NOT fire.
+        self.assertTrue(mw.terminated)
+        # Far fewer than the full budget: exactly hard_limit tool calls.
+        tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
+        self.assertEqual(len(tool_msgs), 5)
+        # A steering message was injected at the warn threshold.
+        self.assertTrue(
+            any(
+                isinstance(m, SystemMessage) and "[LOOP DETECTION]" in m.content
+                for m in messages
+            )
+        )
+        # A usable partial trajectory was captured.
+        self.assertGreater(len(messages), 0)
+
+
+class TestExecuteWorkerLoopDetection(unittest.TestCase):
+    """execute_worker returns a deterministic [LOOP_DETECTED] message and still
+    writes the trace + metrics when the middleware force-terminates (ADR-0046)."""
+
+    def setUp(self):
+        self.original_api_key = os.environ.get("OPENROUTER_API_KEY")
+        os.environ["OPENROUTER_API_KEY"] = "mock-key"
+        self.original_log_path = os.environ.get("AGENT_LOG_PATH")
+        self.logs_temp = tempfile.TemporaryDirectory()
+        os.environ["AGENT_LOG_PATH"] = self.logs_temp.name
+
+    def tearDown(self):
+        if self.original_api_key is not None:
+            os.environ["OPENROUTER_API_KEY"] = self.original_api_key
+        elif "OPENROUTER_API_KEY" in os.environ:
+            del os.environ["OPENROUTER_API_KEY"]
+        if self.original_log_path is not None:
+            os.environ["AGENT_LOG_PATH"] = self.original_log_path
+        elif "AGENT_LOG_PATH" in os.environ:
+            del os.environ["AGENT_LOG_PATH"]
+        self.logs_temp.cleanup()
+
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    def test_loop_termination_returns_deterministic_message(self, mock_create_agent):
+        """When the middleware force-terminates, execute_worker returns
+        [LOOP_DETECTED] (counted as one failed attempt) and still writes the
+        worker trace on the partial trajectory (ADR-0046)."""
+        messages = [
+            HumanMessage(content="Solve the issue"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "run_command",
+                        "args": {"command": "pip install x"},
+                        "id": "c1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="usage: pip ...", tool_call_id="c1", name="run_command"
+            ),
+        ]
+
+        captured = {}
+
+        def fake_create_agent(llm, tools, system_prompt=None, middleware=None):
+            # execute_worker passes the LoopDetectionMiddleware it constructed;
+            # simulate the middleware having force-terminated during the run so
+            # execute_worker's post-stream check reads terminated=True.
+            captured["middleware"] = middleware
+            if middleware:
+                mw = middleware[0]
+                mw.terminated = True
+                mw.termination_signature = (
+                    "run_command",
+                    '{"command": "pip install x"}',
+                )
+                mw.termination_count = 5
+            mock_agent = MagicMock()
+            mock_agent.stream.return_value = iter([{"messages": messages}])
+            return mock_agent
+
+        mock_create_agent.side_effect = fake_create_agent
+
+        result = execute_worker(
+            issue_description="x",
+            plan="y",
+            node_name="execute",
+            issue_number=13,
+            attempt=1,
+        )
+
+        # The middleware was attached (default hard_limit > 0).
+        self.assertIsNotNone(captured.get("middleware"))
+        self.assertEqual(len(captured["middleware"]), 1)
+        self.assertIn("[LOOP_DETECTED]", result)
+        self.assertIn("pip install x", result)
+        self.assertIn("failed attempt", result)
+
+        # The worker trace sidecar still runs on the partial trajectory.
+        trace_path = Path(os.environ["AGENT_LOG_PATH"]) / "worker_trace_13_1.jsonl"
+        self.assertTrue(trace_path.exists())
