@@ -1,7 +1,10 @@
+import collections
 import json
 import logging
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import SystemMessage
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
 
@@ -133,6 +136,173 @@ SYSTEM_PROMPT = (
 )
 
 
+# --- Tool Loop Detection (issue #121 / ADR-0046) ---------------------------
+#
+# The earlier, cheaper layer of the ReAct-loop defense, sitting in front of
+# the Recursion Budget crash guard (ADR-0045). It catches a Worker stuck
+# repeating an identical (name + arguments) tool call — the failure mode where
+# a model (notably non-OpenAI ones) re-issues e.g. `pip install ...` until
+# GraphRecursionError, burning the whole budget without progress.
+
+_LOOP_STEER_MESSAGE = (
+    "[LOOP DETECTION] You are repeating the same tool call with identical "
+    "arguments and it is not making progress. Stop calling that exact tool "
+    "with those exact arguments. Try a different approach — different "
+    "arguments, a different tool, or diagnose the underlying error in the "
+    "last tool result — or finish and report what you accomplished. "
+    "Repeating the same call again will terminate your run early."
+)
+
+
+def _canonicalize_args(args) -> str:
+    """Canonicalize tool-call arguments to a stable, hashable string.
+
+    JSON-serialization with sorted keys yields deterministic ordering for dict
+    args (the common case) and recurses into nested structures, so paginated
+    reads that differ only by offset (different args) are distinct keys and are
+    not flagged as a loop. Non-JSON-serializable values fall back to ``str``
+    via ``default=str`` so detection never raises.
+    """
+    try:
+        return json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return repr(args)
+
+
+class ToolLoopDetector:
+    """Detect repeated identical tool calls within a sliding window.
+
+    A pure helper: ``record`` observes each tool invocation (name + full
+    arguments) into a bounded deque, and ``status`` reports whether the
+    most-repeated signature in the window has crossed the warn threshold or the
+    hard limit. Detection keys on name + FULL canonicalized arguments, so
+    legitimately-varied calls (e.g. paginated reads with a different offset)
+    are not flagged. A transient retry that succeeds on the second identical
+    attempt (count 2) is not stopped because ``warn_threshold`` defaults to
+    >= 2. The sliding window also catches short oscillations (A->B->A->B...)
+    once a single signature accumulates within it.
+    """
+
+    def __init__(
+        self,
+        warn_threshold: int = 3,
+        hard_limit: int = 5,
+        window_size: int = 10,
+    ) -> None:
+        self.warn_threshold = warn_threshold
+        self.hard_limit = hard_limit
+        self.window_size = window_size
+        self._signatures: collections.deque[tuple] = collections.deque(
+            maxlen=window_size if window_size and window_size > 0 else 10
+        )
+        self._warned: set[tuple] = set()
+
+    @staticmethod
+    def _key(name, args) -> tuple:
+        return (name, _canonicalize_args(args))
+
+    def record(self, name, args) -> None:
+        """Record one tool invocation. Call from wrap_tool_call (pre-execution)."""
+        key = self._key(name, args)
+        self._signatures.append(key)
+        # Prune the warned set to signatures still present in the window: once
+        # a signature leaves the window (the loop broke), it may be re-warned
+        # if it recurs later in a fresh episode.
+        self._warned &= set(self._signatures)
+
+    def status(self) -> tuple[str, tuple | None, int]:
+        """Return ``(state, signature, count)`` for the most-repeated signature.
+
+        ``state`` is ``'terminate'`` (count >= hard_limit), ``'warn'`` (count
+        >= warn_threshold and not yet warned for this signature), or ``'ok'``.
+        The warn fires at most once per signature per window episode (the
+        signature is added to ``_warned``), so the steering message is not
+        re-injected every turn; termination still wins over an already-warned
+        signature once the hard limit is reached.
+        """
+        if not self._signatures or self.hard_limit <= 0:
+            return ("ok", None, 0)
+        counts = collections.Counter(self._signatures)
+        sig, cnt = counts.most_common(1)[0]
+        if cnt >= self.hard_limit:
+            return ("terminate", sig, cnt)
+        if cnt >= self.warn_threshold and sig not in self._warned:
+            self._warned.add(sig)
+            return ("warn", sig, cnt)
+        return ("ok", sig, cnt)
+
+
+def _format_loop_signature(sig: tuple | None, cnt: int) -> str:
+    """Human-readable summary of the signature that triggered loop detection."""
+    if sig is None:
+        return "unknown"
+    name, args_str = sig
+    snippet = args_str if len(args_str) <= 200 else args_str[:200] + "..."
+    return f"{name}({snippet}) repeated {cnt}x"
+
+
+class LoopDetectionMiddleware(AgentMiddleware):
+    """LangChain middleware that breaks a Worker stuck repeating identical tool
+    calls (issue #121 / ADR-0046).
+
+    Sits in front of the Recursion Budget crash guard (ADR-0045):
+
+    - ``wrap_tool_call`` (sync): observes every tool invocation, recording
+      ``(name, args)`` in the detector before the tool actually executes.
+    - ``before_model`` (sync, ``can_jump_to=["end"]``): inspects the detector
+      before each model call; at ``warn_threshold`` injects a steering
+      ``SystemMessage`` so the model can self-correct, and at ``hard_limit``
+      returns ``{"jump_to": "end"}`` to force-terminate the agent cleanly.
+      The partial trajectory is still captured by ``execute_worker``'s
+      ``stream(stream_mode="values")`` loop, and the Worker Trace sidecar +
+      Run Observability metrics still run on it (ADR-0016 / ADR-0029). A
+      force-terminate counts as one failed attempt (ADR-0045 contract preserved).
+    """
+
+    def __init__(
+        self,
+        detector: ToolLoopDetector,
+        node_name: str = "execute",
+        attempt: int | None = None,
+    ) -> None:
+        self.detector = detector
+        self.node_name = node_name
+        self.attempt = attempt
+        self.terminated = False
+        self.termination_signature: tuple | None = None
+        self.termination_count = 0
+
+    def wrap_tool_call(self, request, handler):  # type: ignore[override]
+        tc = request.tool_call
+        name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+        args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+        self.detector.record(name, args)
+        return handler(request)
+
+    def before_model(self, state, runtime):  # type: ignore[override]
+        state_, sig, cnt = self.detector.status()
+        if state_ == "terminate":
+            self.terminated = True
+            self.termination_signature = sig
+            self.termination_count = cnt
+            logger.warning(
+                "Loop detection terminating worker (node=%s, attempt=%s): "
+                "%s. Force-terminating before next model call (ADR-0046).",
+                self.node_name,
+                self.attempt,
+                _format_loop_signature(sig, cnt),
+            )
+            return {"jump_to": "end"}
+        if state_ == "warn":
+            return {"messages": [SystemMessage(content=_LOOP_STEER_MESSAGE)]}
+        return None
+
+    # Allow before_model to route to END (jump_to="end"). This attribute is read
+    # by langchain's agent factory (_get_can_jump_to) to wire the conditional
+    # edge that permits jumping to the graph exit from the before_model node.
+    before_model.__can_jump_to__ = ["end"]  # type: ignore[attr-defined]
+
+
 def execute_worker(
     issue_description: str,
     plan: str,
@@ -166,10 +336,32 @@ def execute_worker(
     llm = get_chat_model_from_config(cfg)
     tools = get_worker_tools()
 
+    # Tool Loop Detection (issue #121 / ADR-0046): an earlier, cheaper layer
+    # than the Recursion Budget. Resolved per-node alongside the Model Config.
+    # A loop_hard_limit <= 0 disables loop detection for this node (no
+    # middleware is attached), leaving the Recursion Budget as the sole guard.
+    loop_warn = cfg.get("loop_warn_threshold", 3)
+    loop_hard = cfg.get("loop_hard_limit", 5)
+    loop_window = cfg.get("loop_window_size", 10)
+    loop_middleware: LoopDetectionMiddleware | None = None
+    middleware_list: list = []
+    if loop_hard > 0:
+        detector = ToolLoopDetector(
+            warn_threshold=loop_warn,
+            hard_limit=loop_hard,
+            window_size=loop_window,
+        )
+        loop_middleware = LoopDetectionMiddleware(
+            detector, node_name=node_name, attempt=attempt
+        )
+        middleware_list = [loop_middleware]
+
     # Compile the prebuilt ReAct agent. LangGraph v1 moved
     # create_react_agent to langchain.agents.create_agent and renamed the
     # `prompt` kwarg to `system_prompt`.
-    agent = create_agent(llm, tools, system_prompt=SYSTEM_PROMPT)
+    agent = create_agent(
+        llm, tools, system_prompt=SYSTEM_PROMPT, middleware=middleware_list
+    )
 
     # Formulate the user message combining issue and plan
     user_message = (
@@ -286,6 +478,35 @@ def execute_worker(
             f"invocation(s). Partial work was produced but may be incomplete. "
             f"Last action: {_summarize_last_action(messages)}. Treat this as "
             f"a failed attempt."
+        )
+
+    # Tool Loop Detection force-terminate (issue #121 / ADR-0046): the
+    # middleware returned jump_to="end" from before_model, halting the agent
+    # before the next model call. The partial trajectory was captured above by
+    # the stream loop and the trace + metrics already ran on it. Like budget
+    # exhaustion, this counts as one failed attempt: the caller's retry/verify
+    # logic drives self-correction (Hybrid Retry for Execute, 3-attempt loop
+    # for Test-Writer). Preserves the ADR-0045 contract — the Recursion Budget
+    # remains the crash guard; loop detection is the earlier, cheaper layer.
+    if loop_middleware is not None and loop_middleware.terminated:
+        tool_calls = count_tool_invocations(messages)
+        logger.warning(
+            "Loop detection terminated worker (node=%s, attempt=%s, "
+            "window=%d): captured %d partial messages, %d tool invocation(s). "
+            "Returning deterministic loop-detected message (ADR-0046).",
+            node_name,
+            attempt,
+            loop_window,
+            len(messages),
+            tool_calls,
+        )
+        return (
+            f"[LOOP_DETECTED] Worker agent (node={node_name}, attempt={attempt}) "
+            f"was force-terminated after repeating an identical tool call "
+            f"({_format_loop_signature(loop_middleware.termination_signature, loop_middleware.termination_count)}) "
+            f"within the loop-detection window ({loop_window}). Partial work "
+            f"was produced but may be incomplete. Last action: "
+            f"{_summarize_last_action(messages)}. Treat this as a failed attempt."
         )
 
     # Extract the last message from the result

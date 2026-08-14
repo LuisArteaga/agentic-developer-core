@@ -45,6 +45,22 @@ LLM_TIMEOUT = 600.0
 # AGENT_RECURSION_LIMIT), mirroring the Model Config override precedence.
 DEFAULT_RECURSION_LIMIT = 50
 
+# Default Tool Loop Detection thresholds (issue #121 / ADR-0046). Loop
+# detection is an earlier, cheaper layer than the Recursion Budget crash
+# guard: it breaks the ReAct loop when the Worker repeats an identical
+# (name + arguments) tool call — the failure mode where a model (notably
+# non-OpenAI ones) re-issues e.g. `pip install ...` until GraphRecursionError,
+# burning the whole budget without progress. Like recursion_limit, these are
+# co-resolved per node alongside the Model Config (no magic constants in the
+# worker). Keying is on name + FULL arguments, so legitimately-varied calls
+# (e.g. paginated reads with a different offset) are not flagged; warn >= 2
+# avoids stopping a transient retry that succeeds on the second attempt.
+DEFAULT_LOOP_WARN_THRESHOLD = 3
+DEFAULT_LOOP_HARD_LIMIT = 5
+# Window = 2 * hard_limit by default so a 2-cycle oscillation (A->B->A->B...)
+# can accumulate to hard_limit within the window. Overridable per node.
+DEFAULT_LOOP_WINDOW_SIZE = 10
+
 # Path resolution: config/factory.json relative to the project root
 # (the parent of this module's package directory).
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -138,6 +154,74 @@ def _resolve_recursion_limit(node_name: str, factory_cfg: dict | None) -> int:
     return DEFAULT_RECURSION_LIMIT
 
 
+def _resolve_int_env(
+    node_name: str, factory_cfg: dict | None, factory_key: str, default: int
+) -> int:
+    """Resolve a per-node integer config value with env precedence.
+
+    Shared by loop-detection thresholds (ADR-0046), mirroring the precedence
+    of ``_resolve_recursion_limit`` (ADR-0045):
+      1. Node-specific env: f"{node_name.upper()}_{ENV_KEY}"
+      2. General env: AGENT_{ENV_KEY}
+      3. factory.json entry (factory_key) for the node
+      4. Hardcoded default
+
+    A malformed value (env or factory) is logged and ignored, degrading to the
+    next precedence tier rather than crashing the run.
+    """
+    env_key = factory_key.upper()  # e.g. loop_hard_limit -> LOOP_HARD_LIMIT
+    env_val = os.getenv(f"{node_name.upper()}_{env_key}") or os.getenv(
+        f"AGENT_{env_key}"
+    )
+    if env_val:
+        try:
+            return int(env_val)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid %s env value %r for node '%s'; ignoring and "
+                "falling back to factory/default.",
+                env_key,
+                env_val,
+                node_name,
+            )
+    if factory_cfg and factory_cfg.get(factory_key) is not None:
+        try:
+            return int(factory_cfg[factory_key])
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid %s in factory.json for node '%s' (%r); falling "
+                "back to default %d.",
+                factory_key,
+                node_name,
+                factory_cfg[factory_key],
+                default,
+            )
+    return default
+
+
+def _resolve_loop_config(node_name: str, factory_cfg: dict | None) -> dict[str, int]:
+    """Resolve the per-node Tool Loop Detection config (issue #121 / ADR-0046).
+
+    Returns a dict of ``{"loop_warn_threshold": int, "loop_hard_limit": int,
+    "loop_window_size": int}``, co-located with the rest of the per-node Model
+    Config. Each field follows the env -> factory.json -> default precedence
+    (see ``_resolve_int_env``). Distinct values per node (execute vs
+    test_writer) are supported via per-node env vars or factory.json entries.
+    A ``loop_hard_limit <= 0`` disables loop detection for that node.
+    """
+    return {
+        "loop_warn_threshold": _resolve_int_env(
+            node_name, factory_cfg, "loop_warn_threshold", DEFAULT_LOOP_WARN_THRESHOLD
+        ),
+        "loop_hard_limit": _resolve_int_env(
+            node_name, factory_cfg, "loop_hard_limit", DEFAULT_LOOP_HARD_LIMIT
+        ),
+        "loop_window_size": _resolve_int_env(
+            node_name, factory_cfg, "loop_window_size", DEFAULT_LOOP_WINDOW_SIZE
+        ),
+    }
+
+
 def resolve_model_config(node_name: str) -> dict[str, Any]:
     """Resolve the Model Config for a given orchestrator node.
 
@@ -156,7 +240,9 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
         {"model": str, "routing": List[str] | None,
          "temperature": float, "options": Dict[str, Any] | None,
          "max_tokens": int | None, "fallback_model": str | None,
-         "recursion_limit": int}
+         "recursion_limit": int,
+         "loop_warn_threshold": int, "loop_hard_limit": int,
+         "loop_window_size": int}
     """
     factory = _load_factory_config()
     factory_cfg = factory.get(node_name) if isinstance(factory, dict) else None
@@ -167,6 +253,12 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
             node_name,
         )
         factory_cfg = None
+
+    # Tool Loop Detection config (issue #121 / ADR-0046): co-resolved per node
+    # alongside the Recursion Budget, mirroring its precedence. Computed once
+    # and spread into every return path so loop detection is configured on all
+    # resolution tiers (env-override, factory, hardcoded fallback).
+    loop_cfg = _resolve_loop_config(node_name, factory_cfg)
 
     # 1 & 2. Environment overrides
     node_env_var = f"{node_name.upper()}_MODEL"
@@ -194,6 +286,7 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
             if factory_cfg
             else None,
             "recursion_limit": _resolve_recursion_limit(node_name, factory_cfg),
+            **loop_cfg,
         }
 
     # 3. Factory configuration
@@ -206,6 +299,7 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
             "max_tokens": factory_cfg.get("max_tokens"),
             "fallback_model": factory_cfg.get("fallback_model"),
             "recursion_limit": _resolve_recursion_limit(node_name, factory_cfg),
+            **loop_cfg,
         }
 
     # 4. Hardcoded fallback (factory missing/malformed or node absent)
@@ -222,6 +316,7 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
         "max_tokens": None,
         "fallback_model": None,
         "recursion_limit": _resolve_recursion_limit(node_name, factory_cfg),
+        **loop_cfg,
     }
 
 
