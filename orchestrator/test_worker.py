@@ -13,6 +13,7 @@ from orchestrator.worker import (
     LoopDetectionMiddleware,
     ToolLoopDetector,
     _canonicalize_args,
+    _format_loop_signature,
     execute_worker,
     get_worker_tools,
 )
@@ -627,6 +628,32 @@ class TestToolLoopDetector(unittest.TestCase):
         import json as _json
 
         self.assertEqual(_json.loads(result)["obj"], "weird-instance")
+
+
+class TestFormatLoopSignature(unittest.TestCase):
+    """Tests for _format_loop_signature (issue #121 / ADR-0046)."""
+
+    def test_none_signature_returns_unknown(self):
+        """A None signature (the defensive branch) returns 'unknown'."""
+        self.assertEqual(_format_loop_signature(None, 0), "unknown")
+
+    def test_short_signature_not_truncated(self):
+        """A short args string is included verbatim."""
+        sig = ("run_command", '{"command": "pip install x"}')
+        result = _format_loop_signature(sig, 5)
+        self.assertIn("run_command", result)
+        self.assertIn("pip install x", result)
+        self.assertIn("repeated 5x", result)
+
+    def test_long_signature_truncated(self):
+        """An args string over 200 chars is truncated with '...'."""
+        long_args = '{"path": "' + "x" * 250 + '"}'
+        sig = ("read_file", long_args)
+        result = _format_loop_signature(sig, 3)
+        self.assertIn("...", result)
+        self.assertIn("repeated 3x", result)
+        # The snippet is truncated to 200 chars + "..."
+        self.assertNotIn("x" * 250, result)
 
 
 class TestLoopDetectionMiddlewareIntegration(unittest.TestCase):
