@@ -1308,7 +1308,18 @@ def _run_bineval(
         f"=== DIFF ===\n{diff_section if diff_section.strip() else '(empty)'}\n"
     )
 
-    cfg = resolve_model_config("bin_eval")
+    try:
+        cfg = resolve_model_config("bin_eval")
+    except Exception as e:
+        # Config resolution is part of the soft-gate surface (ADR-0027): a
+        # factory.json failure must degrade to PASS, not propagate. Mirrors the
+        # original code's placement of resolve_model_config inside the try/except.
+        logger.warning(
+            "BinEval config resolution failed (%s); treating as PASS (soft "
+            "gate, infrastructure failure does not block).",
+            e,
+        )
+        return None
     result, finish_reason = _invoke_bineval_structured(cfg, prompt)
     if result is not None:
         return result

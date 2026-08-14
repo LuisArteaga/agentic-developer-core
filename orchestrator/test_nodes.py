@@ -2055,6 +2055,63 @@ class TestBinEvalHelpers(unittest.TestCase):
         # counter for the caller to mis-increment from this path.
         self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
 
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_config_resolution_failure_degrades_to_pass(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC (ADR-0027 soft-gate contract): a config-resolution failure
+        (e.g. malformed factory.json) must degrade to PASS (return None),
+        not propagate as an exception. resolve_model_config is part of the
+        soft-gate surface."""
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.side_effect = RuntimeError("malformed factory.json")
+
+        # Must not raise — degrades to None (soft-gate PASS).
+        self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
+        # The LLM was never constructed (config resolution failed first).
+        mock_get_llm.assert_not_called()
+
+
+class TestBinevalRetryConfig(unittest.TestCase):
+    """Unit tests for _bineval_retry_config (issue #134 coverage)."""
+
+    def test_multiplier_enlarges_budget(self):
+        from orchestrator.nodes import _bineval_retry_config
+
+        cfg = {"model": "m", "max_tokens": 8192, "temperature": 0.0}
+        retry = _bineval_retry_config(cfg)
+        self.assertEqual(retry["max_tokens"], 8192 * 2)
+        # Other fields inherited unchanged.
+        self.assertEqual(retry["model"], "m")
+        self.assertEqual(retry["temperature"], 0.0)
+
+    def test_uses_default_when_no_max_tokens(self):
+        from orchestrator.nodes import _bineval_retry_config
+
+        cfg = {"model": "m", "temperature": 0.0}
+        retry = _bineval_retry_config(cfg)
+        # No max_tokens in cfg -> base is the default (4096).
+        self.assertEqual(retry["max_tokens"], 4096 * 2)
+
+    def test_cap_applied(self):
+        from orchestrator.nodes import _bineval_retry_config
+
+        # A large base that would exceed the cap (16384) when doubled.
+        cfg = {"model": "m", "max_tokens": 20000}
+        retry = _bineval_retry_config(cfg)
+        self.assertEqual(retry["max_tokens"], 16384)
+
+    def test_original_cfg_not_mutated(self):
+        from orchestrator.nodes import _bineval_retry_config
+
+        cfg = {"model": "m", "max_tokens": 8192}
+        _bineval_retry_config(cfg)
+        # The original dict is unchanged (shallow copy).
+        self.assertEqual(cfg["max_tokens"], 8192)
+
 
 class TestPRNode(unittest.TestCase):
     def setUp(self):
