@@ -1942,20 +1942,117 @@ class TestBinEvalHelpers(unittest.TestCase):
         self, _rubric, mock_resolve, mock_get_llm
     ):
         """AC: BinEval truncation is distinguishable from soft-gate PASS —
-        parse failure (finish_reason=length) returns None (soft-gate PASS)
-        but the finish_reason is logged."""
+        a persistent length-limit parse failure returns None (soft-gate PASS)
+        after exactly one budget retry, and the finish_reason is logged."""
         from orchestrator.nodes import _run_bineval
 
-        mock_resolve.return_value = {"model": "m"}
+        mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
+        llm = unittest.mock.MagicMock()
+        structured = unittest.mock.MagicMock()
+        # Both the initial call and the length-limit retry return a truncated
+        # response — the retry must not loop beyond a single attempt.
+        structured.invoke.side_effect = [
+            _raw_structured_response(
+                None, finish_reason="length", parsing_error=ValueError("truncated")
+            ),
+            _raw_structured_response(
+                None, finish_reason="length", parsing_error=ValueError("truncated")
+            ),
+        ]
+        llm.with_structured_output.return_value = structured
+        mock_get_llm.return_value = llm
+
+        # Persistent length failure still soft-gates to PASS (returns None).
+        self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
+        # Exactly one retry: the initial call + a single enlarged-budget retry.
+        self.assertEqual(structured.invoke.call_count, 2)
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_length_retry_succeeds(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC: a length-limit truncation is recovered by the single
+        enlarged-budget retry — the verdict is parsed on the second call."""
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
+        llm = unittest.mock.MagicMock()
+        structured = unittest.mock.MagicMock()
+        structured.invoke.side_effect = [
+            _raw_structured_response(
+                None, finish_reason="length", parsing_error=ValueError("truncated")
+            ),
+            _raw_structured_response(_all_pass_result()),
+        ]
+        llm.with_structured_output.return_value = structured
+        mock_get_llm.return_value = llm
+
+        result = _run_bineval("issue body", "plan", "diff", "ADR TEXT")
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(all(c.passed for c in result.checks))
+        # Initial call + exactly one retry.
+        self.assertEqual(structured.invoke.call_count, 2)
+        # The retry used an enlarged max_tokens budget (multiplier * base).
+        retry_cfg = mock_get_llm.call_args_list[1].args[0]
+        self.assertGreater(retry_cfg["max_tokens"], 8192)
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_non_length_failure_no_retry(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC: only finish_reason=length triggers the budget retry. A parse
+        failure with a different finish_reason (e.g. stop) degrades to PASS
+        immediately with no retry — non-reasoning models are unaffected."""
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
         llm = unittest.mock.MagicMock()
         structured = unittest.mock.MagicMock()
         structured.invoke.return_value = _raw_structured_response(
-            None, finish_reason="length", parsing_error=ValueError("truncated")
+            None, finish_reason="stop", parsing_error=ValueError("malformed")
         )
         llm.with_structured_output.return_value = structured
         mock_get_llm.return_value = llm
 
-        # Parse failure still soft-gates to PASS (returns None).
+        self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
+        # No retry: a single invoke call.
+        self.assertEqual(structured.invoke.call_count, 1)
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_length_retry_does_not_consume_semantic_budget(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC (ADR-0047): the length-limit budget retry must NOT consume the
+        BinEval semantic-retry budget. _run_bineval is a pure function — it
+        never touches state['attempts']; only a genuine BinEval FAIL does
+        (in _run_bineval_phase). A length-limit degradation returns None,
+        which _run_bineval_phase treats as a degraded PASS (no increment)."""
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
+        llm = unittest.mock.MagicMock()
+        structured = unittest.mock.MagicMock()
+        structured.invoke.side_effect = [
+            _raw_structured_response(
+                None, finish_reason="length", parsing_error=ValueError("truncated")
+            ),
+            _raw_structured_response(
+                None, finish_reason="length", parsing_error=ValueError("truncated")
+            ),
+        ]
+        llm.with_structured_output.return_value = structured
+        mock_get_llm.return_value = llm
+
+        # _run_bineval returns None (degraded PASS) on persistent length
+        # failure — it carries no state, so there is no semantic-budget
+        # counter for the caller to mis-increment from this path.
         self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
 
 

@@ -1091,6 +1091,25 @@ _BINEVAL_DIFF_MAX_CHARS = int(os.getenv("BINEVAL_DIFF_MAX_CHARS", "20000"))
 # Maximum characters of concatenated ADR text fed to the BinEval LLM.
 _BINEVAL_ADR_MAX_CHARS = int(os.getenv("BINEVAL_ADR_MAX_CHARS", "20000"))
 
+# Length-Limit Budget Retry (issue #134). A reasoning model (e.g. the BinEval
+# flash model emitting reasoning_tokens) can exhaust the configured max_tokens
+# budget on reasoning before emitting the verdict, producing
+# finish_reason=length and no parseable content. The default max_tokens was
+# raised from 4096 to 8192 to cover the measured reasoning length (~4078
+# tokens observed in production) plus the verdict. As a safety net for
+# reasoning-length variability beyond p95, a single retry with an enlarged
+# budget is attempted on finish_reason=length. This is a *budget* retry, not a
+# semantic retry — it does NOT consume attempts["bineval"] (ADR-0047): the
+# semantic budget counts genuine BinEval FAILs, not infrastructure truncation.
+# Non-reasoning models never hit finish_reason=length and are unaffected.
+_BINEVAL_DEFAULT_MAX_TOKENS = int(os.getenv("BINEVAL_DEFAULT_MAX_TOKENS", "4096"))
+_BINEVAL_LENGTH_RETRY_MULTIPLIER = int(
+    os.getenv("BINEVAL_LENGTH_RETRY_MULTIPLIER", "2")
+)
+_BINEVAL_LENGTH_RETRY_MAX_TOKENS_CAP = int(
+    os.getenv("BINEVAL_LENGTH_RETRY_MAX_TOKENS_CAP", "16384")
+)
+
 
 class BinEvalCheck(BaseModel):
     id: str = Field(description="Rubric check id, e.g. '1.1', '3.2'.")
@@ -1173,15 +1192,87 @@ def _get_workspace_diff(workspace_path: Path) -> str:
     return diff_cached(workspace_path)
 
 
+def _bineval_retry_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Build a Model Config for the Length-Limit Budget Retry (issue #134).
+
+    Returns a shallow copy of ``cfg`` with ``max_tokens`` enlarged by the
+    configured multiplier, capped at ``_BINEVAL_LENGTH_RETRY_MAX_TOKENS_CAP``.
+    When ``cfg`` carries no ``max_tokens`` (provider default in effect), the
+    retry uses ``_BINEVAL_DEFAULT_MAX_TOKENS`` as the base so the retry still
+    raises a concrete budget. All other fields (model, routing, temperature,
+    options) are inherited unchanged — the retry uses the same model, just with
+    more output room.
+    """
+    base = cfg.get("max_tokens") or _BINEVAL_DEFAULT_MAX_TOKENS
+    retry_budget = min(
+        base * _BINEVAL_LENGTH_RETRY_MULTIPLIER,
+        _BINEVAL_LENGTH_RETRY_MAX_TOKENS_CAP,
+    )
+    retry_cfg = dict(cfg)
+    retry_cfg["max_tokens"] = retry_budget
+    return retry_cfg
+
+
+def _invoke_bineval_structured(
+    cfg: dict[str, Any], prompt: str
+) -> tuple[BinEvalResult | None, str | None]:
+    """Invoke the BinEval structured-output LLM once.
+
+    Returns ``(parsed_result, finish_reason)``. On a successful parse with a
+    non-empty ``checks`` list, ``parsed_result`` is the ``BinEvalResult`` and
+    ``finish_reason`` is the raw response's finish reason. On a parse failure
+    or malformed/empty output, ``parsed_result`` is ``None`` and
+    ``finish_reason`` is returned so the caller can distinguish a
+    ``length``-limit truncation (retryable) from other failures. On an
+    API-level exception (network, auth, rate-limit) returns ``(None, None)``
+    after logging — the soft-gate contract degrades to PASS, and there is no
+    finish_reason to act on.
+    """
+    try:
+        llm = get_chat_model_from_config(cfg)
+        structured_llm = llm.with_structured_output(
+            BinEvalResult, strict=True, include_raw=True
+        )
+        raw_result = structured_llm.invoke(prompt)
+    except Exception as e:
+        logger.warning(
+            "BinEval LLM call failed (%s); treating as PASS (soft gate, "
+            "infrastructure failure does not block).",
+            e,
+        )
+        return None, None
+
+    result, finish_reason = _extract_structured_output(raw_result, "BinEvalResult")
+
+    if not result or not getattr(result, "checks", None):
+        logger.warning(
+            "BinEval returned malformed/empty structured output "
+            "(finish_reason=%s); treating as PASS.",
+            finish_reason or "unknown",
+        )
+        return None, finish_reason
+
+    return result, finish_reason
+
+
 def _run_bineval(
     issue_body: str, plan: str, diff: str, adrs: str
 ) -> BinEvalResult | None:
     """Run the BinEval LLM grading pass and return the parsed result.
 
     Returns None on any failure (API error, missing key, malformed/empty
-    structured output). Per the soft-gate policy, callers treat None as PASS so
-    an infrastructure failure never blocks progression — the post-PR hard-gate
-    judges remain the safety net.
+    structured output, or an unrecovered length-limit truncation). Per the
+    soft-gate policy, callers treat None as PASS so an infrastructure failure
+    never blocks progression — the post-PR hard-gate judges remain the safety
+    net.
+
+    Length-Limit Budget Retry (issue #134): a reasoning model can burn the
+    whole max_tokens budget on reasoning_tokens and emit no parseable verdict
+    (finish_reason=length). On that specific failure class the call is retried
+    once with an enlarged max_tokens budget (see ``_bineval_retry_config``).
+    This is a budget retry, not a semantic retry — it does NOT consume
+    attempts["bineval"] (ADR-0047). A persistent length failure after the
+    single retry degrades to PASS (None) like any other infra failure.
     """
     rubric = _load_grading_rubric()
 
@@ -1217,30 +1308,35 @@ def _run_bineval(
         f"=== DIFF ===\n{diff_section if diff_section.strip() else '(empty)'}\n"
     )
 
-    try:
-        cfg = resolve_model_config("bin_eval")
-        llm = get_chat_model_from_config(cfg)
-        structured_llm = llm.with_structured_output(
-            BinEvalResult, strict=True, include_raw=True
-        )
-        raw_result = structured_llm.invoke(prompt)
-    except Exception as e:
+    cfg = resolve_model_config("bin_eval")
+    result, finish_reason = _invoke_bineval_structured(cfg, prompt)
+    if result is not None:
+        return result
+
+    # Length-Limit Budget Retry: only the `length` finish reason is retryable.
+    # It signals the output was truncated mid-generation (a reasoning model can
+    # spend the entire budget on reasoning_tokens), distinct from a genuine
+    # parse error or API failure. Non-reasoning models never produce it.
+    if finish_reason == "length":
+        retry_cfg = _bineval_retry_config(cfg)
         logger.warning(
-            "BinEval LLM call failed (%s); treating as PASS (soft gate, "
-            "infrastructure failure does not block).",
-            e,
+            "BinEval truncated (finish_reason=length); retrying once with "
+            "enlarged max_tokens budget (%s -> %s). This is a budget retry "
+            "and does not consume the BinEval semantic-retry budget "
+            "(attempts['bineval'], ADR-0047).",
+            cfg.get("max_tokens"),
+            retry_cfg.get("max_tokens"),
         )
-        return None
-
-    result, _ = _extract_structured_output(raw_result, "BinEvalResult")
-
-    if not result or not getattr(result, "checks", None):
+        result, retry_finish_reason = _invoke_bineval_structured(retry_cfg, prompt)
+        if result is not None:
+            return result
         logger.warning(
-            "BinEval returned malformed/empty structured output; treating as PASS."
+            "BinEval length-limit retry still failed (finish_reason=%s); "
+            "degrading to soft-gate PASS with bineval_degraded=True.",
+            retry_finish_reason or "unknown",
         )
-        return None
 
-    return result
+    return None
 
 
 def _apply_no_adr_autopass(result: BinEvalResult) -> None:

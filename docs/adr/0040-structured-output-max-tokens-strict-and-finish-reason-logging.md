@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted (Decision 1 amended by
+[ADR-0049](./0049-bineval-length-limit-budget-retry.md): `bin_eval`
+`max_tokens` raised 4096 → 8192)
 
 ## Context
 
@@ -28,6 +30,11 @@ the latent truncation risk remains.
    `max_tokens: 4096` for `bin_eval`. Non-structured-output nodes (execute,
    test_writer, judges) do not set `max_tokens` — they use the model/provider
    default, avoiding truncation of ReAct reasoning or judge evaluations.
+   *(Amended by [ADR-0049](./0049-bineval-length-limit-budget-retry.md): the
+   `bin_eval` `max_tokens` was raised from `4096` to `8192` after a reasoning
+   model exhausted the 4096 budget on `reasoning_tokens` and emitted no
+   verdict. ADR-0049 also added a single enlarged-budget retry on
+   `finish_reason=length`; the cap mechanism decided here is unchanged.)*
 
 2. **`strict=True` on `with_structured_output`.** Both `DevelopmentPlan` and
    `BinEvalResult` schemas are called with `strict=True` alongside the default
