@@ -599,13 +599,34 @@ class TestToolLoopDetector(unittest.TestCase):
         self.assertIn('"a"', a)
 
     def test_canonicalize_args_handles_non_serializable(self):
-        """Non-JSON-serializable values never raise (default=str fallback)."""
+        """A value json.dumps cannot serialize even with default=str (a circular
+        reference raises ValueError) hits the except fallback and returns repr,
+        never raising (ADR-0046)."""
+
+        circular: list = []
+        circular.append(circular)  # self-reference -> ValueError "Circular ref"
+
+        result = _canonicalize_args({"obj": circular})
+        self.assertIsInstance(result, str)
+        # repr of a list begins with '['; the fallback returned repr(args), not
+        # a JSON document, confirming the except branch was taken.
+        self.assertTrue(result.startswith("{"))  # repr of the dict {"obj": [...]}
+
+    def test_canonicalize_args_default_str_path(self):
+        """An object serializable only via default=str takes the normal
+        (non-fallback) path and still returns a JSON string."""
 
         class Weird:
-            pass
+            def __str__(self):
+                return "weird-instance"
 
         result = _canonicalize_args({"obj": Weird()})
         self.assertIsInstance(result, str)
+        self.assertIn("weird-instance", result)
+        # The normal path produces valid JSON; the fallback (repr) would not be.
+        import json as _json
+
+        self.assertEqual(_json.loads(result)["obj"], "weird-instance")
 
 
 class TestLoopDetectionMiddlewareIntegration(unittest.TestCase):
