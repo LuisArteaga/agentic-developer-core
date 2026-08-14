@@ -121,28 +121,60 @@ def commit(repo_dir: Path | str, message: str, author: str | None = None) -> boo
     return True
 
 
+def _unstage_all(repo_dir: Path | str) -> None:
+    """Best-effort mixed reset so nothing remains staged (working tree untouched).
+
+    Restores the index to ``HEAD`` after :func:`diff_cached` has captured the
+    candidate diff, re-establishing the invariant the ADR-0034 hard reset relies
+    on: *nothing is staged until the PR-Node*. A mixed reset unstages new files
+    (returning them to untracked) and tracked modifications alike, leaving the
+    working tree exactly as it was — so a later ``git reset --hard HEAD`` reverts
+    only tracked-file edits and leaves Worker-created files on disk.
+
+    Idempotent across repeated verify→execute cycles. Never raises: on failure
+    (e.g. unborn HEAD, where ``git reset`` has no ref to reset to) it logs and
+    returns, preserving the soft-gate contract that ``diff_cached`` never raises.
+    """
+    try:
+        _run_git(repo_dir, ["reset", "-q"], check=False)
+    except GitError as e:
+        logger.debug("unstage failed in %s (non-fatal): %s", repo_dir, e)
+
+
 def diff_cached(repo_dir: Path | str) -> str:
     """Return the staged diff (tracked changes + newly added files) vs HEAD.
 
     Stages all current changes first (tracked modifications and untracked
-    files) via `git add -A`, then returns `git diff --cached` output. This
+    files) via ``git add -A``, then returns ``git diff --cached`` output. This
     captures the full set of candidate PR changes including new files, which a
-    bare `git diff HEAD` would miss (untracked files are not shown). Staging is
+    bare ``git diff HEAD`` would miss (untracked files are not shown). Staging is
     idempotent and never commits — the PR-Node re-stages before committing.
+
+    After capturing the diff the index is **unstaged** via :func:`_unstage_all`
+    (a mixed ``git reset -q``), so the workspace returns to its pre-BinEval
+    state: nothing staged, Worker-created files untracked again. This restores
+    the ADR-0034 hard-reset invariant — a later ``git reset --hard HEAD`` reverts
+    only tracked-file edits and leaves untracked Worker output intact. Without
+    it, the staged new files would be deleted from the working tree by the hard
+    reset, wiping the Worker's prior work on the final retry attempt.
 
     Returns the diff text, or an empty string if the directory is not a git
     repository or the diff command fails. Never raises: BinEval treats an empty
-    diff as a signal to skip the soft gate (edge-case policy).
+    diff as a signal to skip the soft gate (edge-case policy). The index is
+    unstaged on every return path — success, diff failure, and exception — so no
+    staged residue is ever left behind.
     """
     try:
         _run_git(repo_dir, ["add", "-A"], check=False)
         result = _run_git(repo_dir, ["diff", "--cached"], check=False)
-        if result.returncode != 0:
-            return ""
-        return result.stdout
     except GitError as e:
         logger.debug("diff_cached failed in %s: %s", repo_dir, e)
+        _unstage_all(repo_dir)
         return ""
+
+    diff = result.stdout if result.returncode == 0 else ""
+    _unstage_all(repo_dir)
+    return diff
 
 
 def diff_name_only(repo_dir: Path | str, base: str = "origin/main...HEAD") -> str:

@@ -31,7 +31,7 @@ The Orchestrator runs a **phased LangGraph state machine** (not a free-form ReAc
 2. **Plan** — produce a [Localization](CONTEXT.md) (target files + intents) from the issue + a codebase snapshot, using tree-sitter structural outlines for Python/TypeScript.
 3. **Write tests first** (Test-Driven Development, ADR-0010).
 4. **Execute** — a ReAct [Worker](CONTEXT.md) makes the changes with a bounded tool suite, self-correcting on verification feedback.
-5. **Verify** — run the target repo's deterministic gate (`make verify` by default), then a BinEval soft semantic gate; retry on failure.
+5. **Verify** — run the target repo's deterministic gate (`make verify` by default, configurable via `AGENT_VERIFY_COMMAND`), then a BinEval soft semantic gate; retry on failure.
 6. **Open the PR** with a deterministic body (plan rationale + diff stat + coverage tail).
 7. **Merge** — poll CI and PR Review Judge verdicts; on actionable feedback, run a bounded merge-fix loop back to Execute; else merge or escalate to recovery.
 
@@ -69,7 +69,7 @@ Node responsibilities:
 | `plan` | LLM analysis of the issue + codebase snapshot → [Localization](CONTEXT.md) (target files + intents) and structural outlines (tree-sitter, Python/TS). Optional single Plan Detail Request re-invoke. |
 | `test_writer` | Write unit/integration tests for the planned changes first (TDD, ADR-0010). |
 | `execute` | ReAct [Worker](CONTEXT.md) runs the plan with custom tools, self-correcting on [Verification Feedback](CONTEXT.md). |
-| `verify` | Run the target repo's deterministic gate (`make verify`) then the BinEval soft gate; on failure route back to `execute` (bounded retries). |
+| `verify` | Run the target repo's deterministic gate (`make verify` by default, override via `AGENT_VERIFY_COMMAND`) then the BinEval soft gate; on failure route back to `execute` (bounded retries). |
 | `pr` | Open the PR with a deterministic body; commit `fix:` commits in the merge-fix loop ([PR Body Enrichment](CONTEXT.md)). |
 | `merge` | Poll merge/CI status; parse PR Review Judge verdicts; merge, loop to `execute` (merge-fix), or escalate to recovery. |
 | `recovery` | Clean up and reset the issue label to `agent-ready` for a future attempt ([Failure Recovery](CONTEXT.md)). |
@@ -90,7 +90,7 @@ Graph state is serialized atomically to `.agent_logs/state.json` on every transi
 
 ## Verification & quality gates
 
-- **In-cycle deterministic gate** — `make verify` (ruff lint, ruff format check, mypy, pytest). Deliberately excludes semgrep/pip-audit (ADR-0020).
+- **In-cycle deterministic gate** — `make verify` (ruff lint, ruff format check, mypy, pytest). Deliberately excludes semgrep/pip-audit (ADR-0020). The command runs in `GITHUB_WORKSPACE` against the target repository and is configurable per target repo via `AGENT_VERIFY_COMMAND` (e.g. `python -m pytest tests/` for a repo without a Makefile); `AGENT_VERIFY_TIMEOUT` bounds its runtime (default 300s). The command is executed via `shlex.split` without a shell — a single command with arguments only, no pipes or `&&`.
 - **Opt-in strict gate** — `make pre-commit-strict` (adds local semgrep mirroring CI). See [Development & verification](#development--verification).
 - **BinEval soft gate** — a pre-PR semantic review (10 binary checks across Completeness / Simplicity / ADR Compliance / Robustness) graded by a lightweight LLM against the issue body, plan, git diff, and ADRs. Infra failure degrades to PASS; the post-PR Review Judges remain the hard gate (ADR-0027).
 - **CI** — [`pr-checks.yml`](.github/workflows/pr-checks.yml) runs the secret scan, ruff, mypy, pytest with coverage (≥89%), semgrep, pip-audit, and then the **PR Review Judges** (`scripts/review.py`): Syntax/Lint, Test Coverage, Architecture, Security. Judges evaluate per-file chunks with [Enclosing Function Context](CONTEXT.md) (ADR-0022/0023), emit a hidden verdict block (ADR-0019), and produce `PASS` / `FAIL` / `NEEDS REVIEW` verdicts that gate the merge (ADR-0014). [`secret-scan.yml`](.github/workflows/secret-scan.yml) adds gitleaks.
@@ -147,6 +147,8 @@ Copy [`.env.example`](.env.example) to `.env` for the full environment surface. 
 | `AGENT_LOG_PATH` | Where state, traces, and metrics are written (default `.agent_logs`). |
 | `AGENT_LABEL_READY` / `AGENT_LABEL_IN_PROGRESS` / `AGENT_LABEL_BLOCKED` | Issue label lifecycle (defaults: `agent-ready` / `agent-in-progress` / `agent-blocked`). |
 | `AGENT_SUBPROCESS_ENV_ALLOWLIST` | Comma-separated extra env vars to pass to `run_command` subprocesses beyond the default minimal allowlist (ADR-0043). |
+| `AGENT_VERIFY_COMMAND` | Deterministic gate command run in `GITHUB_WORKSPACE` during the Verify phase (default `make verify`). Must match the target repository's tooling. Single command with arguments (no shell operators); must not be blank. |
+| `AGENT_VERIFY_TIMEOUT` | Timeout in seconds for the verify command (default `300`); must not be blank. |
 
 **Issue label lifecycle**: `agent-ready` → `agent-in-progress` (claimed) / `agent-blocked` (open dependencies) → `agent-ready` (dependencies closed, or recovery after failure).
 

@@ -79,7 +79,14 @@ under the `orchestrator_phase_verify` parent span (ADR-0016).
   (`_apply_no_adr_autopass`), independent of LLM compliance with the prompt.
 - **Diff capture.** `diff_cached` stages all changes (incl. untracked files)
   via `git add -A` then returns `git diff --cached`; staging is idempotent and
-  never commits (the PR-Node re-stages). The diff is truncated to
+  never commits (the PR-Node re-stages). After capturing the diff, `diff_cached`
+  **unstages** via a mixed `git reset -q` (working tree untouched), restoring the
+  index to its pre-BinEval state so nothing remains staged. This preserves the
+  invariant the ADR-0034 hard reset relies on — leaving new files staged would
+  cause a later `git reset --hard HEAD` to delete them from the working tree,
+  wiping Worker output on the final retry (issue #128). Unstaging is idempotent
+  and never raises; an unborn-HEAD failure is logged and the diff returned
+  anyway (soft-gate contract). The diff is truncated to
   `BINEVAL_DIFF_MAX_CHARS` (default 20000) with an explicit note.
 
 ## Inspiration & References

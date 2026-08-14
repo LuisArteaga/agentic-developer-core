@@ -1029,8 +1029,14 @@ def execute_node(state: AgentState) -> AgentState:
         # instead of building on compounding errors. Only tracked files are
         # reverted: nothing is committed until the PR-Node, so the Test-Writer's
         # tests and stubs are untracked and survive the reset (git reset --hard
-        # does not touch untracked files). reset --hard to HEAD is idempotent, so
-        # a crash-and-resume that re-enters this attempt re-resetting is safe.
+        # does not touch untracked files). This invariant holds only while
+        # nothing is staged before this point — `diff_cached` (BinEval, ADR-0027)
+        # unstages via a mixed `git reset -q` after computing the candidate diff,
+        # so Worker-created files remain untracked here rather than staged. Were
+        # they left staged, `git reset --hard HEAD` would delete them from the
+        # working tree, wiping the Worker's prior output on the final retry.
+        # reset --hard to HEAD is idempotent, so a crash-and-resume that re-enters
+        # this attempt re-resetting is safe.
         hard_reset_attempt = int(os.getenv("AGENT_RETRY_HARD_RESET_ATTEMPT", "3"))
         if attempt >= hard_reset_attempt:
             logger.info(

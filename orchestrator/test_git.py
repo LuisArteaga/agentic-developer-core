@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from orchestrator import git
 from orchestrator.git import (
@@ -157,6 +158,115 @@ class TestGitSubprocessHelper(unittest.TestCase):
         # Untracked files are captured because diff_cached stages with add -A.
         self.assertIn("new_file.txt", diff)
         self.assertIn("brand new", diff)
+
+    def test_diff_cached_leaves_nothing_staged(self):
+        """diff_cached unstages after computing so nothing remains staged (issue #128)."""
+        from orchestrator.git import diff_cached
+
+        (self.repo_path / "initial.txt").write_text("changed", encoding="utf-8")
+        (self.repo_path / "new_file.txt").write_text("brand new", encoding="utf-8")
+
+        diff = diff_cached(self.repo_path)
+
+        # Diff is still captured (full candidate diff incl. untracked files).
+        self.assertIn("new_file.txt", diff)
+        self.assertIn("brand new", diff)
+
+        # No staged changes remain after diff_cached unstages.
+        self._assert_nothing_staged()
+
+    def test_diff_cached_unstaging_survives_hard_reset(self):
+        """Regression for issue #128: staged-by-BinEval files survive a hard reset.
+
+        Reproduces the destructive interaction: untracked Worker-created files,
+        once captured by diff_cached (which stages them), must remain on disk
+        after a subsequent reset_hard(HEAD) — the ADR-0034 final-retry path. This
+        only holds because diff_cached unstages after computing, returning the
+        files to untracked state.
+        """
+        from orchestrator.git import diff_cached
+
+        # Worker creates several new files (untracked) and edits a tracked one.
+        (self.repo_path / "initial.txt").write_text("changed", encoding="utf-8")
+        new_files = ["pyproject.toml", "src/pkg/__init__.py", "tests/test_pkg.py"]
+        for rel in new_files:
+            path = self.repo_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"# {rel}\n", encoding="utf-8")
+
+        diff = diff_cached(self.repo_path)
+        # BinEval received the full candidate diff incl. untracked files.
+        for rel in new_files:
+            self.assertIn(rel, diff)
+
+        # After diff_cached, nothing is staged and the files are untracked again.
+        self._assert_nothing_staged()
+
+        # The ADR-0034 hard-reset path: tracked edits revert to HEAD, but the
+        # untracked Worker files must survive on disk.
+        reset_hard(self.repo_path, "HEAD")
+
+        for rel in new_files:
+            self.assertTrue(
+                (self.repo_path / rel).exists(),
+                f"untracked file {rel!r} was wiped by reset_hard (issue #128)",
+            )
+
+    def test_diff_cached_unstaging_is_idempotent_across_cycles(self):
+        """diff_cached unstaging is idempotent across repeated verify->execute cycles."""
+        from orchestrator.git import diff_cached
+
+        (self.repo_path / "new_file.txt").write_text("brand new", encoding="utf-8")
+
+        for _ in range(3):
+            diff = diff_cached(self.repo_path)
+            self.assertIn("new_file.txt", diff)
+            self._assert_nothing_staged()
+
+    def test_diff_cached_failure_path_leaves_no_staged_residue(self):
+        """On the diff-failure path the index is still unstaged (no staged residue)."""
+        from orchestrator.git import diff_cached
+
+        (self.repo_path / "new_file.txt").write_text("brand new", encoding="utf-8")
+
+        # Force the `git diff --cached` step to fail by making git unusable via a
+        # bad GIT_EXEC_PATH-style shim is fragile; instead patch the inner helper
+        # so the diff command "fails" (non-zero) after add -A has staged files.
+        import orchestrator.git as gmod
+
+        original_run_git = gmod._run_git
+        call_count = {"n": 0}
+
+        def failing_diff(repo_dir, args, check=True):
+            call_count["n"] += 1
+            # Let `git add -A` (first call) succeed; make `git diff --cached` fail.
+            if args[:2] == ["diff", "--cached"]:
+                return subprocess.CompletedProcess(
+                    args=["git"] + args, returncode=1, stdout="", stderr="boom"
+                )
+            return original_run_git(repo_dir, args, check=check)
+
+        with patch("orchestrator.git._run_git", side_effect=failing_diff):
+            result = diff_cached(self.repo_path)
+
+        self.assertEqual(result, "")
+        # Even on the failure path, nothing must remain staged.
+        self._assert_nothing_staged()
+
+    def _assert_nothing_staged(self):
+        """Assert the index has no staged changes (empty `git diff --cached`)."""
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertEqual(
+            staged.strip(),
+            "",
+            f"unexpected staged changes left behind:\n{staged}",
+        )
 
     def test_diff_cached_empty_when_no_changes(self):
         from orchestrator.git import diff_cached
