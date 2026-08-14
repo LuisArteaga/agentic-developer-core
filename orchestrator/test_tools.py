@@ -633,6 +633,24 @@ class TestCodebaseTools(unittest.TestCase):
         self.assertIn("created successfully", res)
         self.assertEqual(deep.read_text(encoding="utf-8"), "x = 1\n")
 
+    def test_patch_file_create_parent_dir_mkdir_failure(self):
+        """If parent-directory creation fails, the error is reported and no file is written."""
+        new_file = self.temp_dir_path / "blocked_dir" / "new.py"
+        with unittest.mock.patch(
+            "orchestrator.tools.Path.mkdir", side_effect=OSError("permission denied")
+        ):
+            res = patch_file(str(new_file), "", "x = 1\n")
+        self.assertIn("Failed to create parent directories", res)
+        self.assertFalse(new_file.exists())
+
+    def test_patch_file_create_write_failure(self):
+        """If the file write fails, the error is reported and no file is written."""
+        new_file = self.temp_dir_path / "write_fail.py"
+        with unittest.mock.patch("builtins.open", side_effect=OSError("disk full")):
+            res = patch_file(str(new_file), "", "content")
+        self.assertIn("Failed to create file", res)
+        self.assertFalse(new_file.exists())
+
     def test_patch_file_create_does_not_authorize_subsequent_edit(self):
         """After create, a str_replace on the new file still requires read_file first."""
         new_file = self.temp_dir_path / "created.py"
