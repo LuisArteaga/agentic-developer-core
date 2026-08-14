@@ -1,6 +1,6 @@
 # ADR 0027: Pre-PR BinEval Review as a Soft Semantic Gate
 
-* **Status**: Accepted (amended by ADR-0032)
+* **Status**: Accepted (amended by ADR-0032; shared-counter decision superseded by ADR-0047)
 * **Date**: 2026-07
 * **Deciders**: Luis Arteaga & Antigravity
 
@@ -70,6 +70,10 @@ under the `orchestrator_phase_verify` parent span (ADR-0016).
   failures and BinEval failures (max 3 total), so a Worker cannot spin on
   BinEval forever. The counter resets only on a full verify success
   (make-verify pass AND BinEval pass/skip/infra-fallback).
+  *(Superseded by [ADR-0047](./0047-split-per-gate-verify-attempt-counters.md):
+  the shared counter let `make verify` failures starve the BinEval gate of
+  retries — observed in production on 2026-08-14. BinEval and make-verify now
+  track independent per-gate budgets.)*
 - **Deterministic no-ADRs auto-pass.** When the Target Repository has no
   `docs/adr/`, the ADR Compliance checks are forced to PASS in code
   (`_apply_no_adr_autopass`), independent of LLM compliance with the prompt.

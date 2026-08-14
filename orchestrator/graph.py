@@ -72,10 +72,12 @@ def route_after_verify(state: AgentState) -> str:
     """Routes execution after the Verify-Node based on success, retry, or failure status.
 
     The Verify-Node encompasses both the deterministic `make verify` command and
-    the Pre-PR BinEval Review (soft semantic gate). Both failure modes share the
-    `attempts["verify"]` counter and signal their outcome via `status`:
+    the Pre-PR BinEval Review (soft semantic gate). Per ADR-0047 each failure
+    mode tracks its own independent retry budget (attempts["verify_cmd"] for
+    make-verify, attempts["bineval"] for BinEval) and signals its outcome via
+    `status`:
       - "executing" → make verify OR BinEval failed with retries remaining → execute
-      - "failed"   → make verify OR BinEval exhausted attempts (3/3) → recovery
+      - "failed"   → make verify OR BinEval exhausted its per-gate cap → recovery
       - "verifying" → make verify AND BinEval passed (or was skipped / infra-fallback)
                      → pr (Pull Request creation)
     No graph-level change was needed: BinEval PASS/FAIL is signaled through the

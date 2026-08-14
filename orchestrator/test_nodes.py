@@ -1048,7 +1048,7 @@ class TestExecuteNode(unittest.TestCase):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
-        # attempts["verify"]=0 -> first execute attempt (1) -> below threshold (3)
+        # attempts["verify_cmd"]=0 -> first execute attempt (1) -> below threshold (3)
         state_module.save(state)
 
         execute_node(state)
@@ -1073,8 +1073,8 @@ class TestExecuteNode(unittest.TestCase):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
-        # attempts["verify"]=2 -> execute attempt 3 -> meets default threshold
-        state["attempts"] = {"verify": 2}
+        # attempts["verify_cmd"]=2 -> execute attempt 3 -> meets default threshold
+        state["attempts"] = {"verify_cmd": 2}
         state_module.save(state)
 
         execute_node(state)
@@ -1110,8 +1110,8 @@ class TestExecuteNode(unittest.TestCase):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
-        # attempts["verify"]=1 -> execute attempt 2 -> meets configured threshold
-        state["attempts"] = {"verify": 1}
+        # attempts["verify_cmd"]=1 -> execute attempt 2 -> meets configured threshold
+        state["attempts"] = {"verify_cmd": 1}
         state_module.save(state)
 
         execute_node(state)
@@ -1143,12 +1143,41 @@ class TestExecuteNode(unittest.TestCase):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["plan"] = '{"rationale": "...", "tasks": []}'
-        state["attempts"] = {"verify": 2}  # attempt 3, but threshold 99 -> no reset
+        state["attempts"] = {"verify_cmd": 2}  # attempt 3, but threshold 99 -> no reset
         state_module.save(state)
 
         execute_node(state)
 
         mock_reset_hard.assert_not_called()
+        mock_execute_worker.assert_called_once_with(
+            unittest.mock.ANY,
+            '{"rationale": "...", "tasks": []}',
+            issue_number=10,
+            attempt=3,
+        )
+
+    @patch("orchestrator.nodes.reset_hard")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_execute_node_attempt_derived_from_both_gate_counters(
+        self, mock_github_api, mock_execute_worker, mock_reset_hard
+    ):
+        """ADR-0047: the execute attempt index is the SUM of the per-gate verify
+        counters (verify_cmd + bineval + 1), so a BinEval-only failure history
+        still advances the Hybrid Retry threshold. verify_cmd=1 + bineval=1 ->
+        attempt 3 -> meets the default hard-reset threshold.
+        """
+        mock_github_api.return_value = {"title": "Fix a bug", "body": "body"}
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state["attempts"] = {"verify_cmd": 1, "bineval": 1}
+        state_module.save(state)
+
+        execute_node(state)
+
+        self.assertEqual(mock_reset_hard.call_count, 1)
         mock_execute_worker.assert_called_once_with(
             unittest.mock.ANY,
             '{"rationale": "...", "tasks": []}',
@@ -1204,7 +1233,7 @@ class TestVerifyNode(unittest.TestCase):
         # Setup initial state with existing attempts and feedback
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
-        state["attempts"] = {"verify": 2}
+        state["attempts"] = {"verify_cmd": 2}
         state["feedback"] = "some previous error"
         state_module.save(state)
 
@@ -1214,7 +1243,7 @@ class TestVerifyNode(unittest.TestCase):
         # Verify state changes: status 'verifying', attempts reset to 0, feedback cleared
         self.assertEqual(new_state["status"], "verifying")
         self.assertEqual(new_state["phase"], "verifying")
-        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertEqual(new_state["attempts"]["verify_cmd"], 0)
         self.assertIsNone(new_state["feedback"])
 
         # Verify subprocess was called correctly (default command: 'make verify')
@@ -1238,7 +1267,7 @@ class TestVerifyNode(unittest.TestCase):
         # Setup initial state
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
-        state["attempts"] = {"verify": 1}
+        state["attempts"] = {"verify_cmd": 1}
         state_module.save(state)
 
         # Run verify node
@@ -1247,7 +1276,7 @@ class TestVerifyNode(unittest.TestCase):
         # Verify state: status becomes 'executing' for retry, attempts incremented to 2, feedback saved
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "verifying")
-        self.assertEqual(new_state["attempts"]["verify"], 2)
+        self.assertEqual(new_state["attempts"]["verify_cmd"], 2)
         self.assertEqual(new_state["feedback"], "AssertionError: 1 != 2")
 
     @patch("orchestrator.nodes.subprocess.run")
@@ -1261,7 +1290,7 @@ class TestVerifyNode(unittest.TestCase):
         # Setup initial state at 2 attempts
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
-        state["attempts"] = {"verify": 2}
+        state["attempts"] = {"verify_cmd": 2}
         state_module.save(state)
 
         # Run verify node (this is attempt 3)
@@ -1270,7 +1299,7 @@ class TestVerifyNode(unittest.TestCase):
         # Verify state: status becomes 'failed', attempts incremented to 3
         self.assertEqual(new_state["status"], "failed")
         self.assertEqual(new_state["phase"], "verifying")
-        self.assertEqual(new_state["attempts"]["verify"], 3)
+        self.assertEqual(new_state["attempts"]["verify_cmd"], 3)
         self.assertEqual(new_state["feedback"], "AssertionError: 1 != 2")
 
     @patch("orchestrator.nodes.subprocess.run")
@@ -1291,7 +1320,7 @@ class TestVerifyNode(unittest.TestCase):
         new_state = verify_node(state)
 
         self.assertEqual(new_state["status"], "executing")
-        self.assertEqual(new_state["attempts"]["verify"], 1)
+        self.assertEqual(new_state["attempts"]["verify_cmd"], 1)
         assert new_state["feedback"] is not None
         self.assertIn("timed out after 300 seconds", new_state["feedback"])
         self.assertIn("Starting tests...", new_state["feedback"])
@@ -1386,10 +1415,10 @@ class TestBinEvalPhase(unittest.TestCase):
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
 
-    def _state(self, attempts_verify=0):
+    def _state(self, verify_cmd=0, bineval=0):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
-        state["attempts"] = {"verify": attempts_verify}
+        state["attempts"] = {"verify_cmd": verify_cmd, "bineval": bineval}
         state["plan"] = '{"tasks": []}'
         state_module.save(state)
         return state
@@ -1413,10 +1442,11 @@ class TestBinEvalPhase(unittest.TestCase):
         mock_run.return_value = self._mock_make_verify_pass()
         mock_gh.return_value = {"body": "issue body"}
         with patch("orchestrator.nodes._run_bineval", return_value=_all_pass_result()):
-            state = self._state(attempts_verify=2)
+            state = self._state(bineval=2)
             new_state = verify_node(state)
         self.assertEqual(new_state["status"], "verifying")
-        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertEqual(new_state["attempts"]["bineval"], 0)
+        self.assertEqual(new_state["attempts"]["verify_cmd"], 0)
         self.assertIsNone(new_state["feedback"])
 
     @patch("orchestrator.nodes._load_adrs", return_value="")
@@ -1437,10 +1467,10 @@ class TestBinEvalPhase(unittest.TestCase):
             "introduces speculative interface in f.py",
         )
         with patch("orchestrator.nodes._run_bineval", return_value=fail):
-            state = self._state(attempts_verify=0)
+            state = self._state(bineval=0)
             new_state = verify_node(state)
         self.assertEqual(new_state["status"], "executing")
-        self.assertEqual(new_state["attempts"]["verify"], 1)
+        self.assertEqual(new_state["attempts"]["bineval"], 1)
         self.assertIsNotNone(new_state["feedback"])
         assert new_state["feedback"] is not None
         self.assertIn("[2.1]", new_state["feedback"])
@@ -1461,10 +1491,10 @@ class TestBinEvalPhase(unittest.TestCase):
             "4.2", "Robustness", "No regression risk", "removes safety check"
         )
         with patch("orchestrator.nodes._run_bineval", return_value=fail):
-            state = self._state(attempts_verify=2)
+            state = self._state(bineval=2)
             new_state = verify_node(state)
         self.assertEqual(new_state["status"], "failed")
-        self.assertEqual(new_state["attempts"]["verify"], 3)
+        self.assertEqual(new_state["attempts"]["bineval"], 3)
         assert new_state["feedback"] is not None
         self.assertIn("[4.2]", new_state["feedback"])
 
@@ -1478,10 +1508,10 @@ class TestBinEvalPhase(unittest.TestCase):
         mock_run.return_value = self._mock_make_verify_pass()
         mock_gh.return_value = {"body": "issue body"}
         with patch("orchestrator.nodes._run_bineval", return_value=None):
-            state = self._state(attempts_verify=1)
+            state = self._state(bineval=1)
             new_state = verify_node(state)
         self.assertEqual(new_state["status"], "verifying")
-        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertEqual(new_state["attempts"]["bineval"], 0)
         self.assertIsNone(new_state["feedback"])
 
     @patch("orchestrator.nodes._github_api_request")
@@ -1491,11 +1521,11 @@ class TestBinEvalPhase(unittest.TestCase):
         from orchestrator.nodes import verify_node
 
         mock_run.return_value = self._mock_make_verify_pass()
-        state = self._state(attempts_verify=2)
+        state = self._state(bineval=2)
         new_state = verify_node(state)
         # Empty diff -> skip BinEval -> PASS path -> reset + PR transition.
         self.assertEqual(new_state["status"], "verifying")
-        self.assertEqual(new_state["attempts"]["verify"], 0)
+        self.assertEqual(new_state["attempts"]["bineval"], 0)
         self.assertIsNone(new_state["feedback"])
         # BinEval never reached the issue fetch.
         mock_gh.assert_not_called()
@@ -1532,7 +1562,7 @@ class TestBinEvalPhase(unittest.TestCase):
                 return _all_pass_result()
 
             with patch("orchestrator.nodes._run_bineval", side_effect=capture_bineval):
-                state = self._state(attempts_verify=0)
+                state = self._state(bineval=0)
                 new_state = verify_node(state)
 
         # The diff passed to _run_bineval must be enriched
@@ -1554,6 +1584,92 @@ class TestBinEvalPhase(unittest.TestCase):
         # Non-ADR checks are untouched.
         non_adr = [c for c in result.checks if c.dimension != "ADR Compliance"]
         self.assertTrue(all(c.passed for c in non_adr))
+
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_bineval_not_starved_by_make_verify_failures(
+        self, mock_run, _diff, mock_gh, _adrs
+    ):
+        """AC1 (issue #123): a BinEval FAIL after >=1 prior make-verify failures
+        leaves at least one retry that injects BinEval structured feedback.
+
+        Reproduces the 2026-08-14 sequence: verify-fail, verify-fail,
+        verify-pass+bineval-fail. Under the old shared counter this transitioned
+        to 'failed' (3/3) and the Worker never saw BinEval feedback. With the
+        split per-gate counters (ADR-0047) the BinEval budget is independent, so
+        the issue stays 'executing' with structured feedback injected.
+        """
+        from orchestrator.nodes import verify_node
+
+        fail_res = unittest.mock.MagicMock(returncode=1, stdout=b"make: *** No rule")
+        pass_res = self._mock_make_verify_pass()
+        mock_run.side_effect = [fail_res, fail_res, pass_res]
+        mock_gh.return_value = {"body": "issue body"}
+        fail = _result_with_fail(
+            "2.1", "Simplicity", "No unnecessary abstraction", "speculative iface"
+        )
+
+        state = self._state()
+        with patch("orchestrator.nodes._run_bineval", return_value=fail):
+            # Attempt 1: make verify fails -> verify_cmd=1, executing.
+            state = verify_node(state)
+            self.assertEqual(state["status"], "executing")
+            self.assertEqual(state["attempts"]["verify_cmd"], 1)
+            self.assertEqual(state["attempts"]["bineval"], 0)
+            # Attempt 2: make verify fails again -> verify_cmd=2, executing.
+            state = verify_node(state)
+            self.assertEqual(state["status"], "executing")
+            self.assertEqual(state["attempts"]["verify_cmd"], 2)
+            self.assertEqual(state["attempts"]["bineval"], 0)
+            # Attempt 3: make verify passes, BinEval FAILs -> bineval=1, STILL
+            # executing (not failed) with structured BinEval feedback injected.
+            state = verify_node(state)
+        self.assertEqual(state["status"], "executing")
+        self.assertEqual(state["attempts"]["verify_cmd"], 2)
+        self.assertEqual(state["attempts"]["bineval"], 1)
+        assert state["feedback"] is not None
+        self.assertIn("[2.1]", state["feedback"])
+        self.assertIn("speculative iface", state["feedback"])
+
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_mixed_sequence_counters_independent_and_bounded(
+        self, mock_run, _diff, mock_gh, _adrs
+    ):
+        """Edge case (issue #123): a mixed verify-fail / bineval-fail sequence
+        increments each gate's counter independently, and the total stays
+        bounded — here make-verify exhausts its own cap (3) and transitions to
+        'failed' even though BinEval was never exhausted.
+        """
+        from orchestrator.nodes import verify_node
+
+        fail_res = unittest.mock.MagicMock(returncode=1, stdout=b"AssertionError")
+        pass_res = self._mock_make_verify_pass()
+        # Sequence: vf, vp(bf), vf, vf  -> verify_cmd 1,2,3 (failed); bineval 1.
+        mock_run.side_effect = [fail_res, pass_res, fail_res, fail_res]
+        mock_gh.return_value = {"body": "issue body"}
+        bineval_fail = _result_with_fail(
+            "4.2", "Robustness", "No regression risk", "removes safety check"
+        )
+
+        state = self._state()
+        with patch("orchestrator.nodes._run_bineval", return_value=bineval_fail):
+            state = verify_node(state)  # vf -> verify_cmd=1
+            self.assertEqual(state["status"], "executing")
+            state = verify_node(state)  # vp+bf -> bineval=1
+            self.assertEqual(state["status"], "executing")
+            self.assertEqual(state["attempts"]["bineval"], 1)
+            state = verify_node(state)  # vf -> verify_cmd=2
+            self.assertEqual(state["status"], "executing")
+            self.assertEqual(state["attempts"]["verify_cmd"], 2)
+            state = verify_node(state)  # vf -> verify_cmd=3 -> failed
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["attempts"]["verify_cmd"], 3)
+        self.assertEqual(state["attempts"]["bineval"], 1)
 
 
 class TestBinEvalHelpers(unittest.TestCase):
@@ -2332,7 +2448,8 @@ class TestMergeNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "merge_fix")
         self.assertEqual(new_state["attempts"].get("merge"), 1)
-        self.assertEqual(new_state["attempts"].get("verify"), 0)
+        self.assertEqual(new_state["attempts"].get("verify_cmd"), 0)
+        self.assertEqual(new_state["attempts"].get("bineval"), 0)
         assert new_state["feedback"] is not None
         self.assertIn("merge-fix attempt 1/", new_state["feedback"])
         self.assertIn("security (FAIL)", new_state["feedback"])
@@ -2382,7 +2499,8 @@ class TestMergeNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "merge_fix")
         self.assertEqual(new_state["attempts"].get("merge"), 1)
-        self.assertEqual(new_state["attempts"].get("verify"), 0)
+        self.assertEqual(new_state["attempts"].get("verify_cmd"), 0)
+        self.assertEqual(new_state["attempts"].get("bineval"), 0)
         assert new_state["feedback"] is not None
         self.assertIn("merge-fix attempt 1/", new_state["feedback"])
         self.assertIn("architecture (FAIL)", new_state["feedback"])
@@ -2478,7 +2596,8 @@ class TestMergeNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "merge_fix")
         self.assertEqual(new_state["attempts"].get("merge"), 1)
-        self.assertEqual(new_state["attempts"].get("verify"), 0)
+        self.assertEqual(new_state["attempts"].get("verify_cmd"), 0)
+        self.assertEqual(new_state["attempts"].get("bineval"), 0)
         assert new_state["feedback"] is not None
         self.assertIn("merge-fix attempt 1/", new_state["feedback"])
         self.assertIn("syntax_lint (FAIL)", new_state["feedback"])
@@ -2528,7 +2647,8 @@ class TestMergeNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "merge_fix")
         self.assertEqual(new_state["attempts"].get("merge"), 1)
-        self.assertEqual(new_state["attempts"].get("verify"), 0)
+        self.assertEqual(new_state["attempts"].get("verify_cmd"), 0)
+        self.assertEqual(new_state["attempts"].get("bineval"), 0)
         assert new_state["feedback"] is not None
         self.assertIn("merge-fix attempt 1/", new_state["feedback"])
         self.assertIn("test_coverage (FAIL)", new_state["feedback"])
@@ -2579,7 +2699,8 @@ class TestMergeNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "merge_fix")
         self.assertEqual(new_state["attempts"].get("merge"), 1)
-        self.assertEqual(new_state["attempts"].get("verify"), 0)
+        self.assertEqual(new_state["attempts"].get("verify_cmd"), 0)
+        self.assertEqual(new_state["attempts"].get("bineval"), 0)
         assert new_state["feedback"] is not None
         self.assertIn("merge-fix attempt 1/", new_state["feedback"])
         self.assertIn("security (NEEDS REVIEW)", new_state["feedback"])
@@ -2723,7 +2844,8 @@ class TestMergeNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "merge_fix")
         self.assertEqual(new_state["attempts"].get("merge"), 1)
-        self.assertEqual(new_state["attempts"].get("verify"), 0)
+        self.assertEqual(new_state["attempts"].get("verify_cmd"), 0)
+        self.assertEqual(new_state["attempts"].get("bineval"), 0)
         assert new_state["feedback"] is not None
         self.assertIn("merge-fix attempt 1/", new_state["feedback"])
         self.assertIn("security (NEEDS REVIEW)", new_state["feedback"])
@@ -2827,7 +2949,7 @@ class TestMergeNode(unittest.TestCase):
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         # Budget already exhausted: cap=1 and one merge-fix already attempted.
-        state["attempts"] = {"merge": 1, "verify": 0}
+        state["attempts"] = {"merge": 1, "verify_cmd": 0, "bineval": 0}
         state_module.save(state)
 
         os.environ["AGENT_PR_FIX_MAX"] = "1"
@@ -2869,7 +2991,7 @@ class TestMergeNode(unittest.TestCase):
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
         # Simulate a prior merge-fix cycle whose PR then merged.
-        state["attempts"] = {"merge": 2, "verify": 0}
+        state["attempts"] = {"merge": 2, "verify_cmd": 0, "bineval": 0}
         state_module.save(state)
 
         from orchestrator.nodes import merge_node
@@ -2924,7 +3046,7 @@ class TestMergeNode(unittest.TestCase):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
-        state["attempts"] = {"merge": 1, "verify": 0}
+        state["attempts"] = {"merge": 1, "verify_cmd": 0, "bineval": 0}
         state_module.save(state)
 
         os.environ["AGENT_PR_FIX_MAX"] = "1"
@@ -2981,7 +3103,7 @@ class TestMergeNode(unittest.TestCase):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
-        state["attempts"] = {"merge": 1, "verify": 0}
+        state["attempts"] = {"merge": 1, "verify_cmd": 0, "bineval": 0}
         state_module.save(state)
 
         os.environ["AGENT_PR_FIX_MAX"] = "1"
@@ -3151,7 +3273,7 @@ class TestPrNodeCommitSelection(unittest.TestCase):
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
         state["branch"] = "feat/issue-10"
-        state["attempts"] = {"merge": 2, "verify": 0}
+        state["attempts"] = {"merge": 2, "verify_cmd": 0, "bineval": 0}
         state_module.save(state)
 
         from orchestrator.nodes import pr_node

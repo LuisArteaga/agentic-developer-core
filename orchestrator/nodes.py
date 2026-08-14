@@ -67,6 +67,15 @@ def _safe_telemetry(func, *args, **kwargs):
 _GH_API_TIMEOUT = 30
 _GH_API_MAX_ATTEMPTS = 3
 
+# Per-gate verify retry cap (ADR-0047). The deterministic `make verify` gate
+# (attempts["verify_cmd"]) and the BinEval soft gate (attempts["bineval"]) each
+# get an independent budget of this size, so neither gate can starve the other.
+# The total Execute->Verify loop is still bounded: in the worst case
+# (alternating gate failures) one gate exhausts its cap after at most
+# 2*VERIFY_MAX_ATTEMPTS-1 loop-backs. The Hybrid Retry hard-reset threshold
+# (ADR-0034) keys off the *derived* execute attempt = verify_cmd + bineval + 1.
+VERIFY_MAX_ATTEMPTS = 3
+
 
 def _gh_backoff_seconds(attempt: int, retry_after: str | None) -> float:
     """Compute a bounded backoff wait before retrying a GitHub API request.
@@ -569,8 +578,9 @@ def claim_node(state: AgentState) -> AgentState:
             state["plan"] = None
             state["read_files"] = {}
             # Reset retry counters and per-cycle fields for a fresh issue cycle.
-            # Without this, a stale attempts["merge"] / attempts["verify"]
-            # from a prior cycle would leak into the new one (ADR-0036).
+            # Without this, stale attempts["merge"] / attempts["verify_cmd"] /
+            # attempts["bineval"] from a prior cycle would leak into the new one
+            # (ADR-0036, ADR-0047).
             state["attempts"] = {}
             state["feedback"] = None
             state["pushed_at"] = None
@@ -1003,10 +1013,14 @@ def execute_node(state: AgentState) -> AgentState:
         logger.info("Invoking worker agent...")
         from orchestrator.worker import execute_worker
 
-        # Derive the 1-based execute attempt index from the verify retry counter
-        # (first execute = 1, after a failed verify = 2, ...). Used to name the
-        # Worker Trace sidecar file and to drive the Hybrid Retry strategy.
-        attempt = state.get("attempts", {}).get("verify", 0) + 1
+        # Derive the 1-based execute attempt index from the per-gate verify
+        # counters (ADR-0047): first execute = 1, after any verify-gate failure
+        # = verify_cmd + bineval + 1. Used to name the Worker Trace sidecar
+        # file and to drive the Hybrid Retry strategy (ADR-0034). Both the
+        # deterministic `make verify` gate and the BinEval soft gate loop back
+        # to execute on failure, so their counters are summed.
+        _attempts = state.get("attempts", {})
+        attempt = _attempts.get("verify_cmd", 0) + _attempts.get("bineval", 0) + 1
 
         # Hybrid Retry (ADR-0034): retries below the hard-reset threshold stay
         # incremental (ADR-0013) — the Worker patches its prior edits in place.
@@ -1268,9 +1282,11 @@ def _bineval_failed_feedback(result: BinEvalResult) -> str:
 def verify_node(state: AgentState) -> AgentState:
     """Runs verification tests in a subprocess and manages the retry/feedback loop.
 
-    Tracks retries in the state's 'attempts' dictionary under the 'verify' key (maximum 3 retries).
-    If verification fails, captures the truncated test output and transitions back to executing.
-    If retries are exhausted, transitions to failed.
+    Tracks make-verify retries in the state's 'attempts' dictionary under the
+    'verify_cmd' key (maximum VERIFY_MAX_ATTEMPTS retries, ADR-0047). The BinEval
+    soft gate, run after make-verify passes, tracks its own independent budget
+    under 'bineval'. If verification fails, captures the truncated test output and
+    transitions back to executing. If retries are exhausted, transitions to failed.
     """
     issue_num = state.get("issue_number")
     if issue_num is None:
@@ -1347,21 +1363,27 @@ def verify_node(state: AgentState) -> AgentState:
         logger.warning(
             "Verification failed (exit code: %d, timed out: %s).", exit_code, timed_out
         )
-        # Track retry attempts safely without mutating a shared DEFAULT_STATE dict
+        # Track the make-verify retry budget independently from BinEval's
+        # (ADR-0047): a make-verify failure must not deplete the BinEval budget
+        # and starve the semantic gate. Track retry attempts safely without
+        # mutating a shared DEFAULT_STATE dict.
         attempts = state.get("attempts", {}).copy()
-        attempts["verify"] = attempts.get("verify", 0) + 1
+        attempts["verify_cmd"] = attempts.get("verify_cmd", 0) + 1
         state["attempts"] = attempts
 
-        if attempts["verify"] >= 3:
+        if attempts["verify_cmd"] >= VERIFY_MAX_ATTEMPTS:
             logger.error(
-                "Maximum verification attempts (3) reached. Transitioning to failed."
+                "Maximum make-verify attempts (%d) reached. Transitioning to failed.",
+                VERIFY_MAX_ATTEMPTS,
             )
             state["status"] = "failed"
             state["feedback"] = output
         else:
             logger.info(
-                "Verification failed. Attempt %d/3. Transitioning back to executing.",
-                attempts["verify"],
+                "Verification failed. make-verify attempt %d/%d. Transitioning "
+                "back to executing.",
+                attempts["verify_cmd"],
+                VERIFY_MAX_ATTEMPTS,
             )
             state["feedback"] = output
             # Transition back to executing to let the graph route back to execute_node
@@ -1379,10 +1401,11 @@ def _run_bineval_phase(state: AgentState, issue_num: int, workspace_path: Path) 
     """Run the BinEval soft gate after `make verify` passes.
 
     Mutates `state` in place: on PASS (incl. empty-diff skip and LLM-failure
-    fallback) resets attempts["verify"] to 0 and clears feedback, leaving
-    status as "verifying" so route_after_verify transitions to PR. On FAIL
-    increments the shared attempts["verify"] counter and either transitions to
-    "executing" (retry) or "failed" (exhaustion at 3/3).
+    fallback) resets the per-gate verify counters (verify_cmd, bineval) and
+    clears feedback, leaving status as "verifying" so route_after_verify
+    transitions to PR. On FAIL increments the independent BinEval counter
+    (attempts["bineval"], ADR-0047) and either transitions to "executing"
+    (retry) or "failed" (exhaustion at the cap).
 
     Returns the exit code to attribute to the verify phase telemetry span:
     0 on PASS, 1 on BinEval FAIL.
@@ -1462,23 +1485,29 @@ def _run_bineval_phase(state: AgentState, issue_num: int, workspace_path: Path) 
     feedback = _bineval_failed_feedback(bineval_result)
     # Genuinely graded (a real FAIL, not a degraded PASS).
     state["bineval_degraded"] = False
+    # BinEval has its own retry budget, independent from make-verify's
+    # (ADR-0047): a BinEval failure must not be starved by prior make-verify
+    # failures that depleted a shared counter. The total loop stays bounded
+    # because each gate is independently capped at VERIFY_MAX_ATTEMPTS.
     attempts = state.get("attempts", {}).copy()
-    attempts["verify"] = attempts.get("verify", 0) + 1
+    attempts["bineval"] = attempts.get("bineval", 0) + 1
     state["attempts"] = attempts
 
-    if attempts["verify"] >= 3:
+    if attempts["bineval"] >= VERIFY_MAX_ATTEMPTS:
         logger.error(
-            "BinEval failed and max verification attempts (3) reached. "
-            "Transitioning to failed."
+            "BinEval failed and max BinEval attempts (%d) reached. "
+            "Transitioning to failed.",
+            VERIFY_MAX_ATTEMPTS,
         )
         state["status"] = "failed"
         state["feedback"] = feedback
     else:
         logger.info(
-            "BinEval FAIL for issue #%d. Attempt %d/3. Transitioning back to "
-            "executing with structured feedback.",
+            "BinEval FAIL for issue #%d. BinEval attempt %d/%d. Transitioning "
+            "back to executing with structured feedback.",
             issue_num,
-            attempts["verify"],
+            attempts["bineval"],
+            VERIFY_MAX_ATTEMPTS,
         )
         state["feedback"] = feedback
         state["status"] = "executing"
@@ -1486,16 +1515,20 @@ def _run_bineval_phase(state: AgentState, issue_num: int, workspace_path: Path) 
 
 
 def _reset_verify_success(state: AgentState) -> None:
-    """Reset the shared verify counter and feedback on a full verify success.
+    """Reset the per-gate verify counters and feedback on a full verify success.
 
-    The counter is reset only when the whole verify phase succeeds (make verify
-    pass AND BinEval pass / skip / infra-fallback). It is shared between
-    make-verify failures and BinEval failures, so a BinEval fail does NOT reset
-    prior make-verify attempts.
+    The counters are reset only when the whole verify phase succeeds (make verify
+    pass AND BinEval pass / skip / infra-fallback). Per ADR-0047 the make-verify
+    budget (attempts["verify_cmd"]) and the BinEval budget (attempts["bineval"])
+    are independent; both are reset here so a fresh budget is granted on success.
     """
-    if "verify" in state.get("attempts", {}):
-        attempts = state["attempts"].copy()
-        attempts["verify"] = 0
+    attempts = state.get("attempts", {}).copy()
+    changed = False
+    for key in ("verify_cmd", "bineval"):
+        if key in attempts:
+            attempts[key] = 0
+            changed = True
+    if changed:
         state["attempts"] = attempts
     state["feedback"] = None
     # status stays "verifying" — route_after_verify transitions to "pr".
@@ -2117,10 +2150,14 @@ def merge_node(state: AgentState) -> AgentState:
                     # (consumed by execute_node), and a fresh per-cycle verify
                     # budget is granted so the Hybrid Retry threshold (ADR-0034)
                     # counts Execute attempts within this merge-fix cycle, not
-                    # across cycles.
+                    # across cycles. Both per-gate counters are reset (ADR-0047):
+                    # a stale BinEval/make-verify count from the pre-PR phase must
+                    # not carry into the merge-fix cycle and trigger spurious
+                    # exhaustion.
                     attempts = state.get("attempts", {}).copy()
                     attempts["merge"] = merge_attempts + 1
-                    attempts["verify"] = 0
+                    attempts["verify_cmd"] = 0
+                    attempts["bineval"] = 0
                     state["attempts"] = attempts
                     state["feedback"] = _merge_fix_feedback(
                         verdict_review_body or "",
