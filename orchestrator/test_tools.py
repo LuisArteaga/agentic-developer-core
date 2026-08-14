@@ -578,6 +578,88 @@ class TestCodebaseTools(unittest.TestCase):
             res = patch_file(str(self.text_file), "line two", "line modified")
         self.assertIn("patched successfully", res)
 
+    # --- File Creation path (issue #129 / ADR-0048) --------------------------
+
+    def test_patch_file_create_success(self):
+        """Creating a new file with non-empty content succeeds in a single call, no read needed."""
+        new_file = self.temp_dir_path / "new_module.py"
+        res = patch_file(str(new_file), "", "def hello():\n    return 'hi'\n")
+        self.assertIn("created successfully", res)
+        self.assertEqual(
+            new_file.read_text(encoding="utf-8"), "def hello():\n    return 'hi'\n"
+        )
+        # Creation must NOT register read_files membership.
+        loaded = state.load(self.state_file_path)
+        _, rel_str = tools._normalize_path(str(new_file))
+        self.assertNotIn(rel_str, loaded["read_files"])
+
+    def test_patch_file_create_empty_content(self):
+        """An empty new_string creates an empty file (e.g. __init__.py)."""
+        init_file = self.temp_dir_path / "pkg" / "__init__.py"
+        res = patch_file(str(init_file), "", "")
+        self.assertIn("created successfully", res)
+        self.assertEqual(init_file.read_text(encoding="utf-8"), "")
+
+    def test_patch_file_create_existing_file_fails(self):
+        """Creating an already-existing file fails (no overwrite) with a clear error."""
+        res = patch_file(str(self.text_file), "", "completely new content")
+        self.assertIn("already exists", res)
+        # The original content is untouched.
+        self.assertEqual(
+            self.text_file.read_text(encoding="utf-8"),
+            "line one\nline two\nline three\nline four",
+        )
+
+    def test_patch_file_create_blocked_sensitive_path(self):
+        """Path Safety Validation is enforced on create: .env creation is blocked, no file written."""
+        env_file = self.temp_dir_path / ".env"
+        res = patch_file(str(env_file), "", "SECRET=leak")
+        self.assertIn("blocked by the path-safety policy", res)
+        self.assertFalse(env_file.exists())
+
+    def test_patch_file_create_blocked_sensitive_directory(self):
+        """Creation under a forbidden directory (.git) is blocked."""
+        git_dir = self.temp_dir_path / ".git"
+        git_dir.mkdir()
+        cfg = git_dir / "config"
+        res = patch_file(str(cfg), "", "[core]")
+        self.assertIn("blocked by the path-safety policy", res)
+        self.assertFalse(cfg.exists())
+
+    def test_patch_file_create_missing_parent_dirs(self):
+        """Missing parent directories are created automatically (mkdir -p semantics)."""
+        deep = self.temp_dir_path / "a" / "b" / "c" / "deep.py"
+        res = patch_file(str(deep), "", "x = 1\n")
+        self.assertIn("created successfully", res)
+        self.assertEqual(deep.read_text(encoding="utf-8"), "x = 1\n")
+
+    def test_patch_file_create_does_not_authorize_subsequent_edit(self):
+        """After create, a str_replace on the new file still requires read_file first."""
+        new_file = self.temp_dir_path / "created.py"
+        patch_file(str(new_file), "", "value = 1\n")
+        # Editing without reading must be rejected by Read-Before-Edit.
+        res = patch_file(str(new_file), "value = 1", "value = 2")
+        self.assertIn("Read-Before-Edit validation failed", res)
+
+    def test_patch_file_create_then_read_then_patch(self):
+        """Full create -> read -> patch flow succeeds end to end."""
+        new_file = self.temp_dir_path / "flow.py"
+        patch_file(str(new_file), "", "def f():\n    return 1\n")
+        read_file(str(new_file))
+        res = patch_file(str(new_file), "return 1", "return 2")
+        self.assertIn("patched successfully", res)
+        self.assertIn("return 2", new_file.read_text(encoding="utf-8"))
+
+    def test_patch_file_create_path_traversal_rejected(self):
+        """Path traversal on create is rejected by path normalization."""
+        res = patch_file("../escape.txt", "", "data")
+        self.assertIn("Error:", res)
+
+    def test_patch_file_create_does_not_interfere_with_edits(self):
+        """A normal edit (non-empty old_string) on an unread existing file is still blocked."""
+        res = patch_file(str(self.text_file), "line one", "line uno")
+        self.assertIn("Read-Before-Edit validation failed", res)
+
     def test_path_traversal_protection(self):
         """Test that paths outside the project root are rejected with Access denied."""
         res = read_file("/etc/passwd")

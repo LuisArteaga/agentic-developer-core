@@ -441,10 +441,18 @@ class TestPlanNode(unittest.TestCase):
             "AGENT_LOG_PATH": str(self.logs_dir),
             "GITHUB_REPOSITORY": "test-owner/test-repo",
             "AGENT_MODE": "local",
+            # Isolate the verify command so the default ('make verify') path is
+            # exercised deterministically regardless of any AGENT_VERIFY_COMMAND
+            # exported in the surrounding shell (e.g. 'python -m pytest tests/').
+            # A None value means "ensure this var is unset" (see the loop below).
+            "AGENT_VERIFY_COMMAND": None,
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
-            os.environ[k] = v
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def tearDown(self):
         # Restore environment variables
@@ -923,10 +931,18 @@ class TestExecuteNode(unittest.TestCase):
             "AGENT_LOG_PATH": str(self.logs_dir),
             "GITHUB_REPOSITORY": "test-owner/test-repo",
             "AGENT_MODE": "local",
+            # Isolate the verify command so the default ('make verify') path is
+            # exercised deterministically regardless of any AGENT_VERIFY_COMMAND
+            # exported in the surrounding shell (e.g. 'python -m pytest tests/').
+            # A None value means "ensure this var is unset" (see the loop below).
+            "AGENT_VERIFY_COMMAND": None,
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
-            os.environ[k] = v
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def tearDown(self):
         # Restore environment variables
@@ -1203,10 +1219,18 @@ class TestVerifyNode(unittest.TestCase):
             "AGENT_LOG_PATH": str(self.logs_dir),
             "GITHUB_REPOSITORY": "test-owner/test-repo",
             "AGENT_MODE": "local",
+            # Isolate the verify command so the default ('make verify') path is
+            # exercised deterministically regardless of any AGENT_VERIFY_COMMAND
+            # exported in the surrounding shell (e.g. 'python -m pytest tests/').
+            # A None value means "ensure this var is unset" (see the loop below).
+            "AGENT_VERIFY_COMMAND": None,
         }
         for k, v in vars_to_set.items():
             self.original_env[k] = os.environ.get(k)
-            os.environ[k] = v
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def tearDown(self):
         # Restore environment variables
@@ -1402,9 +1426,16 @@ class TestBinEvalPhase(unittest.TestCase):
             "AGENT_LOG_PATH": str(self.logs_dir),
             "GITHUB_REPOSITORY": "test-owner/test-repo",
             "AGENT_MODE": "local",
+            # Isolate the verify command so the default ('make verify') path is
+            # exercised deterministically regardless of any AGENT_VERIFY_COMMAND
+            # exported in the surrounding shell. None means "ensure unset".
+            "AGENT_VERIFY_COMMAND": None,
         }.items():
             self.original_env[k] = os.environ.get(k)
-            os.environ[k] = v
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def tearDown(self):
         for k, v in self.original_env.items():

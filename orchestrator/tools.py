@@ -524,6 +524,12 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
     current execution cycle, and that the line span occupied by old_string falls within the
     previously read line ranges (range-scoped, ADR-0033).
     Enforces 'Ambiguity Abort' by verifying that old_string matches exactly once in the file.
+
+    File Creation (ADR-0048): passing an empty ``old_string`` with a non-existent ``path``
+    creates the file with ``new_string`` as its content. Creation is exempt from the
+    Read-Before-Edit constraint (there is no prior content to read) but is subject to the
+    same Path Safety Validation as edits. Creating an existing file fails (no overwrite);
+    a subsequent edit on a freshly-created file still requires a ``read_file`` first.
     """
     try:
         abs_path, rel_str = _normalize_path(path)
@@ -532,12 +538,44 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
 
     # 0. Runtime Path-Safety Validation (ADR-0035): re-validate against the
     #    shared sensitive-path blocklist at tool-call time, on the normalized
-    #    relative path, BEFORE the Read-Before-Edit gate. A blocked path is a
-    #    hard stop even if it was somehow registered in read_files, closing the
+    #    relative path, BEFORE any other gate. A blocked path is a hard stop
+    #    even if it was somehow registered in read_files, closing the
     #    bypass of ADR-0012's pre-flight-only validation (defense in depth).
     if not is_safe_path(rel_str):
         _record_runtime_security_block(rel_str)
         return f"Error: Path '{path}' is blocked by the path-safety policy and cannot be modified."
+
+    # 0a. File Creation path (ADR-0048): an empty old_string on a non-existent
+    #     file creates it. This short-circuits BEFORE the Read-Before-Edit gate
+    #     — creation is exempt because there is no prior content to read — but
+    #     still goes through the Path Safety check above (identical to edits).
+    #     An empty old_string on an EXISTING file is rejected (no silent
+    #     overwrite): the Worker must use the read-then-str_replace path.
+    if old_string == "":
+        if abs_path.exists():
+            return (
+                f"Error: File '{path}' already exists. To modify an existing file, call "
+                f"'read_file' first, then 'patch_file' with a non-empty 'old_string' to "
+                f"perform a search-and-replace edit. The create path (empty old_string) only "
+                f"applies to files that do not yet exist."
+            )
+        # Create parent directories explicitly (mkdir -p semantics). Every path
+        # component was already validated against the blocklist by is_safe_path,
+        # so creating the tree cannot reach a sensitive directory.
+        parent = abs_path.parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return f"Error: Failed to create parent directories for '{path}': {e}"
+        try:
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(new_string)
+        except Exception as e:
+            return f"Error: Failed to create file '{path}': {e}"
+        # Creation does NOT register read_files membership: a subsequent edit
+        # on this file still requires a read_file first (the invariant from
+        # ADR-0006/0033 applies uniformly — the create is not a read).
+        return f"Success: File '{path}' created successfully."
 
     # 1. Read-Before-Edit Constraint (path-level): the file must have been read at least
     #    once in this cycle (its path is a key in read_files). Whether the *lines* targeted
