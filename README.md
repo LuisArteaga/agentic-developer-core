@@ -153,6 +153,9 @@ Copy [`.env.example`](.env.example) to `.env` for the full environment surface. 
 | `AGENT_SUBPROCESS_ENV_ALLOWLIST` | Comma-separated extra env vars to pass to `run_command` subprocesses beyond the default minimal allowlist (ADR-0043). |
 | `AGENT_VERIFY_COMMAND` | Deterministic gate command run in `GITHUB_WORKSPACE` during the Verify phase (default `make verify`). Must match the target repository's tooling. Single command with arguments (no shell operators); must not be blank. |
 | `AGENT_VERIFY_TIMEOUT` | Timeout in seconds for the verify command (default `300`); must not be blank. |
+| `AGENT_TRUSTED_JUDGE_USER` | GitHub login that must author a PR Review Judge review for the Merge-Node to trust it (spoofing guard, ADR-0014). Must equal the owner of the target repo's `JUDGE_GH_TOKEN`. If unset, the Merge-Node falls back to the orchestrator's own identity and ignores reviews posted under another account. See [target-repo judge setup](docs/target-repo-judge-setup.md). |
+| `AGENT_MERGE_POLL_INTERVAL` | Seconds between Merge-Node polls of target-repo PR reviews (default `10`). |
+| `AGENT_MERGE_POLL_TIMEOUT` | Max seconds the Merge-Node polls before escalating to recovery (default `300`). A target repo without the [Reusable Judge Workflow](docs/target-repo-judge-setup.md) installed will hit this timeout. |
 
 **Issue label lifecycle**: `agent-ready` → `agent-in-progress` (claimed) / `agent-blocked` (open dependencies) → `agent-ready` (dependencies closed, or recovery after failure).
 

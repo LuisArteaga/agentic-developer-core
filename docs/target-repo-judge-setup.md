@@ -50,16 +50,48 @@ jobs:
 Pin `@main` to a release tag (e.g. `@v1`) once one is cut, so the verdict-block
 writer stays in lockstep with the orchestrator's parser ([ADR-0019](./adr/0019-combined-pr-review-body-with-hidden-verdict-block.md)).
 
-## Step 3 — Configure the orchestrator
+## Step 3 — Configure the orchestrator (judge trust)
 
-Set the orchestrator environment so the Merge-Node trusts the review author:
+The Merge-Node trusts a PR review **only** when its author's GitHub login equals `AGENT_TRUSTED_JUDGE_USER` (spoofing guard, ADR-0014). This is an **orchestrator-side** environment variable — set it wherever the orchestrator runs against the target repo, **not** in the target repository.
 
 ```
 AGENT_TRUSTED_JUDGE_USER=<login that owns JUDGE_GH_TOKEN>
 ```
 
-The Merge-Node ignores reviews from any other author, and only considers reviews
-whose `submitted_at` is on or after the PR's `pushed_at` ([ADR-0014](./adr/0014-pr-verification-and-llm-judge-review-integration.md)).
+Where to set it:
+
+- **Local dev / `uv run`** — add the line to the orchestrator's `.env` (copy from `.env.example`).
+- **Docker** — pass it as a `-e` flag alongside the other orchestrator vars:
+  ```bash
+  docker run --rm \
+    -e OPENROUTER_API_KEY=... -e GH_PAT=... \
+    -e GITHUB_REPOSITORY=owner/target-repo \
+    -e AGENT_TRUSTED_JUDGE_USER=<judge login> \
+    agentic-developer-core
+  ```
+
+If `AGENT_TRUSTED_JUDGE_USER` is **unset**, the Merge-Node falls back to the orchestrator's own GitHub identity (`GET /user`, then `GITHUB_ACTOR`). If that identity differs from the account that owns `JUDGE_GH_TOKEN`, the judge's reviews are posted under one login while the Merge-Node trusts another — the verdicts are ignored and the poll times out. This is exactly the gap the integration closes, so always set `AGENT_TRUSTED_JUDGE_USER` to the `JUDGE_GH_TOKEN` owner.
+
+The Merge-Node also only considers reviews whose `submitted_at` is on or after the PR's `pushed_at` (freshness, ADR-0014), and polls every `AGENT_MERGE_POLL_INTERVAL` seconds (default `10`) up to `AGENT_MERGE_POLL_TIMEOUT` (default `300`) before escalating to recovery.
+
+### Creating `JUDGE_GH_TOKEN`
+
+`JUDGE_GH_TOKEN` is a GitHub token created under the account that should appear as the reviewer — that login becomes `AGENT_TRUSTED_JUDGE_USER`. Two options:
+
+**Fine-grained PAT (recommended, least privilege):**
+
+1. Sign in as the judge account → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**.
+2. **Resource owner**: the judge account. **Repository access**: *Only select repositories* → the target repo.
+3. **Permissions**: *Pull requests* → Read and write; *Contents* → Read-only.
+4. Generate, copy the `github_pat_…` value, add it as target-repo secret `JUDGE_GH_TOKEN`.
+
+**Classic PAT (simpler, broader):**
+
+1. Same account → **Settings → Developer settings → Personal access tokens → Tokens (classic) → Generate new token (classic)**.
+2. Scope: `repo`.
+3. Add the `ghp_…` value as secret `JUDGE_GH_TOKEN`.
+
+To confirm the value for `AGENT_TRUSTED_JUDGE_USER`, run `gh api user --jq .login` while authenticated as the `JUDGE_GH_TOKEN` account — that login is what you set.
 
 ## Optional inputs
 
