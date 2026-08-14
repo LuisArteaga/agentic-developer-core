@@ -133,6 +133,10 @@ docker run --rm \
   agentic-developer-core
 ```
 
+### Wiring the PR Review Judges into a target repository
+
+The Merge-Node polls the **target** repository's PRs for the PR Review Judges' hidden verdict block (ADR-0019). The judges ship in this repository's CI by default; to have them run on a target repository's PRs, install the reusable judge workflow — see [docs/target-repo-judge-setup.md](docs/target-repo-judge-setup.md) (ADR-0050).
+
 ## Environment & labels
 
 Copy [`.env.example`](.env.example) to `.env` for the full environment surface. Key variables:

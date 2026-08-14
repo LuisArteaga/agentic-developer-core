@@ -1,0 +1,154 @@
+name: LLM PR Review (reusable)
+
+# Reusable workflow that runs the PR Review Judges (scripts/review.py) on a
+# pull request and posts the combined review carrying the hidden
+# `llm-pr-review-verdicts` block (ADR-0019). Intended to be called by a TARGET
+# repository's pull-request workflow so the orchestrator's Merge-Node can poll
+# parseable verdicts instead of timing out. See docs/target-repo-judge-setup.md
+# and ADR-0050.
+#
+# Inside a called workflow the `github` context belongs to the CALLER (the
+# target repository), so `actions/checkout` with no `repository` checks out the
+# target repo at the PR head, and a second checkout fetches the canonical
+# review.py from the orchestrator repository (writer/parser lockstep, ADR-0019).
+
+on:
+  workflow_call:
+    inputs:
+      orchestrator-repo:
+        description: >-
+          Repository that hosts the canonical scripts/review.py (the writer of
+          the verdict block). Defaults to the orchestrator repository.
+        type: string
+        default: LuisArteaga/agentic-developer-core
+      orchestrator-ref:
+        description: >-
+          Git ref of the orchestrator repo to check out. Pin to a release tag
+          to keep the verdict-block writer in lockstep with merge_node's parser
+          (ADR-0019).
+        type: string
+        default: main
+      diff-exclude:
+        description: >-
+          Space-separated git pathspecs to exclude from the judge diff, e.g.
+          `uv.lock package-lock.json`. Empty excludes nothing.
+        type: string
+        default: ""
+      coverage-artifact-name:
+        description: >-
+          Name of a CI coverage report artifact (ADR-0030) uploaded by a
+          preceding target-repo job. Empty = diff-only evaluation (graceful
+          degradation per ADR-0030).
+        type: string
+        default: ""
+      coverage-artifact-path:
+        description: >-
+          Path inside the coverage artifact to the coverage report file.
+        type: string
+        default: ci_coverage_output.txt
+    secrets:
+      judge-token:
+        description: >-
+          GitHub token (PAT or App token) used to post the review. Its owner
+          MUST equal the orchestrator's AGENT_TRUSTED_JUDGE_USER so merge_node
+          trusts the review (spoofing guard, ADR-0014).
+        required: true
+      openrouter-api-key:
+        description: OpenRouter API key for the LLM judges.
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  llm-pr-review:
+    runs-on: ubuntu-latest
+    env:
+      AGENT_MODE: ci
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      # Posted via `gh` whose author becomes the review author; must be the
+      # trusted judge identity (AGENT_TRUSTED_JUDGE_USER).
+      GH_TOKEN: ${{ secrets.judge-token }}
+      OPENROUTER_API_KEY: ${{ secrets.openrouter-api-key }}
+      # Consumed by the test_coverage judge when a coverage report is staged
+      # (ADR-0030). Absent/empty degrades gracefully to diff-only evaluation.
+      CI_COVERAGE_OUTPUT_PATH: ${{ github.workspace }}/ci_coverage_output.txt
+    steps:
+      - name: Check out target repository (PR head)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out orchestrator repository (canonical review.py)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.orchestrator-repo }}
+          ref: ${{ inputs.orchestrator-ref }}
+          path: orchestrator-src
+
+      - name: Download CI coverage artifact (optional, ADR-0030)
+        if: ${{ inputs.coverage-artifact-name != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.coverage-artifact-name }}
+          path: ${{ github.workspace }}/coverage-artifact
+
+      - name: Stage CI coverage output
+        if: ${{ inputs.coverage-artifact-name != '' }}
+        run: |
+          set -euo pipefail
+          src="${{ github.workspace }}/coverage-artifact/${{ inputs.coverage-artifact-path }}"
+          if [ -f "$src" ]; then
+            cp "$src" "$CI_COVERAGE_OUTPUT_PATH"
+            echo "[INFO] Staged CI coverage output ($CI_COVERAGE_OUTPUT_PATH)"
+          else
+            echo "[WARN] Coverage artifact present but '$src' not found; falling back to diff-only evaluation."
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install orchestrator runtime dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e orchestrator-src
+          pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp openinference-semantic-conventions
+
+      - name: Prefetch tree-sitter parsers (best-effort)
+        # tree-sitter-language-pack downloads parser binaries at runtime. A
+        # prefetch failure must NOT block the judge: enclosing-function-context
+        # enrichment (ADR-0022) degrades gracefully for unsupported languages.
+        continue-on-error: true
+        run: |
+          python3 -c "
+          import tree_sitter_language_pack as tsp
+          try:
+              tsp.prefetch(languages=['python', 'tsx', 'typescript'])
+              print('Prefetched:', tsp.downloaded_languages())
+          except Exception as e:
+              print(f'[WARN] tree-sitter prefetch failed: {e}; enrichment will degrade.')
+          "
+
+      - name: Validate judge configuration
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "[ERR] judge-token secret not configured."; exit 1; fi
+          if [ -z "$OPENROUTER_API_KEY" ]; then echo "[ERR] openrouter-api-key secret not configured."; exit 1; fi
+          if [ -z "$PR_NUMBER" ]; then echo "[ERR] No pull_request event (PR_NUMBER empty)."; exit 1; fi
+          gh auth status
+
+      - name: Run PR Review Judges
+        # review.py reads the PR diff from stdin and posts the combined review
+        # via `gh pr review` using GH_TOKEN. It exits 1 when any judge returns
+        # FAIL/NEEDS REVIEW (the review is posted before exit), surfacing the
+        # verdict as a red check consistent with the hard merge gate.
+        run: |
+          set -euo pipefail
+          base_ref="${{ github.base_ref }}"
+          excludes=()
+          for p in ${{ inputs.diff-exclude }}; do
+            excludes+=(":(exclude)$p")
+          done
+          git diff -w "origin/${base_ref}...HEAD" -- . "${excludes[@]}" | python3 orchestrator-src/scripts/review.py
