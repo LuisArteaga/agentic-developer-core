@@ -2123,6 +2123,67 @@ def _raise_length_limit_error():
     return error_cls(completion=MagicMock())
 
 
+class TestResolveLengthFinishReasonError(unittest.TestCase):
+    """Unit tests for the SDK-drift resolver (issue #138).
+
+    Exercises all three resolution branches by controlling the import
+    machinery: the top-level export (default), the historical private
+    module location, and the catch-nothing sentinel returned when the
+    installed openai SDK exposes neither.
+    """
+
+    def test_resolves_top_level_export(self):
+        import openai
+
+        from orchestrator import nodes
+
+        self.assertIs(
+            nodes._resolve_length_finish_reason_error(),
+            openai.LengthFinishReasonError,
+        )
+
+    def test_falls_back_to_private_module_location(self):
+        import builtins
+
+        from openai.lib._parsing._completions import (
+            LengthFinishReasonError as Private,
+        )
+
+        from orchestrator import nodes
+
+        real_import = builtins.__import__
+
+        def _no_top_level(name, *args, **kwargs):
+            if name == "openai":
+                raise ImportError("simulated: no top-level export")
+            return real_import(name, *args, **kwargs)
+
+        with unittest.mock.patch("builtins.__import__", side_effect=_no_top_level):
+            resolved = nodes._resolve_length_finish_reason_error()
+        self.assertIs(resolved, Private)
+
+    def test_sentinel_when_sdk_lacks_exception(self):
+        import builtins
+
+        import openai
+
+        from orchestrator import nodes
+
+        real_import = builtins.__import__
+
+        def _no_sdk(name, *args, **kwargs):
+            if name == "openai" or name.startswith("openai."):
+                raise ImportError("simulated: SDK lacks the exception")
+            return real_import(name, *args, **kwargs)
+
+        with unittest.mock.patch("builtins.__import__", side_effect=_no_sdk):
+            resolved = nodes._resolve_length_finish_reason_error()
+        # The sentinel is a fresh Exception subclass nothing can raise,
+        # so the except tuple matches nothing (generic-path behavior).
+        self.assertTrue(issubclass(resolved, Exception))
+        self.assertIsNot(resolved, openai.LengthFinishReasonError)
+
+
 @unittest.skipUnless(
     len(__import__("orchestrator.nodes", fromlist=["obj"])._LENGTH_FINISH_REASON_ERRORS)
     > 0,

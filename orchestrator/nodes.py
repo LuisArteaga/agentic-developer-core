@@ -1125,14 +1125,14 @@ def _resolve_length_finish_reason_error() -> type[Exception]:
         from openai import LengthFinishReasonError
 
         return LengthFinishReasonError
-    except ImportError:  # pragma: no cover - exercised only on older SDKs
+    except ImportError:
         pass
     try:
         # Historical private location predating the top-level export.
         from openai.lib._parsing._completions import LengthFinishReasonError
 
         return LengthFinishReasonError
-    except ImportError:  # pragma: no cover - SDK lacks structured outputs
+    except ImportError:
         pass
 
     class _NoMatchLengthError(Exception):
