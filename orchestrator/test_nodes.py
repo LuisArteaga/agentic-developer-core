@@ -9,6 +9,7 @@ from typing import cast
 from unittest.mock import MagicMock, patch
 
 from orchestrator import state as state_module
+import orchestrator.nodes as nodes_module
 from orchestrator.nodes import (
     claim_node,
     execute_node,
@@ -2185,8 +2186,7 @@ class TestResolveLengthFinishReasonError(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    len(__import__("orchestrator.nodes", fromlist=["obj"])._LENGTH_FINISH_REASON_ERRORS)
-    > 0,
+    bool(nodes_module._LENGTH_FINISH_REASON_ERRORS),
     "openai SDK does not expose LengthFinishReasonError",
 )
 class TestBinEvalLengthErrorRetry(unittest.TestCase):
@@ -2323,8 +2323,7 @@ class TestBinEvalLengthErrorRetry(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    len(__import__("orchestrator.nodes", fromlist=["obj"])._LENGTH_FINISH_REASON_ERRORS)
-    > 0,
+    bool(nodes_module._LENGTH_FINISH_REASON_ERRORS),
     "openai SDK does not expose LengthFinishReasonError",
 )
 class TestBinEvalLengthErrorRetryPhase(unittest.TestCase):
