@@ -2113,6 +2113,246 @@ class TestBinevalRetryConfig(unittest.TestCase):
         self.assertEqual(cfg["max_tokens"], 8192)
 
 
+def _raise_length_limit_error():
+    """Raise the production-resolved LengthFinishReasonError instance."""
+    import orchestrator.nodes as nodes
+
+    # The resolved class is what _invoke_bineval_structured catches; construct
+    # it the way the OpenAI SDK does (keyword-only completion argument).
+    error_cls = nodes._LENGTH_FINISH_REASON_ERRORS[0]
+    return error_cls(completion=MagicMock())
+
+
+@unittest.skipUnless(
+    len(__import__("orchestrator.nodes", fromlist=["obj"])._LENGTH_FINISH_REASON_ERRORS)
+    > 0,
+    "openai SDK does not expose LengthFinishReasonError",
+)
+class TestBinEvalLengthErrorRetry(unittest.TestCase):
+    """Unit tests for the raised-exception truncation path (issue #138).
+
+    In production the OpenAI SDK's structured-output parse helper RAISES
+    ``LengthFinishReasonError`` on finish_reason=length instead of returning a
+    raw response, so ADR-0049's retry only fires if
+    ``_invoke_bineval_structured`` translates the exception into the
+    ``finish_reason="length"`` signal.
+    """
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_invoke_bineval_length_error_returns_length_signal(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC: a raised LengthFinishReasonError yields (None, 'length')."""
+        from orchestrator.nodes import _invoke_bineval_structured
+
+        mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
+        llm = unittest.mock.MagicMock()
+        llm.with_structured_output.return_value.invoke.side_effect = (
+            _raise_length_limit_error()
+        )
+        mock_get_llm.return_value = llm
+
+        result, finish_reason = _invoke_bineval_structured({}, "prompt")
+        self.assertIsNone(result)
+        self.assertEqual(finish_reason, "length")
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_invoke_bineval_generic_exception_returns_none_signal(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC: non-length API exceptions still yield (None, None) — no retry."""
+        from orchestrator.nodes import _invoke_bineval_structured
+
+        mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
+        llm = unittest.mock.MagicMock()
+        llm.with_structured_output.return_value.invoke.side_effect = RuntimeError(
+            "rate limit"
+        )
+        mock_get_llm.return_value = llm
+
+        result, finish_reason = _invoke_bineval_structured({}, "prompt")
+        self.assertIsNone(result)
+        self.assertIsNone(finish_reason)
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_length_error_retry_fires(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC: first call raises LengthFinishReasonError, the single enlarged-
+        budget retry succeeds -> verdict returned, two calls total."""
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
+        llm = unittest.mock.MagicMock()
+        structured = unittest.mock.MagicMock()
+        structured.invoke.side_effect = [
+            _raise_length_limit_error(),
+            _raw_structured_response(_all_pass_result()),
+        ]
+        llm.with_structured_output.return_value = structured
+        mock_get_llm.return_value = llm
+
+        result = _run_bineval("issue body", "plan", "diff", "ADR TEXT")
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(all(c.passed for c in result.checks))
+        # Initial call + exactly one budget retry.
+        self.assertEqual(structured.invoke.call_count, 2)
+        # The retry used an enlarged max_tokens budget.
+        retry_cfg = mock_get_llm.call_args_list[1].args[0]
+        self.assertGreater(retry_cfg["max_tokens"], 8192)
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_length_error_retry_exhausted_degrades_to_pass(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC: retry also raises LengthFinishReasonError -> soft-gate PASS
+        (None) after exactly one retry, warning carries the retry's
+        finish_reason='length'."""
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
+        llm = unittest.mock.MagicMock()
+        structured = unittest.mock.MagicMock()
+        structured.invoke.side_effect = [
+            _raise_length_limit_error(),
+            _raise_length_limit_error(),
+        ]
+        llm.with_structured_output.return_value = structured
+        mock_get_llm.return_value = llm
+
+        with self.assertLogs("orchestrator.nodes", level="WARNING") as logs:
+            result = _run_bineval("issue body", "plan", "diff", "ADR TEXT")
+        self.assertIsNone(result)
+        # Exactly one retry: initial call + a single enlarged-budget retry.
+        self.assertEqual(structured.invoke.call_count, 2)
+        degradation = [
+            line for line in logs.output if "length-limit retry still failed" in line
+        ]
+        self.assertTrue(degradation)
+        self.assertIn("finish_reason=length", degradation[0])
+
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    def test_run_bineval_non_length_exception_no_retry(
+        self, _rubric, mock_resolve, mock_get_llm
+    ):
+        """AC: network/auth/rate-limit exceptions degrade to PASS via the
+        generic path with NO retry — a single invoke call."""
+        from orchestrator.nodes import _run_bineval
+
+        mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
+        llm = unittest.mock.MagicMock()
+        structured = unittest.mock.MagicMock()
+        structured.invoke.side_effect = RuntimeError("API down")
+        llm.with_structured_output.return_value = structured
+        mock_get_llm.return_value = llm
+
+        self.assertIsNone(_run_bineval("issue body", "plan", "diff", "ADR TEXT"))
+        self.assertEqual(structured.invoke.call_count, 1)
+
+
+@unittest.skipUnless(
+    len(__import__("orchestrator.nodes", fromlist=["obj"])._LENGTH_FINISH_REASON_ERRORS)
+    > 0,
+    "openai SDK does not expose LengthFinishReasonError",
+)
+class TestBinEvalLengthErrorRetryPhase(unittest.TestCase):
+    """Phase-level coverage for the raised-exception truncation path.
+
+    Drives verify_node's BinEval phase through the REAL ``_run_bineval`` while
+    the LLM raises ``LengthFinishReasonError``, asserting the soft-gate
+    contract: degrade to PASS with bineval_degraded=True and NO semantic
+    attempt consumed (attempts['bineval'] reset to 0, never incremented).
+    """
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        self.original_env = {}
+        for k, v in {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+            "AGENT_VERIFY_COMMAND": None,
+        }.items():
+            self.original_env[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    def _state(self, bineval=1):
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["attempts"] = {"verify_cmd": 0, "bineval": bineval}
+        state["plan"] = '{"tasks": []}'
+        state_module.save(state)
+        return state
+
+    @patch("orchestrator.nodes._load_grading_rubric", return_value="RUBRIC")
+    @patch("orchestrator.nodes._load_adrs", return_value="")
+    @patch("orchestrator.nodes.resolve_model_config")
+    @patch("orchestrator.nodes.get_chat_model_from_config")
+    @patch("orchestrator.nodes._github_api_request")
+    @patch(
+        "orchestrator.nodes._get_workspace_diff",
+        return_value="diff --git a/f.py b/f.py\n+pass",
+    )
+    @patch("orchestrator.nodes.subprocess.run")
+    def test_persistent_length_error_degrades_pass_without_semantic_attempt(
+        self, mock_run, _diff, mock_gh, mock_get_llm, mock_resolve, _adrs, _rubric
+    ):
+        from orchestrator.nodes import verify_node
+
+        mock_res = unittest.mock.MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = b"All tests passed."
+        mock_run.return_value = mock_res
+        mock_gh.return_value = {"body": "issue body"}
+        mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
+        llm = unittest.mock.MagicMock()
+        structured = unittest.mock.MagicMock()
+        structured.invoke.side_effect = [
+            _raise_length_limit_error(),
+            _raise_length_limit_error(),
+        ]
+        llm.with_structured_output.return_value = structured
+        mock_get_llm.return_value = llm
+
+        state = self._state(bineval=1)
+        new_state = verify_node(state)
+
+        # Soft-gate degradation, not a semantic retry.
+        self.assertEqual(new_state["status"], "verifying")
+        self.assertTrue(new_state["bineval_degraded"])
+        # ADR-0047: the budget retry must not consume the semantic counter —
+        # it was reset by success semantics, NOT incremented past its input.
+        self.assertEqual(new_state["attempts"]["bineval"], 0)
+        self.assertIsNone(new_state["feedback"])
+
+
 class TestPRNode(unittest.TestCase):
     def setUp(self):
         self.workspace_temp = tempfile.TemporaryDirectory()

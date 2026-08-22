@@ -100,6 +100,19 @@ distinguishable from other infra failures (network, auth, rate-limit) —
 satisfying the issue's "repeated silent degradation should be noticeable"
 edge case.
 
+**Exception-translation surface (clarified by
+[issue #138](https://github.com/LuisArteaga/agentic-developer-core/issues/138)):**
+the truncation signal arrives through *two* mechanisms, both funneling into the
+same retry branch. When the OpenAI SDK's structured-output parse helper is in
+the call path, it **raises** `openai.LengthFinishReasonError` inside the model
+call — `include_raw=True` does not capture it into `parsing_error`, so
+`_invoke_bineval_structured` catches the exception class specifically
+(resolved robustly across SDK versions) and translates it into
+`finish_reason="length"`. When a provider returns the raw truncated response
+instead, `_extract_structured_output` surfaces `finish_reason=length` from the
+response metadata as before. Both paths feed the identical single enlarged-
+budget retry; neither consumes `attempts["bineval"]`.
+
 ## Consequences
 
 ### Pros
@@ -152,3 +165,15 @@ edge case.
   `finish_reason` logging), **ADR-0047** (per-gate retry-counter
   independence), **ADR-0021** (layered retry pattern the single retry
   mirrors).
+- **OpenAI structured-outputs guide** (accessed 2026-08-15): the canonical
+  caller-side handling of truncation is to check
+  `finish_reason == "length"` and act on it; the SDK's `parse` helper
+  operationalizes this by raising `LengthFinishReasonError` when the length
+  limit is reached before the schema-valid JSON completes.
+  https://developers.openai.com/api/docs/guides/structured-outputs
+- **OpenAI Community — "Structured output calls fail trying to parse response
+  content"** (accessed 2026-08-15): real-world reports of
+  `openai.LengthFinishReasonError` with reasoning models exhausting the token
+  budget on hidden reasoning — the identical production signature that
+  motivated the exception-translation fix.
+  https://community.openai.com/t/structured-output-calls-fail-trying-to-parse-response-content/1080922
