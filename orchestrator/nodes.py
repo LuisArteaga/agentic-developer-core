@@ -1,4 +1,5 @@
 import datetime
+import fnmatch
 import json
 import logging
 import os
@@ -2464,6 +2465,134 @@ def recovery_node(state: AgentState) -> AgentState:
     return state
 
 
+_TEST_DIR_SEGMENTS = frozenset({"tests", "__tests__"})
+
+
+def _is_test_path(path: str) -> bool:
+    """Language-agnostic test-file heuristic for the no-op guard (issue #141).
+
+    A path counts as a test artifact when it carries any conventional signal:
+    a ``tests``/``__tests__`` directory component (pytest, Jest ``__tests__``,
+    Rust integration tests), a ``test_`` basename prefix (pytest), a
+    ``*_test.*`` basename suffix (Go, Rust), or a ``.test.``/``.spec.``
+    middle marker (Jest/Vitest). Conventional naming is deliberately kept to
+    these widespread signals; nonstandard test layouts are recognized through
+    the Plan-Localization targets instead (see :func:`_plan_test_targets`),
+    keeping the check language-agnostic without hard-coding per-language rules.
+    """
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    parts = normalized.split("/")
+    if any(segment in _TEST_DIR_SEGMENTS for segment in parts[:-1]):
+        return True
+    name = parts[-1]
+    return (
+        name.startswith("test_")
+        or fnmatch.fnmatch(name, "*_test.*")
+        or ".test." in name
+        or ".spec." in name
+    )
+
+
+def _extract_added_or_modified_paths(diff_text: str) -> list[str]:
+    """Extract added-or-modified paths from a unified diff (issue #141).
+
+    A path is counted only when its diff section carries a ``+++ b/<path>``
+    post-image header: deleted files show ``+++ /dev/null`` and pure renames
+    carry no post-image hunk, so neither counts as added-or-modified. Quoted
+    paths (git's ``core.quotePath`` for "unusual" characters) are unquoted.
+    Never raises.
+    """
+    paths: list[str] = []
+    for line in diff_text.splitlines():
+        if not line.startswith("+++ "):
+            continue
+        raw = line[len("+++ ") :].strip()
+        if raw.startswith('"') and raw.endswith('"'):
+            raw = raw[1:-1]
+        if raw.startswith("b/") and len(raw) > 2:
+            path = raw[2:]
+            if path and path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _plan_test_targets(plan_json: str | None) -> set[str]:
+    """Files the Plan Localization designated as test targets (issue #141).
+
+    A task counts as a test task when its description mentions "test"; its
+    ``target_files`` are then treated as test artifacts even when they do not
+    match conventional naming — this is how nonstandard test locations
+    (e.g. ``spec/`` layouts) satisfy the no-op guard while pure implementation
+    targets (whose task descriptions do not mention tests) never do. Parse
+    failures degrade to an empty set so the guard falls back to conventional
+    signals alone.
+    """
+    if not plan_json:
+        return set()
+    try:
+        data = json.loads(plan_json)
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    targets: set[str] = set()
+    for task in data.get("tasks", []) or []:
+        if not isinstance(task, dict):
+            continue
+        if "test" not in str(task.get("description", "")).lower():
+            continue
+        for file_path in task.get("target_files", []) or []:
+            if file_path:
+                targets.add(file_path)
+    return targets
+
+
+def _workspace_has_test_changes(
+    workspace_path: Path, plan_json: str | None
+) -> tuple[bool | None, list[str]]:
+    """Whether the candidate diff adds or modifies at least one test file.
+
+    Implements the Test-Writing pre-verification no-op guard (issue #141): the
+    Test-First loop (ADR-0010) exists to produce tests first, so an attempt
+    that leaves the workspace without any test-file change must fail rather
+    than pass because the pre-existing suite is merely importable.
+
+    Returns ``(verdict, matched_paths)``:
+
+    - ``(True, paths)`` — at least one added/modified test file was detected.
+    - ``(False, [])`` — genuine no-op: a valid repository whose diff shows no
+      added/modified test file.
+    - ``(None, [])`` — indeterminate diff: the directory is not a git
+      repository or any git/parse step failed. The caller must fail open and
+      keep current behavior — an observability failure never blocks the phase.
+
+    Detection reuses :func:`orchestrator.git.diff_cached`; a file counts when
+    it matches conventional test patterns (:func:`_is_test_path`) or was named
+    as a test target by the Plan Localization (:func:`_plan_test_targets`).
+    Presence-only: the content or shape of the change is never inspected
+    (Implementation Leakage constraint).
+    """
+    try:
+        if not is_git_repository(workspace_path):
+            logger.warning(
+                "No-op test check skipped: %s is not a git repository. "
+                "Failing open.",
+                workspace_path,
+            )
+            return None, []
+
+        diff_text = diff_cached(workspace_path)
+        changed = _extract_added_or_modified_paths(diff_text)
+        planned_targets = _plan_test_targets(plan_json)
+        matched = [p for p in changed if _is_test_path(p) or p in planned_targets]
+        return (bool(matched), matched)
+    except Exception as e:  # noqa: BLE001 - observability must never block
+        logger.warning("No-op test check failed (%s). Failing open.", e)
+        return None, []
+
+
 def test_writer_node(state: AgentState) -> AgentState:
     """Invokes the worker agent to write unit tests and stub files, performing TDD pre-verification and retrying on syntax/import errors."""
     issue_num = state.get("issue_number")
@@ -2541,7 +2670,9 @@ def test_writer_node(state: AgentState) -> AgentState:
             )
 
             if feedback:
-                instructions += f"\n=== PREVIOUS ATTEMPT FAILED PRE-VERIFICATION ===\n{feedback}\nPlease fix the syntax or import issues listed above."
+                instructions += (
+                    f"\n=== PREVIOUS ATTEMPT FAILED PRE-VERIFICATION ===\n{feedback}"
+                )
 
             from orchestrator.worker import execute_worker
 
@@ -2552,6 +2683,39 @@ def test_writer_node(state: AgentState) -> AgentState:
                 issue_number=issue_num,
                 attempt=attempt,
             )
+
+            # Run programmatic pre-verification checks. The no-op guard runs
+            # first (issue #141): the Test-First loop (ADR-0010) requires a
+            # test artifact, so an attempt whose diff shows no added/modified
+            # test file fails here and consumes one attempt. An indeterminate
+            # diff (verdict None) fails open and falls through to the existing
+            # syntax/import check unchanged.
+            verdict, matched = _workspace_has_test_changes(
+                workspace_path, state.get("plan")
+            )
+            if verdict is False:
+                logger.warning(
+                    "Pre-verification failed on attempt %d: no-op test phase "
+                    "(no test files were added or modified).",
+                    attempt,
+                )
+                feedback = (
+                    "No test files were added or modified in this attempt. "
+                    "Write the tests before implementation: the Test-First "
+                    "loop requires a test artifact first. Use patch_file to "
+                    "create or extend test files in the project's test "
+                    "location (e.g. a tests/ directory or *_test.* naming), "
+                    "with minimal stubs for any not-yet-implemented code. "
+                    "Do not run implementation commands."
+                )
+                attempt += 1
+                continue
+
+            if verdict is True:
+                logger.info(
+                    "No-op test check passed: test changes detected in %s.",
+                    matched,
+                )
 
             # Run programmatic pre-verification check
             logger.info("Running pre-verification check on generated tests...")
@@ -2577,7 +2741,10 @@ def test_writer_node(state: AgentState) -> AgentState:
                     "Pre-verification failed due to syntax/import errors on attempt %d.",
                     attempt,
                 )
-                feedback = f"Test run output contains syntax/import errors:\n{output}"
+                feedback = (
+                    "Test run output contains syntax/import errors. Fix these "
+                    f"so the test suite is importable:\n{output}"
+                )
                 attempt += 1
             else:
                 logger.info(

@@ -30,6 +30,40 @@ def _raw_structured_response(parsed, finish_reason="stop", parsing_error=None):
     return {"raw": raw_msg, "parsed": parsed, "parsing_error": parsing_error}
 
 
+def _routed_subprocess_run(discovery_results, real_run=None):
+    """Build a subprocess.run stand-in that scripts only the Test-Writer
+    pre-verification discovery call.
+
+    Patching ``orchestrator.nodes.subprocess.run`` replaces the ``run``
+    attribute on the shared stdlib module, so orchestrator.git's repo probes
+    (``is_git_repository``, ``diff_cached``) would be mocked too. This router
+    forwards any non-discovery command to the real subprocess and serves the
+    queued ``(stdout, stderr)`` tuples only for the unittest-discovery call.
+    """
+    if real_run is None:
+        real_run = subprocess.run
+    queue = list(discovery_results)
+
+    def _run(cmd, **kwargs):
+        if cmd[:3] == ["python3", "-m", "unittest"]:
+            res = MagicMock()
+            res.stdout, res.stderr = queue.pop(0)
+            res.returncode = 0
+            return res
+        return real_run(cmd, **kwargs)
+
+    return _run
+
+
+def _discovery_calls(mock_run):
+    """Filter a subprocess.run mock's calls down to unittest-discovery ones."""
+    return [
+        c
+        for c in mock_run.call_args_list
+        if c.args and c.args[0][:3] == ["python3", "-m", "unittest"]
+    ]
+
+
 class TestClaimNode(unittest.TestCase):
     def setUp(self):
         # Create temp directory for workspace
@@ -3955,10 +3989,7 @@ class TestTestWriterNode(unittest.TestCase):
             "body": "There is a bug in main.py.",
         }
         # Setup mock subprocess output (success, no bad errors)
-        mock_res = unittest.mock.MagicMock()
-        mock_res.stdout = "Ran 5 tests in 0.1s\nOK"
-        mock_res.stderr = ""
-        mock_run.return_value = mock_res
+        mock_run.side_effect = _routed_subprocess_run([("Ran 5 tests in 0.1s\nOK", "")])
 
         # Setup initial state
         state = DEFAULT_STATE.copy()
@@ -3977,7 +4008,7 @@ class TestTestWriterNode(unittest.TestCase):
 
         # Verify execute_worker was called
         mock_execute_worker.assert_called_once()
-        mock_run.assert_called_once()
+        self.assertEqual(len(_discovery_calls(mock_run)), 1)
 
     @patch("orchestrator.nodes.subprocess.run")
     @patch("orchestrator.worker.execute_worker")
@@ -4024,16 +4055,10 @@ class TestTestWriterNode(unittest.TestCase):
             "title": "Fix a bug",
             "body": "There is a bug in main.py.",
         }
-        # First check fails with SyntaxError, second succeeds
-        res_fail = unittest.mock.MagicMock()
-        res_fail.stdout = ""
-        res_fail.stderr = "SyntaxError: invalid syntax"
-
-        res_success = unittest.mock.MagicMock()
-        res_success.stdout = "Ran 5 tests\nOK"
-        res_success.stderr = ""
-
-        mock_run.side_effect = [res_fail, res_success]
+        # First discovery check fails with SyntaxError, second succeeds
+        mock_run.side_effect = _routed_subprocess_run(
+            [("", "SyntaxError: invalid syntax"), ("Ran 5 tests\nOK", "")]
+        )
 
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -4077,6 +4102,375 @@ class TestTestWriterNode(unittest.TestCase):
         self.assertIn("Test-Writer failed pre-verification", result["error"] or "")
 
         self.assertEqual(mock_execute_worker.call_count, 3)
+
+
+class TestTestWriterNoOpGuard(unittest.TestCase):
+    """No-op Test-Phase pre-verification guard (issue #141).
+
+    The Test-First loop (ADR-0010) requires a test artifact: an attempt whose
+    workspace diff shows no added/modified test file must fail pre-verification
+    and consume one attempt, instead of passing because the pre-existing suite
+    is merely importable. An indeterminate diff fails open.
+    """
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    def _init_repo(self) -> None:
+        """Turn the workspace into a real git repository with a baseline commit."""
+        self._git("init", "-b", "main")
+        self._git("config", "user.name", "Test User")
+        self._git("config", "user.email", "test@example.com")
+        baseline = self.workspace_dir / "app.py"
+        baseline.write_text("def feature():\n    pass\n", encoding="utf-8")
+        self._git("add", ".")
+        self._git("commit", "-m", "initial commit")
+
+    @staticmethod
+    def _state_with_plan(plan_json: str | None = None) -> AgentState:
+        if plan_json is None:
+            plan_json = json.dumps(
+                {
+                    "rationale": "r",
+                    "tasks": [
+                        {
+                            "step_number": 1,
+                            "action": "patch",
+                            "description": "Write tests for the feature.",
+                            "target_files": ["tests/test_feature.py"],
+                        }
+                    ],
+                }
+            )
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = plan_json
+        return state
+
+    # Real subprocess.run captured at import time. patching
+    # "orchestrator.nodes.subprocess.run" replaces the attribute on the shared
+    # stdlib module, which would also mock orchestrator.git's subprocess calls
+    # (repo init, diff_cached) — so the mock delegates non-discovery commands
+    # to this real reference.
+    _REAL_SUBPROCESS_RUN = staticmethod(subprocess.run)
+
+    def _git(self, *args: str) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+
+    def _make_node_mocks(
+        self, mock_github_api, mock_run, stdout="Ran 5 tests\nOK", stderr=""
+    ):
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py.",
+        }
+
+        real_run = self._REAL_SUBPROCESS_RUN
+
+        def _delegate(cmd, **kwargs):
+            # Intercept only the pre-verification unittest discovery; real git
+            # traffic (is_git_repository, diff_cached) passes through.
+            if cmd[:3] == ["python3", "-m", "unittest"]:
+                res = MagicMock()
+                res.stdout = stdout
+                res.stderr = stderr
+                res.returncode = 0
+                return res
+            return real_run(cmd, **kwargs)
+
+        mock_run.side_effect = _delegate
+
+    # --- pure helper: _is_test_path ---------------------------------------
+
+    def test_is_test_path_conventional_signals(self):
+        from orchestrator.nodes import _is_test_path
+
+        self.assertTrue(_is_test_path("tests/test_feature.py"))
+        self.assertTrue(_is_test_path("src/pkg/tests/test_other.py"))
+        self.assertTrue(_is_test_path("app/__tests__/suite.ts"))
+        self.assertTrue(_is_test_path("tests/__init__.py"))
+        self.assertTrue(_is_test_path("pkg/worker_test.go"))
+        self.assertTrue(_is_test_path("src/lib.test.ts"))
+        self.assertTrue(_is_test_path("src/lib.spec.js"))
+        # test_ prefix anywhere (pytest collection pattern).
+        self.assertTrue(_is_test_path("test_config.py"))
+
+    def test_is_test_path_rejects_non_test_paths(self):
+        from orchestrator.nodes import _is_test_path
+
+        self.assertFalse(_is_test_path("orchestrator/nodes.py"))
+        self.assertFalse(_is_test_path("contest.py"))
+        self.assertFalse(_is_test_path("latest_utils.py"))
+        self.assertFalse(_is_test_path("attestor.py"))
+        # "_test" must be a suffix before the extension, not an infix.
+        self.assertFalse(_is_test_path("node_tests_runner.py"))
+        # A directory named like a source file is not a test signal.
+        self.assertFalse(_is_test_path("tests_util/helper.py"))
+
+    # --- pure helper: _extract_added_or_modified_paths ---------------------
+
+    def test_extract_added_or_modified_paths(self):
+        from orchestrator.nodes import _extract_added_or_modified_paths
+
+        diff_text = "\n".join(
+            [
+                "diff --git a/tests/test_new.py b/tests/test_new.py",
+                "new file mode 100644",
+                "--- /dev/null",
+                "+++ b/tests/test_new.py",
+                "diff --git a/app.py b/app.py",
+                "--- a/app.py",
+                "+++ b/app.py",
+                "diff --git a/old.py b/old.py",
+                "deleted file mode 100644",
+                "--- a/old.py",
+                "+++ /dev/null",
+                'diff --git "a/path with space/test_a.py" "b/path with space/test_a.py"',
+                '+++ "b/path with space/test_a.py"',
+                "diff --git a/renamed.py b/moved.py",
+                "similarity index 100%",
+                "rename from renamed.py",
+                "rename to moved.py",
+            ]
+        )
+        paths = _extract_added_or_modified_paths(diff_text)
+        self.assertIn("tests/test_new.py", paths)
+        self.assertIn("app.py", paths)
+        self.assertIn("path with space/test_a.py", paths)
+        self.assertNotIn("old.py", paths)  # deletion is not added/modified
+        self.assertNotIn("moved.py", paths)  # pure rename has no post-image
+
+    def test_extract_added_or_modified_paths_empty_diff(self):
+        from orchestrator.nodes import _extract_added_or_modified_paths
+
+        self.assertEqual(_extract_added_or_modified_paths(""), [])
+
+    # --- pure helper: _plan_test_targets ------------------------------------
+
+    def test_plan_test_targets_from_test_tasks_only(self):
+        from orchestrator.nodes import _plan_test_targets
+
+        plan_json = json.dumps(
+            {
+                "rationale": "r",
+                "tasks": [
+                    {
+                        "step_number": 1,
+                        "action": "patch",
+                        "description": "Write tests for the parser.",
+                        "target_files": ["spec/models/user_spec.rb"],
+                    },
+                    {
+                        "step_number": 2,
+                        "action": "patch",
+                        "description": "Implement the parser module.",
+                        "target_files": ["src/parser.rs"],
+                    },
+                ],
+            }
+        )
+        targets = _plan_test_targets(plan_json)
+        self.assertEqual(targets, {"spec/models/user_spec.rb"})
+
+    def test_plan_test_targets_degrades_on_invalid_plan(self):
+        from orchestrator.nodes import _plan_test_targets
+
+        self.assertEqual(_plan_test_targets("not json"), set())
+        self.assertEqual(_plan_test_targets(None), set())
+
+    # --- node-level behavior -------------------------------------------------
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_noop_test_phase_fails_all_attempts(
+        self, mock_github_api, mock_execute_worker, mock_run
+    ):
+        """A clean workspace (no diff at all) is a no-op: every attempt fails."""
+        # Install the delegating subprocess mock BEFORE git setup so real git
+        # commands pass through from the very first call.
+        self._make_node_mocks(mock_github_api, mock_run)
+        self._init_repo()
+
+        state = self._state_with_plan()
+        state_module.save(state)
+
+        from orchestrator.nodes import test_writer_node
+
+        result = test_writer_node(state)
+
+        self.assertIs(result, state)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["phase"], "test_writing")
+        self.assertIn("Test-Writer failed pre-verification", result["error"] or "")
+        # The no-op consumed all three attempts (one failed attempt each,
+        # composing with the ADR-0045 attempt contract).
+        self.assertEqual(mock_execute_worker.call_count, 3)
+
+    def test_noop_feedback_injected_into_retry_instructions(self):
+        """The retry prompt carries the explicit no-test-files feedback."""
+        self._init_repo()
+        plan_json = json.dumps({"rationale": "r", "tasks": []})
+
+        with (
+            patch("orchestrator.nodes.subprocess.run") as mock_run,
+            patch("orchestrator.worker.execute_worker") as mock_execute_worker,
+            patch("orchestrator.nodes._github_api_request") as mock_github_api,
+        ):
+            self._make_node_mocks(mock_github_api, mock_run)
+
+            state = self._state_with_plan(plan_json)
+            state_module.save(state)
+
+            from orchestrator.nodes import test_writer_node
+
+            test_writer_node(state)
+
+        second_instructions = mock_execute_worker.call_args_list[1].args[0]
+        self.assertIn("PREVIOUS ATTEMPT FAILED PRE-VERIFICATION", second_instructions)
+        self.assertIn("No test files were added or modified", second_instructions)
+        self.assertIn("Write the tests before implementation", second_instructions)
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_added_test_file_passes_guard(
+        self, mock_github_api, mock_execute_worker, mock_run
+    ):
+        self._make_node_mocks(mock_github_api, mock_run)
+        self._init_repo()
+        new_test = self.workspace_dir / "tests" / "test_feature.py"
+        new_test.parent.mkdir(parents=True)
+        new_test.write_text("import app\n", encoding="utf-8")
+
+        state = self._state_with_plan()
+        state_module.save(state)
+
+        from orchestrator.nodes import test_writer_node
+
+        result = test_writer_node(state)
+
+        self.assertEqual(result["status"], "executing")
+        self.assertEqual(mock_execute_worker.call_count, 1)
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_modified_test_file_passes_guard(
+        self, mock_github_api, mock_execute_worker, mock_run
+    ):
+        """Extending an existing tracked test file counts as productive."""
+        self._make_node_mocks(mock_github_api, mock_run)
+        self._init_repo()
+        existing_test = self.workspace_dir / "tests" / "test_existing.py"
+        existing_test.parent.mkdir(parents=True)
+        existing_test.write_text("import app\n", encoding="utf-8")
+        self._git("add", ".")
+        self._git("commit", "-m", "add baseline test")
+
+        existing_test.write_text(
+            "import app\n\ndef test_feature():\n    assert True\n",
+            encoding="utf-8",
+        )
+
+        state = self._state_with_plan()
+        state_module.save(state)
+
+        from orchestrator.nodes import test_writer_node
+
+        result = test_writer_node(state)
+
+        self.assertEqual(result["status"], "executing")
+        self.assertEqual(mock_execute_worker.call_count, 1)
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_plan_designated_test_target_passes_guard(
+        self, mock_github_api, mock_execute_worker, mock_run
+    ):
+        """A nonstandard test location named by the Plan Localization passes."""
+        self._make_node_mocks(mock_github_api, mock_run)
+        self._init_repo()
+        planned = self.workspace_dir / "spec" / "models" / "user_spec.rb"
+        planned.parent.mkdir(parents=True)
+        planned.write_text("# spec\n", encoding="utf-8")
+
+        plan_json = json.dumps(
+            {
+                "rationale": "r",
+                "tasks": [
+                    {
+                        "step_number": 1,
+                        "action": "patch",
+                        "description": "Write tests for the user model.",
+                        "target_files": ["spec/models/user_spec.rb"],
+                    }
+                ],
+            }
+        )
+        state = self._state_with_plan(plan_json)
+        state_module.save(state)
+
+        from orchestrator.nodes import test_writer_node
+
+        result = test_writer_node(state)
+
+        self.assertEqual(result["status"], "executing")
+        self.assertEqual(mock_execute_worker.call_count, 1)
+
+    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_indeterminate_diff_fails_open(
+        self, mock_github_api, mock_execute_worker, mock_run
+    ):
+        """Outside a git repository the guard cannot judge: fail open."""
+        # Workspace stays a plain temp dir (no git init).
+        self._make_node_mocks(mock_github_api, mock_run)
+
+        with self.assertLogs("orchestrator.nodes", level="WARNING") as logs:
+            state = self._state_with_plan()
+            state_module.save(state)
+
+            from orchestrator.nodes import test_writer_node
+
+            result = test_writer_node(state)
+
+        self.assertEqual(result["status"], "executing")
+        self.assertEqual(mock_execute_worker.call_count, 1)
+        self.assertTrue(
+            any("not a git repository" in msg for msg in logs.output),
+            f"Expected fail-open warning, got: {logs.output}",
+        )
 
 
 class TestGraphCompilation(unittest.TestCase):
