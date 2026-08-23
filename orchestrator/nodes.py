@@ -1111,6 +1111,41 @@ _BINEVAL_LENGTH_RETRY_MAX_TOKENS_CAP = int(
 )
 
 
+# The OpenAI SDK's structured-output parse helper raises this exception instead
+# of returning a truncation marker when finish_reason=length, so the raw
+# message never reaches _extract_structured_output (ADR-0040's logging path)
+# and the ADR-0049 retry branch would never see the "length" signal. Resolve
+# the class robustly across SDK versions: top-level export first, then the
+# historical private module location; if neither exists a sentinel subclass is
+# returned that matches nothing (nothing can raise it), preserving generic-path
+# behavior.
+def _resolve_length_finish_reason_error() -> type[Exception]:
+    """Resolve ``openai.LengthFinishReasonError`` across SDK versions."""
+    try:
+        from openai import LengthFinishReasonError
+
+        return LengthFinishReasonError
+    except ImportError:
+        pass
+    try:
+        # Historical private location predating the top-level export.
+        from openai.lib._parsing._completions import LengthFinishReasonError
+
+        return LengthFinishReasonError
+    except ImportError:
+        pass
+
+    class _NoMatchLengthError(Exception):
+        """Fallback sentinel: matches nothing when the SDK lacks the real class."""
+
+    return _NoMatchLengthError
+
+
+_LENGTH_FINISH_REASON_ERRORS: tuple[type[Exception], ...] = (
+    _resolve_length_finish_reason_error(),
+)
+
+
 class BinEvalCheck(BaseModel):
     id: str = Field(description="Rubric check id, e.g. '1.1', '3.2'.")
     dimension: str = Field(
@@ -1227,6 +1262,14 @@ def _invoke_bineval_structured(
     API-level exception (network, auth, rate-limit) returns ``(None, None)``
     after logging — the soft-gate contract degrades to PASS, and there is no
     finish_reason to act on.
+
+    The OpenAI SDK's structured-output parse helper raises
+    ``LengthFinishReasonError`` (instead of returning a raw response with
+    ``finish_reason=length``) when the completion is truncated before the
+    verdict JSON completes — a reasoning model can spend the whole budget on
+    reasoning_tokens. That exception is translated here into the
+    ``finish_reason="length"`` signal so the ADR-0049 Length-Limit Budget
+    Retry fires for exactly the failure class it was designed for.
     """
     try:
         llm = get_chat_model_from_config(cfg)
@@ -1234,6 +1277,14 @@ def _invoke_bineval_structured(
             BinEvalResult, strict=True, include_raw=True
         )
         raw_result = structured_llm.invoke(prompt)
+    except _LENGTH_FINISH_REASON_ERRORS as e:
+        logger.warning(
+            "BinEval LLM call hit the length limit "
+            "(LengthFinishReasonError: %s); signaling finish_reason='length' "
+            "for the ADR-0049 budget retry.",
+            e,
+        )
+        return None, "length"
     except Exception as e:
         logger.warning(
             "BinEval LLM call failed (%s); treating as PASS (soft gate, "
