@@ -2577,8 +2577,7 @@ def _workspace_has_test_changes(
     try:
         if not is_git_repository(workspace_path):
             logger.warning(
-                "No-op test check skipped: %s is not a git repository. "
-                "Failing open.",
+                "No-op test check skipped: %s is not a git repository. Failing open.",
                 workspace_path,
             )
             return None, []
