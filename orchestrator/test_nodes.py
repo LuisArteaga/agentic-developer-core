@@ -2821,6 +2821,14 @@ class TestMergeNode(unittest.TestCase):
             self.original_env[k] = os.environ.get(k)
             os.environ[k] = v
 
+        # A machine-local AGENT_TRUSTED_JUDGE_USER would reject the mocked
+        # 'test-judge-user' reviews as untrusted and time the merge poll out.
+        # CI never sets this var; scrub it so local runs match CI deterministically.
+        self.original_env["AGENT_TRUSTED_JUDGE_USER"] = os.environ.get(
+            "AGENT_TRUSTED_JUDGE_USER"
+        )
+        os.environ.pop("AGENT_TRUSTED_JUDGE_USER", None)
+
         subprocess.run(
             ["git", "init", "-b", "main"],
             cwd=str(self.workspace_dir),

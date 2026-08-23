@@ -781,6 +781,19 @@ class TestGetChatModelFromConfig(unittest.TestCase):
         self.assertEqual(extra_body["thinking"], "max")
         self.assertIn("provider", extra_body)
 
+    def test_reasoning_effort_merged_into_extra_body(self):
+        """Nested reasoning options (ADR-0051) pass through to extra_body verbatim."""
+        cfg = {
+            "model": "test-model",
+            "routing": ["DeepInfra"],
+            "temperature": 0.0,
+            "options": {"reasoning": {"effort": "low"}},
+        }
+        llm = get_chat_model_from_config(cfg)
+        extra_body = llm.extra_body or {}
+        self.assertEqual(extra_body["reasoning"], {"effort": "low"})
+        self.assertIn("provider", extra_body)
+
     def test_temperature_passed_through(self):
         """The temperature from the config reaches the ChatOpenAI instance."""
         cfg = {
@@ -912,6 +925,11 @@ class TestRealFactoryJson(unittest.TestCase):
         cfg = resolve_model_config("bin_eval")
         self.assertIsNotNone(cfg["max_tokens"])
         self.assertGreater(cfg["max_tokens"], 0)
+
+    def test_bin_eval_reasoning_effort_low(self):
+        """The bin_eval node caps reasoning effort to low in the shipped factory.json (ADR-0051)."""
+        cfg = resolve_model_config("bin_eval")
+        self.assertEqual(cfg["options"], {"reasoning": {"effort": "low"}})
 
     def test_execute_has_no_max_tokens(self):
         """Non-structured-output nodes (execute) do not set max_tokens."""

@@ -47,6 +47,11 @@ reasoning case. It mirrors the `plan` node, which already uses `max_tokens:
 is honored: worst-case spend per BinEval call doubles, but BinEval is a single
 flash-model call per verify attempt — the absolute cost remains negligible
 relative to the Execute/Test-Writer ReAct loops.
+  *(Extended by [ADR-0051](./0051-bineval-reasoning-effort-cap.md): the raised
+  budget alone proved insufficient — on 2026-08-14 reasoning scaled to consume
+  the full 8192. ADR-0051 bounds the demand at the source via
+  `"options": {"reasoning": {"effort": "low"}}` on `bin_eval`; this budget and
+  the retry below remain as the safety net.)*
 
 ### 2. Single retry with an enlarged budget on `finish_reason=length` (Option 3)
 
