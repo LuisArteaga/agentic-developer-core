@@ -4223,6 +4223,10 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         # test_ prefix anywhere (pytest collection pattern).
         self.assertTrue(_is_test_path("test_config.py"))
 
+    def test_is_test_path_strips_leading_relative_prefix(self):
+        """A './'-prefixed conventional path still classifies as a test file."""
+        self.assertTrue(nodes_module._is_test_path("./tests/test_feature.py"))
+
     def test_is_test_path_rejects_non_test_paths(self):
         from orchestrator.nodes import _is_test_path
 
@@ -4305,6 +4309,76 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
 
         self.assertEqual(_plan_test_targets("not json"), set())
         self.assertEqual(_plan_test_targets(None), set())
+
+    def test_plan_test_targets_skips_non_dict_payloads(self):
+        """A JSON array payload and malformed task entries degrade to empty."""
+        from orchestrator.nodes import _plan_test_targets
+
+        self.assertEqual(_plan_test_targets("[]"), set())
+        plan_json = json.dumps(
+            {
+                "rationale": "r",
+                "tasks": [
+                    "not-a-task",
+                    {
+                        "step_number": 1,
+                        "action": "patch",
+                        "description": "Write tests.",
+                        "target_files": ["tests/test_ok.py"],
+                    },
+                ],
+            }
+        )
+        self.assertEqual(_plan_test_targets(plan_json), {"tests/test_ok.py"})
+
+    def test_workspace_check_fails_open_when_diff_raises(self):
+        """An exception from the diff layer is indeterminate: fail open, warn."""
+        self._make_node_mocks(MagicMock(), MagicMock())  # install real-git routing
+        self._init_repo()
+
+        with patch("orchestrator.nodes.diff_cached") as mock_diff:
+            mock_diff.side_effect = RuntimeError("git exploded")
+            with self.assertLogs("orchestrator.nodes", level="WARNING") as captured:
+                verdict, matched = nodes_module._workspace_has_test_changes(
+                    self.workspace_dir, None
+                )
+
+        self.assertIsNone(verdict)
+        self.assertEqual(matched, [])
+        self.assertTrue(any("Failing open" in msg for msg in captured.output))
+
+    def test_node_without_issue_number_raises(self):
+        """A missing issue_number is a programming error, not a phase failure."""
+        from orchestrator.nodes import test_writer_node
+
+        state = cast(
+            AgentState,
+            {k: v for k, v in DEFAULT_STATE.items() if k != "issue_number"},
+        )
+        with self.assertRaises(ValueError):
+            test_writer_node(state)
+
+    def test_node_without_plan_records_failure(self):
+        """A missing development plan transitions to recovery via failed state."""
+        with (
+            patch("orchestrator.nodes.subprocess.run"),
+            patch("orchestrator.worker.execute_worker"),
+            patch("orchestrator.nodes._github_api_request") as mock_github_api,
+        ):
+            mock_github_api.return_value = {"title": "Fix a bug", "body": "..."}
+            state = cast(
+                AgentState,
+                {k: v for k, v in DEFAULT_STATE.items() if k != "plan"},
+            )
+            state["issue_number"] = 10
+            state_module.save(state)
+
+            from orchestrator.nodes import test_writer_node
+
+            result = test_writer_node(state)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("No development plan", result["error"] or "")
 
     # --- node-level behavior -------------------------------------------------
 
