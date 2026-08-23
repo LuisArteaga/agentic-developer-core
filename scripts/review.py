@@ -161,6 +161,7 @@ SYSTEM_PROMPT_ARCH = (
     "=== 4. EDGE-CASE HANDLING ===\n"
     "- If the prompt indicates that context files are missing, evaluate compliance purely against the general simplicity/lazy coding rules and conventional commits.\n"
     "- Do NOT flag intentional scaffolding that is explicitly requested in the issue requirements.\n"
+    "- Note: Due to system-level egress sanitization, the '@' symbol used for decorators, e.g. @pytest.fixture or @unittest.skipUnless, might be received as '[EMAIL]'. Do NOT count '[EMAIL]' as invalid syntax or a malformed token; treat it as a valid '@' decorator symbol.\n"
     "- If the diff is empty, return PASS with empty findings.\n\n"
     "=== OUTPUT FORMAT ===\n"
     "First, output your reasoning block:\n"
