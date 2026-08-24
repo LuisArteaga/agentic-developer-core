@@ -52,14 +52,29 @@ def test_declared_inputs() -> None:
         "orchestrator-repo",
         "orchestrator-ref",
         "diff-exclude",
-        "coverage-artifact-name",
-        "coverage-artifact-path",
     }
     assert expected <= set(inputs), f"missing inputs: {expected - set(inputs)}"
     # The default repo pins the writer of the verdict block (ADR-0019 lockstep).
     assert (
         inputs["orchestrator-repo"]["default"] == "LuisArteaga/agentic-developer-core"
     )
+
+
+def test_coverage_artifact_inputs_retired() -> None:
+    # ADR-0030 retirement (issue #149): the judge evaluates semantics from
+    # the diff alone; the coverage-artifact inputs, their download/staging
+    # steps, and the staging env var must not reappear. External callers
+    # still passing them get a GitHub Actions unexpected-input validation
+    # error — a deliberate breaking interface change.
+    raw = WORKFLOW_PATH.read_text()
+    assert "coverage-artifact-name" not in raw, "retired input reintroduced"
+    assert "coverage-artifact-path" not in raw, "retired input reintroduced"
+    assert "CI_COVERAGE_OUTPUT" not in raw, "retired staging env var reintroduced"
+    wf = _load_workflow()
+    steps = wf["jobs"]["llm-pr-review"]["steps"]
+    uses = [s.get("uses", "") for s in steps]
+    has_download_step = any("download-artifact" in u for u in uses)
+    assert not has_download_step, "retired artifact download step reintroduced"
 
 
 def test_declared_secrets_required() -> None:

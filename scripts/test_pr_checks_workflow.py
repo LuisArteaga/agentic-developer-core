@@ -3,12 +3,14 @@
 The ``pr-checks`` workflow (``.github/workflows/pr-checks.yml``) is the CI
 enforcement layer of the tiered quality-gate model (ADR-0020). Since issue
 #148 it is also the authoritative enforcement point of the Diff Coverage
-Gate (ADR-0052): the pytest step must emit ``coverage.json`` alongside the
-term-missing output the Test Coverage judge consumes (ADR-0030), and a gate
-step must fail the job deterministically when changed production lines are
-uncovered — before any LLM judge tokens are spent. Drift in any of these
-invariants either silently disables the hard gate or breaks the judge's
-coverage transport, so they are pinned at the ``make verify`` surface.
+Gate (ADR-0052): the pytest step must emit ``coverage.json`` from a single
+test run, and a gate step must fail the job deterministically when changed
+production lines are uncovered — before any LLM judge tokens are spent.
+Since issue #149 the ADR-0030 CI-coverage-output transport is retired: no
+``CI_COVERAGE_OUTPUT`` plumbing may reappear (the Test Coverage judge
+evaluates semantics from the diff alone). Drift in any of these invariants
+either silently disables the hard gate or reintroduces retired machinery,
+so they are pinned at the ``make verify`` surface.
 
 See ADR-0052 for the gate design and ADR-0020 for the tiered-gate model.
 """
@@ -93,15 +95,24 @@ def test_step_ordering_is_stable() -> None:
     ]
 
 
-def test_pytest_step_emits_json_report_alongside_term_missing() -> None:
-    # ADR-0030 transport (term-missing piped through tee) must survive; the
-    # JSON report feeds the Diff Coverage Gate from the same single test run.
+def test_pytest_step_emits_json_report_and_readable_output() -> None:
+    # The JSON report feeds the Diff Coverage Gate from a single test run;
+    # term-missing keeps the per-file missing-line table readable in CI logs.
     run = str(_step_by_name(_load_workflow(), PYTEST_STEP)["run"])
-    assert "--cov-report=term-missing" in run, "judge coverage output lost"
+    assert "--cov-report=term-missing" in run, "readable coverage table lost"
     assert "--cov-report=json:coverage.json" in run, "gate report not emitted"
     assert "set -o pipefail" in run, "pipefail semantics must be preserved"
-    assert "| tee" in run, "judge output capture must be preserved"
+    assert "| tee" not in run, "ADR-0030 output capture must stay retired"
     assert "--cov-fail-under=89" in run, "global percentage floor must be preserved"
+
+
+def test_no_ci_coverage_transport_remains() -> None:
+    # ADR-0030 retirement (issue #149): the env var, the staged file, and any
+    # judge-consumed coverage transport must not reappear anywhere in the
+    # workflow — changed-line coverage is the Diff Coverage Gate's job.
+    raw = WORKFLOW_PATH.read_text()
+    assert "CI_COVERAGE_OUTPUT" not in raw, "retired ADR-0030 transport reintroduced"
+    assert "ci_coverage_output.txt" not in raw, "retired staging file reintroduced"
 
 
 def test_gate_step_invokes_script_against_event_payload_base() -> None:

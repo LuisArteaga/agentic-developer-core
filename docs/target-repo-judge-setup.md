@@ -102,41 +102,16 @@ The caller may pass inputs to the reusable workflow:
 | `orchestrator-repo` | `LuisArteaga/agentic-developer-core` | Source of `scripts/review.py`. Change only for a fork. |
 | `orchestrator-ref` | `main` | Orchestrator git ref. Pin to a tag for lockstep. |
 | `diff-exclude` | `""` | Space-separated pathspecs to exclude (e.g. `uv.lock`). |
-| `coverage-artifact-name` | `""` | Name of a coverage-report artifact ([ADR-0030](./adr/0030-pipe-ci-coverage-output-into-test-coverage-pr-judge.md)). Empty = diff-only. |
-| `coverage-artifact-path` | `ci_coverage_output.txt` | Path to the report inside that artifact. |
 
-### Piping CI coverage (ADR-0030)
-
-When the target repository runs tests in a preceding job, upload the coverage
-report as an artifact and reference it so the `test_coverage` judge consumes
-real coverage instead of diff-only heuristics:
-
-```yaml
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # ... run tests, e.g.:
-      - run: pytest --cov-report=term-missing | tee ci_coverage_output.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ci-coverage
-          path: ci_coverage_output.txt
-
-  judge:
-    needs: test
-    uses: LuisArteaga/agentic-developer-core/.github/workflows/llm-pr-review.yml@main
-    with:
-      coverage-artifact-name: ci-coverage
-      coverage-artifact-path: ci_coverage_output.txt
-    secrets:
-      judge-token: ${{ secrets.JUDGE_GH_TOKEN }}
-      openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
-```
-
-If the artifact is absent or the file is missing, the judge degrades gracefully
-to diff-only evaluation — it never fails the hard gate on missing coverage.
+> **Breaking change (issue #149):** the `coverage-artifact-name` and
+> `coverage-artifact-path` inputs were removed when the ADR-0030
+> CI-coverage-output transport was retired. The `test_coverage` judge now
+> evaluates semantic test quality (Assertion Strength, Edge Cases,
+> Implementation Leakage) from the diff alone; changed-line coverage is
+> enforced by the deterministic Diff Coverage Gate ([ADR-0052](./adr/0052-deterministic-diff-coverage-gate.md)).
+> Callers still passing the removed inputs get a GitHub Actions
+> unexpected-input validation error — delete those inputs from your caller
+> workflow when upgrading.
 
 ## Branch protection & review event type
 

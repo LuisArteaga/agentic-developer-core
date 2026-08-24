@@ -66,7 +66,7 @@ Each covered by `scripts/test_diff_coverage_gate.py`: empty diff → 0; diverged
 
 ## Consequences
 
-* **Pros**: instant, free, exact changed-line feedback at commit time; eliminates the dominant mechanical judge-FAIL class and its Merge-Fix Loop round-trips; the judge's Q4 remains as defense-in-depth until the planned follow-up retires it once the gate is merge-blocking.
+* **Pros**: instant, free, exact changed-line feedback at commit time; eliminates the dominant mechanical judge-FAIL class and its Merge-Fix Loop round-trips; the judge's Q4 remained as defense-in-depth until the gate became merge-blocking (#148), at which point the CI-output transport and the Q3/Q4 criteria were retired entirely — [ADR-0030](./superseded/0030-pipe-ci-coverage-output-into-test-coverage-pr-judge.md) is now superseded by this ADR, and the Test Coverage judge evaluates semantics only (issue #149).
 * **Negatives**: a second implementation of test-path detection lives in `scripts/` until a shared module extraction; `-U0` diff parsing is hand-rolled (mitigated by quoted-path handling and tests); developers must remember to run `make diff-coverage` (opt-in by design, mirroring the Strict Pre-Commit Gate tiering).
 
 ## Inspiration & References

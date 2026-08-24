@@ -34,18 +34,6 @@ on:
           `uv.lock package-lock.json`. Empty excludes nothing.
         type: string
         default: ""
-      coverage-artifact-name:
-        description: >-
-          Name of a CI coverage report artifact (ADR-0030) uploaded by a
-          preceding target-repo job. Empty = diff-only evaluation (graceful
-          degradation per ADR-0030).
-        type: string
-        default: ""
-      coverage-artifact-path:
-        description: >-
-          Path inside the coverage artifact to the coverage report file.
-        type: string
-        default: ci_coverage_output.txt
     secrets:
       judge-token:
         description: >-
@@ -71,9 +59,6 @@ jobs:
       # trusted judge identity (AGENT_TRUSTED_JUDGE_USER).
       GH_TOKEN: ${{ secrets.judge-token }}
       OPENROUTER_API_KEY: ${{ secrets.openrouter-api-key }}
-      # Consumed by the test_coverage judge when a coverage report is staged
-      # (ADR-0030). Absent/empty degrades gracefully to diff-only evaluation.
-      CI_COVERAGE_OUTPUT_PATH: ${{ github.workspace }}/ci_coverage_output.txt
     steps:
       - name: Check out target repository (PR head)
         uses: actions/checkout@v4
@@ -86,25 +71,6 @@ jobs:
           repository: ${{ inputs.orchestrator-repo }}
           ref: ${{ inputs.orchestrator-ref }}
           path: orchestrator-src
-
-      - name: Download CI coverage artifact (optional, ADR-0030)
-        if: ${{ inputs.coverage-artifact-name != '' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.coverage-artifact-name }}
-          path: ${{ github.workspace }}/coverage-artifact
-
-      - name: Stage CI coverage output
-        if: ${{ inputs.coverage-artifact-name != '' }}
-        run: |
-          set -euo pipefail
-          src="${{ github.workspace }}/coverage-artifact/${{ inputs.coverage-artifact-path }}"
-          if [ -f "$src" ]; then
-            cp "$src" "$CI_COVERAGE_OUTPUT_PATH"
-            echo "[INFO] Staged CI coverage output ($CI_COVERAGE_OUTPUT_PATH)"
-          else
-            echo "[WARN] Coverage artifact present but '$src' not found; falling back to diff-only evaluation."
-          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5

@@ -9,10 +9,6 @@ env:
   OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
   GH_PAT: ${{ secrets.GH_PAT }}
   PR_NUMBER: ${{ github.event.pull_request.number }}
-  # Path to the CI test + coverage output consumed by the Test Coverage
-  # PR Review Judge (scripts/review.py). Written by the pytest step below,
-  # read by the LLM review step. See ADR-0030.
-  CI_COVERAGE_OUTPUT_PATH: ${{ github.workspace }}/ci_coverage_output.txt
 
 jobs:
   pr-checks:
@@ -85,14 +81,16 @@ jobs:
         run: mypy orchestrator scripts
 
       - name: Run Pytest Coverage Check
-        # --cov=scripts so the changed production code in scripts/review.py
-        # (the LLM judge itself) appears in the coverage report consumed by the
-        # Test Coverage PR Review Judge. See ADR-0030. The additional JSON
-        # report (coverage.json) feeds the Diff Coverage Gate below; both
-        # reports come from this single test run.
+        # --cov=scripts keeps the judge code itself (scripts/review.py,
+        # production code run in CI) under the global coverage floor. The JSON
+        # report feeds the Diff Coverage Gate below; term-missing keeps the
+        # per-file missing-line table visible in the CI logs for humans.
+        # Changed-line coverage is enforced deterministically by the gate
+        # (ADR-0052); the Test Coverage judge evaluates semantics from the
+        # diff alone (issue #149).
         run: |
           set -o pipefail
-          pytest --cov=orchestrator --cov=scripts --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=89 2>&1 | tee "$CI_COVERAGE_OUTPUT_PATH"
+          pytest --cov=orchestrator --cov=scripts --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=89
 
       - name: Run Diff Coverage Gate
         # Deterministic hard check (ADR-0052): fails the job when any

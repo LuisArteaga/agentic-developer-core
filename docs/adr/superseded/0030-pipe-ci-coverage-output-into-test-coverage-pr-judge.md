@@ -1,6 +1,6 @@
 # ADR 0030: Pipe CI Coverage Output Into the Test Coverage PR Judge
 
-* **Status**: Accepted
+* **Status**: Superseded by [ADR 0052: Deterministic Diff Coverage Gate](../0052-deterministic-diff-coverage-gate.md)
 * **Date**: 2026-07
 * **Deciders**: Luis Arteaga & The Architect
 
