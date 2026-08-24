@@ -5652,14 +5652,25 @@ class TestIsinstanceGuardCoverage(unittest.TestCase):
     ):
         from orchestrator.nodes import merge_node
 
-        state = DEFAULT_STATE.copy()
-        state["issue_number"] = 42
-        state["status"] = "pr_open"
-        state["branch"] = "feat/issue-42"
-        state["pushed_at"] = "2024-01-01T00:00:00Z"
-        state_module.save(state)
+        # CI runners always export GITHUB_ACTOR; scrub it so the fallback
+        # deterministically lands on the warn-and-continue branch (trusted
+        # user unresolvable) instead of silently resolving to the actor.
+        original_actor = os.environ.get("GITHUB_ACTOR")
+        os.environ.pop("GITHUB_ACTOR", None)
+        try:
+            state = DEFAULT_STATE.copy()
+            state["issue_number"] = 42
+            state["status"] = "pr_open"
+            state["branch"] = "feat/issue-42"
+            state["pushed_at"] = "2024-01-01T00:00:00Z"
+            state_module.save(state)
 
-        result = merge_node(state)
+            result = merge_node(state)
+        finally:
+            if original_actor is None:
+                os.environ.pop("GITHUB_ACTOR", None)
+            else:
+                os.environ["GITHUB_ACTOR"] = original_actor
 
         # The /user isinstance guard was swallowed by the inner except
         # (fallback to GITHUB_ACTOR). The poll loop is skipped (timeout=0),
