@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from orchestrator.config import (
     DEFAULT_RECURSION_LIMIT,
     DEFAULT_ROUTING,
     FACTORY_JSON_PATH,
+    _SOURCE_TIER_LOGGED,
     _load_factory_config,
     get_chat_model_from_config,
     resolve_model_config,
@@ -941,6 +943,221 @@ class TestRealFactoryJson(unittest.TestCase):
         for node in ["plan", "test_writer", "execute"]:
             self.assertIn(node, DEFAULT_ROUTING, f"{node} missing from DEFAULT_ROUTING")
             self.assertGreater(len(DEFAULT_ROUTING[node]), 0)
+
+
+class TestResolutionSourceTierLogging(unittest.TestCase):
+    """Tests for the resolution-source log line added by issue #126.
+
+    Every precedence path must report the tier that actually supplied each
+    value: the winning env var name (Model Config Override), "factory.json",
+    or the hardcoded default. Driven exclusively through the public
+    resolve_model_config(); the module-level log-once registry is cleared
+    around each test purely as state hygiene.
+    """
+
+    _ENV_VARS = [
+        "AGENT_MODEL",
+        "PLAN_MODEL",
+        "TEST_WRITER_MODEL",
+        "EXECUTE_MODEL",
+        "AGENT_RECURSION_LIMIT",
+        "PLAN_RECURSION_LIMIT",
+        "EXECUTE_RECURSION_LIMIT",
+        "AGENT_LOOP_WARN_THRESHOLD",
+        "AGENT_LOOP_HARD_LIMIT",
+        "EXECUTE_LOOP_HARD_LIMIT",
+    ]
+
+    def setUp(self):
+        self.original_env = {}
+        for var in self._ENV_VARS:
+            self.original_env[var] = os.environ.get(var)
+            os.environ.pop(var, None)
+        _SOURCE_TIER_LOGGED.clear()
+
+    def tearDown(self):
+        for var, val in self.original_env.items():
+            if val is not None:
+                os.environ[var] = val
+            else:
+                os.environ.pop(var, None)
+        _SOURCE_TIER_LOGGED.clear()
+
+    @staticmethod
+    def _info_messages(cm) -> list[str]:
+        return [r.getMessage() for r in cm.records if r.levelno == logging.INFO]
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_node_env_override_logs_node_var_tier(self, mock_load):
+        """An active {NODE}_MODEL override logs 'Model Config Override' + the var name."""
+        mock_load.return_value = {"execute": {"model": "moonshotai/kimi-k2.7-code"}}
+        os.environ["EXECUTE_MODEL"] = "z-ai/glm-5.2"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["model"], "z-ai/glm-5.2")
+        info = "\n".join(self._info_messages(cm))
+        self.assertIn("Model Config Override active (node=execute)", info)
+        self.assertIn("model=z-ai/glm-5.2 (source=EXECUTE_MODEL)", info)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_no_secret_material_in_log_line(self, mock_load):
+        """The resolution line never leaks unrelated secret env values."""
+        mock_load.return_value = {}
+        os.environ["EXECUTE_MODEL"] = "z-ai/glm-5.2"
+        os.environ["OPENROUTER_API_KEY"] = "sk-supersecret-value"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            resolve_model_config("execute")
+        info = "\n".join(self._info_messages(cm))
+        self.assertNotIn("sk-supersecret-value", info)
+        self.assertNotIn("OPENROUTER_API_KEY", info)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_agent_env_override_logs_agent_tier(self, mock_load):
+        """AGENT_MODEL winning the precedence logs source=AGENT_MODEL."""
+        mock_load.return_value = {}
+        os.environ["AGENT_MODEL"] = "qwen/qwen4-max"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config("plan")
+        self.assertEqual(cfg["model"], "qwen/qwen4-max")
+        info = "\n".join(self._info_messages(cm))
+        self.assertIn("Model Config Override active (node=plan)", info)
+        self.assertIn("(source=AGENT_MODEL)", info)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_empty_node_var_falls_to_agent_tier(self, mock_load):
+        """An empty-string node var does not win; AGENT_MODEL tier is reported."""
+        mock_load.return_value = {}
+        os.environ["EXECUTE_MODEL"] = ""
+        os.environ["AGENT_MODEL"] = "qwen/qwen4-max"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["model"], "qwen/qwen4-max")
+        self.assertIn("(source=AGENT_MODEL)", "\n".join(self._info_messages(cm)))
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_factory_resolution_logs_factory_tier(self, mock_load):
+        """Factory resolution reports source=factory.json without the override prefix."""
+        mock_load.return_value = {
+            "execute": {"model": "moonshotai/kimi-k2.7-code", "routing": ["Together"]}
+        }
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["model"], "moonshotai/kimi-k2.7-code")
+        info = "\n".join(self._info_messages(cm))
+        self.assertIn("Resolved Model Config (node=execute)", info)
+        self.assertIn("(source=factory.json)", info)
+        self.assertNotIn("Override", info)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_missing_node_logs_default_model_tier(self, mock_load):
+        """A node absent from the factory logs source=DEFAULT_MODEL."""
+        mock_load.return_value = {}
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config("syntax_lint")
+        self.assertEqual(cfg["model"], DEFAULT_MODEL)
+        info = "\n".join(self._info_messages(cm))
+        self.assertIn(f"model={DEFAULT_MODEL} (source=DEFAULT_MODEL)", info)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_malformed_env_reports_tier_actually_used(self, mock_load):
+        """A malformed env value is ignored; the reported tier is the next one."""
+        mock_load.return_value = {
+            "execute": {"model": "m", "routing": ["X"], "recursion_limit": 99}
+        }
+        os.environ["EXECUTE_RECURSION_LIMIT"] = "not-an-int"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], 99)
+        info = "\n".join(self._info_messages(cm))
+        self.assertIn("recursion_limit=99 (source=factory.json)", info)
+        self.assertNotIn("source=EXECUTE_RECURSION_LIMIT", info)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_recursion_limit_env_override_reported(self, mock_load):
+        """An env-overridden Recursion Budget names its winning env var."""
+        mock_load.return_value = {}
+        os.environ["EXECUTE_RECURSION_LIMIT"] = "77"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], 77)
+        info = "\n".join(self._info_messages(cm))
+        self.assertIn("recursion_limit=77 (source=EXECUTE_RECURSION_LIMIT)", info)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_agent_loop_threshold_override_reported(self, mock_load):
+        """An env-overridden loop threshold names AGENT_LOOP_HARD_LIMIT."""
+        mock_load.return_value = {}
+        os.environ["AGENT_LOOP_HARD_LIMIT"] = "9"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["loop_hard_limit"], 9)
+        info = "\n".join(self._info_messages(cm))
+        self.assertIn("loop_hard_limit=9 (source=AGENT_LOOP_HARD_LIMIT)", info)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_defaults_reported_for_loop_thresholds(self, mock_load):
+        """Un-overridden loop thresholds report their default provenance."""
+        mock_load.return_value = {"execute": {"model": "m"}}
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config("execute")
+        info = "\n".join(self._info_messages(cm))
+        self.assertIn(
+            f"loop_warn_threshold={DEFAULT_LOOP_WARN_THRESHOLD} (source=default)",
+            info,
+        )
+        self.assertIn(
+            f"loop_window_size={DEFAULT_LOOP_WINDOW_SIZE} (source=default)",
+            info,
+        )
+        self.assertEqual(cfg["loop_warn_threshold"], DEFAULT_LOOP_WARN_THRESHOLD)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_override_equal_to_factory_still_reports_env_tier(self, mock_load):
+        """An env override naming the factory's model still reports the override.
+
+        The override is active and would mask subsequent factory.json edits,
+        so the log must attribute the model to the env tier, not the factory.
+        """
+        mock_load.return_value = {
+            "execute": {"model": "moonshotai/kimi-k2.7-code", "routing": ["X"]}
+        }
+        os.environ["EXECUTE_MODEL"] = "moonshotai/kimi-k2.7-code"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            resolve_model_config("execute")
+        info = "\n".join(self._info_messages(cm))
+        self.assertIn("Model Config Override active (node=execute)", info)
+        self.assertIn("model=moonshotai/kimi-k2.7-code (source=EXECUTE_MODEL)", info)
+        self.assertNotIn("source=factory.json", info)
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_repeat_resolution_downgraded_to_debug(self, mock_load):
+        """The same node resolves ~10x per cycle; only the first logs INFO."""
+        mock_load.return_value = {}
+        with self.assertLogs("orchestrator.config", level="DEBUG") as cm:
+            resolve_model_config("execute")
+            resolve_model_config("execute")
+        self.assertEqual(len(self._info_messages(cm)), 1)
+        # Filter to resolution-source lines: other debug records (e.g. the
+        # absent-node fallback notice) legitimately share the logger.
+        source_debug = [
+            r
+            for r in cm.records
+            if r.levelno == logging.DEBUG and "(source=" in r.getMessage()
+        ]
+        self.assertEqual(len(source_debug), 1)
+        self.assertIn("node=execute", source_debug[0].getMessage())
+
+    @unittest.mock.patch("orchestrator.config._load_factory_config")
+    def test_distinct_nodes_each_get_one_info_line(self, mock_load):
+        """The log-once registry is per-node, not per-process-global."""
+        mock_load.return_value = {}
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            resolve_model_config("plan")
+            resolve_model_config("execute")
+        nodes = [m for m in self._info_messages(cm)]
+        self.assertEqual(len(nodes), 2)
+        self.assertIn("node=plan", nodes[0])
+        self.assertIn("node=execute", nodes[1])
 
 
 if __name__ == "__main__":

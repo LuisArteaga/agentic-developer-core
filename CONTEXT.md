@@ -94,6 +94,8 @@ _Avoid_: changed-line check, incremental coverage, diff coverage script
 _Avoid_: default model, global model
 - **Model Config Override**: An environment variable (e.g., `EXECUTE_MODEL`, `PLAN_MODEL`) that takes precedence over the Factory Configuration default for a specific node. When active, provider routing is disabled (set to `None`), since the override model may not be registered in the factory's routing list.
 _Avoid_: env model, model env var
+- **Resolution Source Tier**: The provenance of a resolved configuration value — which precedence tier supplied it: the node-specific environment variable, the general agent-wide environment variable, the Factory Configuration, or the hardcoded default. Surfaced in orchestrator logs (model id and per-node budget thresholds together with their tiers) once per node at first resolution, so silent drift — e.g. an exported `AGENT_MODEL` overriding Factory Configuration edits invisibly — is diagnosable from logs alone. An active Model Config Override is reported as such even when it happens to equal the factory value, because the override would mask subsequent factory changes. Malformed values that fall through to a lower tier are reported under the tier that actually supplied the final value.
+_Avoid_: config provenance, origin tag, source annotation
 
 ## Loop Metrics
 
