@@ -425,10 +425,15 @@ class TestWorkerAgent(unittest.TestCase):
     def test_fallback_default_when_factory_lacks_recursion_limit(
         self, mock_create_agent
     ):
-        """When factory.json is missing/malformed or the node has no
-        recursion_limit key, the DEFAULT_RECURSION_LIMIT (50) fallback applies
-        (ADR-0045). Isolated from the repo's factory.json content by feeding an
-        empty factory config."""
+        """When factory.json lacks a recursion_limit for the node, the
+        DEFAULT_RECURSION_LIMIT (50) fallback applies (ADR-0045). Exercised
+        through the public configuration-resolution chain: a real temp
+        factory.json (execute entry without recursion_limit) is injected by
+        patching the FACTORY_JSON_PATH constant, so actual file loading and
+        resolution precedence are under test."""
+        factory_path = Path(self.logs_temp.name) / "factory.json"
+        factory_path.write_text(json.dumps({"execute": {"model": "any/model"}}))
+
         mock_agent = MagicMock()
         mock_agent.stream.return_value = iter(
             [{"messages": [AIMessage(content="done")]}]
@@ -438,7 +443,7 @@ class TestWorkerAgent(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("EXECUTE_RECURSION_LIMIT", None)
             os.environ.pop("AGENT_RECURSION_LIMIT", None)
-            with patch("orchestrator.config._load_factory_config", return_value={}):
+            with patch("orchestrator.config.FACTORY_JSON_PATH", factory_path):
                 execute_worker(issue_description="x", plan="y", node_name="execute")
 
         config = mock_agent.stream.call_args.kwargs["config"]

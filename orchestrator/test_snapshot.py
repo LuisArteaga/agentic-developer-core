@@ -202,24 +202,26 @@ class TestBuildWorkspaceSnapshot(unittest.TestCase):
         self.assertIn("[...truncated...]", snap)
         self.assertNotIn("method_199(", snap)
 
-    def test_truncate_tree_drops_whole_lines_and_notes(self):
-        from orchestrator.snapshot import _truncate_tree
+    def test_oversized_tree_truncated_through_public_api(self):
+        # A workspace whose tree exceeds SNAPSHOT_TREE_MAX_CHARS: the composed
+        # snapshot carries the tree-truncation note and whole-line drop
+        # semantics — asserted on the public build_workspace_snapshot output,
+        # not on the internal truncation helper.
+        for i in range(600):
+            (self.ws / f"f{i:03d}.txt").write_text("")
+        snap = build_workspace_snapshot(None, workspace_path=self.ws)
+        self.assertIn("[directory tree truncated to fit snapshot budget]", snap)
+        # Deterministic walk order: earliest entries survive complete...
+        self.assertIn("f000.txt", snap)
+        # ...and the last-walked entry is dropped, never clipped mid-name.
+        self.assertNotIn("f599.txt", snap)
+        for line in snap.split("\n"):
+            if line.startswith(("├── ", "└── ")):
+                self.assertRegex(line, r"(app\.py|f\d{3}\.txt)$")
 
-        tree = "\n".join(f"line{i}" for i in range(50))
-        result = _truncate_tree(tree, 40)
-        note = "\n[directory tree truncated to fit snapshot budget]"
-        self.assertLessEqual(len(result), 40 + len(note))
-        self.assertTrue(result.startswith("line0\n"))
-        self.assertIn("[directory tree truncated to fit snapshot budget]", result)
-        # Whole-line semantics: the last kept line is complete, never clipped.
-        kept_lines = result.split("\n")[:-1]
-        self.assertTrue(all(line.startswith("line") for line in kept_lines))
-
-    def test_truncate_tree_short_tree_unchanged(self):
-        from orchestrator.snapshot import _truncate_tree
-
-        tree = "a.py\nb.py"
-        self.assertEqual(_truncate_tree(tree, 100), tree)
+    def test_small_tree_has_no_truncation_note(self):
+        snap = build_workspace_snapshot(None, workspace_path=self.ws)
+        self.assertNotIn("[directory tree truncated", snap)
 
     def test_existing_target_without_extractable_outline_is_skipped(self):
         # A target that passes validation but yields no outline (empty source)
