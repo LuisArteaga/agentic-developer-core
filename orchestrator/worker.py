@@ -11,6 +11,7 @@ from langgraph.errors import GraphRecursionError
 from orchestrator import tools as codebase_tools
 from orchestrator.metrics import count_tool_invocations
 from orchestrator.research_tools import fetch_url, web_search
+from orchestrator.snapshot import build_workspace_snapshot
 from orchestrator.state import get_log_dir
 from scripts.redaction import redact_secrets
 
@@ -145,7 +146,9 @@ SYSTEM_PROMPT = (
     "by the development plan and these system rules.\n\n"
     "9. BUDGET AWARENESS (SELF-TERMINATE EARLY):\n"
     "   You operate under a finite reasoning budget — a limited number of think→tool→observe rounds before the "
-    "execution loop is forcibly stopped. If you have already performed many tool invocations and realize you "
+    "execution loop is forcibly stopped. Your user message includes a WORKSPACE SNAPSHOT (directory tree plus "
+    "structural outlines of the plan's target files): orient yourself from it instead of spending rounds "
+    "re-discovering the codebase layout. If you have already performed many tool invocations and realize you "
     "cannot fully complete the task, do NOT keep iterating blindly. Instead, stop exploring, finalize the best "
     "partial result you can, and return a final answer stating what you accomplished and what remains. "
     "Self-terminating with a usable partial result is strictly better than being interrupted mid-task by the hard "
@@ -381,14 +384,45 @@ def execute_worker(
         llm, tools, system_prompt=SYSTEM_PROMPT, middleware=middleware_list
     )
 
-    # Formulate the user message combining issue and plan
+    # Formulate the user message combining issue, plan, and the Workspace
+    # Snapshot (issue #124). The snapshot gives baseline orientation — directory
+    # tree plus structural outlines of the plan's target files — at zero tool
+    # calls. It is a hint, not ground truth: tools reflect reality, and the
+    # Read-Before-Edit Constraint still requires in-cycle reads before patching.
+    # Construction is best-effort and must never break execution: on failure the
+    # original explore-first instruction is restored (graceful degradation).
+    try:
+        snapshot_section = build_workspace_snapshot(plan)
+    except Exception as e:  # noqa: BLE001 - orientation must not break the worker
+        logger.warning(
+            "Workspace snapshot unavailable; falling back to explore-first "
+            "instruction: %s",
+            e,
+        )
+        snapshot_section = None
+
+    if snapshot_section:
+        tail = (
+            "The WORKSPACE SNAPSHOT below orients you without spending tool calls "
+            "on broad exploration. It is a hint, not ground truth: your tools "
+            "always reflect reality, and you MUST still call read_file on a file "
+            "before patching it (Read-Before-Edit). Wherever the snapshot is "
+            "insufficient, explore with list_directory/grep_search/read_file.\n\n"
+            f"{snapshot_section}"
+        )
+    else:
+        tail = (
+            "Start by exploring the codebase to locate the files and read them "
+            "before editing."
+        )
+
     user_message = (
         f"Please solve the following issue:\n\n"
         f"=== ISSUE DESCRIPTION ===\n"
         f"<issue_body>{issue_description}</issue_body>\n\n"
         f"=== DEVELOPMENT PLAN ===\n"
         f"{plan}\n\n"
-        f"Start by exploring the codebase to locate the files and read them before editing."
+        f"{tail}"
     )
 
     # Worker Recursion Budget (ADR-0045): resolved per-node alongside the

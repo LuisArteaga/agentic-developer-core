@@ -67,33 +67,38 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FACTORY_JSON_PATH = _PROJECT_ROOT / "config" / "factory.json"
 
 
-def _load_factory_config(filepath: Path = FACTORY_JSON_PATH) -> dict[str, Any]:
+def _load_factory_config(filepath: Path | None = None) -> dict[str, Any]:
     """Load and parse config/factory.json. Returns an empty dict on missing or
     malformed files, logging a warning. Never raises — the resolver degrades
     gracefully to DEFAULT_MODEL.
+
+    ``filepath`` defaults to the module-level FACTORY_JSON_PATH resolved at
+    call time, so tests can redirect the public resolution chain to a temp
+    factory file by patching that constant.
 
     No caching: the orchestrator is a single long-lived process, but
     resolve_model_config is called only ~10 times per issue cycle. Parsing a
     small JSON file is microseconds; caching would add invalidation
     complexity for no measurable benefit.
     """
-    if not filepath.exists():
+    path = filepath if filepath is not None else FACTORY_JSON_PATH
+    if not path.exists():
         logger.warning(
             "Factory configuration not found at %s; falling back to default "
             "model %s for all nodes.",
-            filepath,
+            path,
             DEFAULT_MODEL,
         )
         return {}
 
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         logger.warning(
             "Factory configuration at %s is malformed (%s); falling back to "
             "default model %s for all nodes.",
-            filepath,
+            path,
             e,
             DEFAULT_MODEL,
         )
@@ -103,7 +108,7 @@ def _load_factory_config(filepath: Path = FACTORY_JSON_PATH) -> dict[str, Any]:
         logger.warning(
             "Factory configuration at %s is not a JSON object; falling back "
             "to default model %s for all nodes.",
-            filepath,
+            path,
             DEFAULT_MODEL,
         )
         return {}

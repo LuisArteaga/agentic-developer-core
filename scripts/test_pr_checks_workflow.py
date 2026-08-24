@@ -26,6 +26,7 @@ WORKFLOW_PATH = (
 
 PYTEST_STEP = "Run Pytest Coverage Check"
 GATE_STEP = "Run Diff Coverage Gate"
+REVIEW_STEP = "Run LLM review"
 
 
 def _load_workflow() -> dict[str, Any]:
@@ -137,3 +138,18 @@ def test_gate_step_runs_unconditionally_after_pytest() -> None:
     no_if_condition = "if" not in gate
     assert no_if_condition, "no `if:` — after pytest failure the job is red"
     assert not gate.get("continue-on-error"), "the gate is a hard check"
+
+
+def test_llm_review_skipped_when_deterministic_checks_fail() -> None:
+    # Cost control: the LLM judges run only when every deterministic gate
+    # above them is green. A failing lint/mypy/pytest/diff-coverage step
+    # already blocks the merge deterministically, so a judge pass over that
+    # diff adds token cost without authority. (The former `if: always()`
+    # was a pre-ADR-0025/ADR-0052 visibility fallback; observed 2026-08 on
+    # PR #153: a diff-coverage failure still triggered a full judge review.)
+    review = _step_by_name(_load_workflow(), REVIEW_STEP)
+    # Boolean variables + short messages: stable across ruff formatter
+    # versions (see PR #151).
+    uses_default_gating = "if" not in review
+    assert uses_default_gating, "LLM review must run only on green gates"
+    assert not review.get("continue-on-error"), "a failed judge run fails the job"

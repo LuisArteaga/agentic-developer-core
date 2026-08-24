@@ -403,19 +403,48 @@ class TestWorkerAgent(unittest.TestCase):
         self.assertEqual(config["recursion_limit"], 7)
 
     @unittest.mock.patch("orchestrator.worker.create_agent")
-    def test_success_path_uses_default_recursion_limit(self, mock_create_agent):
-        """Without overrides, the default recursion_limit (50) is applied."""
+    def test_success_path_uses_factory_recursion_limit(self, mock_create_agent):
+        """Without env overrides, the explicit factory.json recursion_limit for
+        the node (issue #124: 100 for execute/test_writer) is applied."""
         mock_agent = MagicMock()
         mock_agent.stream.return_value = iter(
             [{"messages": [AIMessage(content="done")]}]
         )
         mock_create_agent.return_value = mock_agent
 
-        # Clear any stray env override so the default is used.
+        # Clear any stray env override so the factory value is used.
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("EXECUTE_RECURSION_LIMIT", None)
             os.environ.pop("AGENT_RECURSION_LIMIT", None)
             execute_worker(issue_description="x", plan="y", node_name="execute")
+
+        config = mock_agent.stream.call_args.kwargs["config"]
+        self.assertEqual(config["recursion_limit"], 100)
+
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    def test_fallback_default_when_factory_lacks_recursion_limit(
+        self, mock_create_agent
+    ):
+        """When factory.json lacks a recursion_limit for the node, the
+        DEFAULT_RECURSION_LIMIT (50) fallback applies (ADR-0045). Exercised
+        through the public configuration-resolution chain: a real temp
+        factory.json (execute entry without recursion_limit) is injected by
+        patching the FACTORY_JSON_PATH constant, so actual file loading and
+        resolution precedence are under test."""
+        factory_path = Path(self.logs_temp.name) / "factory.json"
+        factory_path.write_text(json.dumps({"execute": {"model": "any/model"}}))
+
+        mock_agent = MagicMock()
+        mock_agent.stream.return_value = iter(
+            [{"messages": [AIMessage(content="done")]}]
+        )
+        mock_create_agent.return_value = mock_agent
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("EXECUTE_RECURSION_LIMIT", None)
+            os.environ.pop("AGENT_RECURSION_LIMIT", None)
+            with patch("orchestrator.config.FACTORY_JSON_PATH", factory_path):
+                execute_worker(issue_description="x", plan="y", node_name="execute")
 
         config = mock_agent.stream.call_args.kwargs["config"]
         self.assertEqual(config["recursion_limit"], 50)
@@ -814,3 +843,111 @@ class TestExecuteWorkerLoopDetection(unittest.TestCase):
         # The worker trace sidecar still runs on the partial trajectory.
         trace_path = Path(os.environ["AGENT_LOG_PATH"]) / "worker_trace_13_1.jsonl"
         self.assertTrue(trace_path.exists())
+
+
+class TestWorkerWorkspaceSnapshot(unittest.TestCase):
+    """The Workspace Snapshot (issue #124) is injected into the Execute/
+    Test-Writer user message, replacing the explore-first instruction, and its
+    construction degrades gracefully instead of breaking the worker."""
+
+    def setUp(self):
+        self.original_api_key = os.environ.get("OPENROUTER_API_KEY")
+        os.environ["OPENROUTER_API_KEY"] = "mock-key"
+        self.original_log_path = os.environ.get("AGENT_LOG_PATH")
+        self.logs_temp = tempfile.TemporaryDirectory()
+        os.environ["AGENT_LOG_PATH"] = self.logs_temp.name
+
+        # Minimal target workspace: one Python module the plan localizes.
+        self.ws_temp = tempfile.TemporaryDirectory()
+        workspace = Path(self.ws_temp.name)
+        (workspace / "app.py").write_text(
+            "class Greeter:\n"
+            "    def greet(self, name: str) -> str:\n"
+            "        return name\n",
+            encoding="utf-8",
+        )
+        self.plan_json = json.dumps(
+            {
+                "rationale": "r",
+                "tasks": [
+                    {
+                        "step_number": 1,
+                        "action": "patch",
+                        "description": "extend Greeter",
+                        "target_files": ["app.py"],
+                    }
+                ],
+            }
+        )
+
+    def tearDown(self):
+        if self.original_api_key is not None:
+            os.environ["OPENROUTER_API_KEY"] = self.original_api_key
+        elif "OPENROUTER_API_KEY" in os.environ:
+            del os.environ["OPENROUTER_API_KEY"]
+        if self.original_log_path is not None:
+            os.environ["AGENT_LOG_PATH"] = self.original_log_path
+        elif "AGENT_LOG_PATH" in os.environ:
+            del os.environ["AGENT_LOG_PATH"]
+        self.logs_temp.cleanup()
+        self.ws_temp.cleanup()
+
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    @unittest.mock.patch(
+        "orchestrator.snapshot.get_workspace_root",
+    )
+    def test_user_message_contains_workspace_snapshot(
+        self, mock_ws_root, mock_create_agent
+    ):
+        mock_ws_root.return_value = Path(self.ws_temp.name)
+        mock_agent = MagicMock()
+        mock_agent.stream.return_value = iter([{"messages": [AIMessage(content="ok")]}])
+        mock_create_agent.return_value = mock_agent
+
+        execute_worker(issue_description="x", plan=self.plan_json, node_name="execute")
+
+        initial = mock_agent.stream.call_args.args[0]["messages"][0]
+        user_text = initial[1]
+        self.assertIn("=== WORKSPACE SNAPSHOT ===", user_text)
+        self.assertIn("Directory tree:", user_text)
+        self.assertIn("app.py", user_text)
+        self.assertIn("def greet(self, name: str) -> str:", user_text)
+        # The explore-first instruction is replaced when a snapshot exists.
+        self.assertNotIn("Start by exploring the codebase", user_text)
+
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    @unittest.mock.patch(
+        "orchestrator.snapshot.get_workspace_root",
+    )
+    def test_test_writer_node_receives_snapshot_too(
+        self, mock_ws_root, mock_create_agent
+    ):
+        mock_ws_root.return_value = Path(self.ws_temp.name)
+        mock_agent = MagicMock()
+        mock_agent.stream.return_value = iter([{"messages": [AIMessage(content="ok")]}])
+        mock_create_agent.return_value = mock_agent
+
+        execute_worker(
+            issue_description="x", plan=self.plan_json, node_name="test_writer"
+        )
+
+        initial = mock_agent.stream.call_args.args[0]["messages"][0]
+        self.assertIn("=== WORKSPACE SNAPSHOT ===", initial[1])
+
+    @unittest.mock.patch("orchestrator.worker.build_workspace_snapshot")
+    @unittest.mock.patch("orchestrator.worker.create_agent")
+    def test_snapshot_failure_falls_back_to_explore_first_instruction(
+        self, mock_create_agent, mock_build_snapshot
+    ):
+        mock_build_snapshot.side_effect = RuntimeError("disk on fire")
+        mock_agent = MagicMock()
+        mock_agent.stream.return_value = iter([{"messages": [AIMessage(content="ok")]}])
+        mock_create_agent.return_value = mock_agent
+
+        result = execute_worker(issue_description="x", plan=self.plan_json)
+
+        self.assertEqual(result, "ok")  # execution was not broken
+        initial = mock_agent.stream.call_args.args[0]["messages"][0]
+        user_text = initial[1]
+        self.assertIn("Start by exploring the codebase", user_text)
+        self.assertNotIn("WORKSPACE SNAPSHOT", user_text)

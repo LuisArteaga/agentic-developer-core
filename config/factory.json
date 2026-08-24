@@ -8,12 +8,14 @@
   "test_writer": {
     "model": "moonshotai/kimi-k2.7-code",
     "routing": ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"],
-    "temperature": 0.0
+    "temperature": 0.0,
+    "recursion_limit": 100
   },
   "execute": {
     "model": "moonshotai/kimi-k2.7-code",
     "routing": ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"],
-    "temperature": 0.0
+    "temperature": 0.0,
+    "recursion_limit": 100
   },
   "syntax_lint": {
     "model": "moonshotai/kimi-k2.7-code",
