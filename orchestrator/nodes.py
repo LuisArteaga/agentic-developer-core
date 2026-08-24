@@ -2066,6 +2066,34 @@ def _post_pr_comment(github_repo: str, pr_num: int, body: str) -> None:
         )
 
 
+def _parse_env_flag(name: str, default: bool) -> bool:
+    """Parse a boolean ``AGENT_*`` environment flag (ADR-0053).
+
+    Accepts case-insensitive ``1/true/yes/on`` and ``0/false/no/off``. An
+    unset or blank variable yields ``default``. A malformed value degrades to
+    the default with a warning — the same warn-and-degrade posture as the
+    factory config loader — rather than crashing the node on an optional
+    operational knob. The fallback direction is deliberately the safe one:
+    judges stay enabled, preserving ADR-0014 semantics.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    logger.warning(
+        "Environment variable %s has unrecognized value '%s'; falling back to "
+        "default (%s).",
+        name,
+        raw,
+        default,
+    )
+    return default
+
+
 def merge_node(state: AgentState) -> AgentState:
     """Polls the PR merge status and LLM Judge review comments.
 
@@ -2078,6 +2106,16 @@ def merge_node(state: AgentState) -> AgentState:
     the previous silent re-queue. A successful merge transitions to ``done``;
     a poll timeout (no actionable verdict) transitions to ``failed``/recovery
     unchanged.
+
+    Interim no-judge mode (``AGENT_JUDGE_ENABLED=false``, ADR-0053): the phase
+    waits only for an external (human/policy) merge — verdict parsing, judge
+    trust resolution, and freshness anchoring are skipped entirely, and the
+    machine-scale ``AGENT_MERGE_POLL_TIMEOUT`` is replaced by the human-scale
+    ``AGENT_NO_JUDGE_MERGE_TIMEOUT`` (non-positive = wait indefinitely). An
+    elapsed window pauses the run *resumably* (status stays ``"merging"``;
+    Stateful Resume routes back here) instead of producing a misleading
+    poll-timeout failure. The default (flag unset or truthy) preserves
+    ADR-0014 semantics exactly.
     """
     issue_num = state.get("issue_number")
     if issue_num is None:
@@ -2088,6 +2126,12 @@ def merge_node(state: AgentState) -> AgentState:
     branch_name = state["branch"]
     if not branch_name:
         raise ValueError("Cannot run Merge-Node: 'branch' is not set in the state.")
+
+    # Mode is resolved once per Merge-Node entry, before any API call, so
+    # resume behavior is deterministic (ADR-0053 edge case): whatever the
+    # environment says at (re-)entry wins — the persisted state carries no
+    # mode marker, making mid-run toggles well-defined across invocations.
+    judge_enabled = _parse_env_flag("AGENT_JUDGE_ENABLED", True)
 
     logger.info("Starting Merge phase for issue #%d...", issue_num)
 
@@ -2120,55 +2164,94 @@ def merge_node(state: AgentState) -> AgentState:
 
         pr_num = pulls[0]["number"]
 
-        # 2. Determine trusted judge username to prevent review spoofing
-        trusted_user = os.getenv("AGENT_TRUSTED_JUDGE_USER")
-        if not trusted_user:
-            try:
-                curr_user_data = _github_api_request("GET", "/user")
-                if not isinstance(curr_user_data, dict):
-                    raise RuntimeError(
-                        "expected a dict from the GitHub API, got "
-                        + type(curr_user_data).__name__
-                    )
-                trusted_user = curr_user_data.get("login")
-            except Exception:
-                trusted_user = os.getenv("GITHUB_ACTOR")
+        # 2. Determine trusted judge username to prevent review spoofing.
+        # Skipped entirely in no-judge mode — no verdicts are parsed, so no
+        # trust anchor is needed (and the /user lookup would be log spam).
+        trusted_user = None
+        if judge_enabled:
+            trusted_user = os.getenv("AGENT_TRUSTED_JUDGE_USER")
+            if not trusted_user:
+                try:
+                    curr_user_data = _github_api_request("GET", "/user")
+                    if not isinstance(curr_user_data, dict):
+                        raise RuntimeError(
+                            "expected a dict from the GitHub API, got "
+                            + type(curr_user_data).__name__
+                        )
+                    trusted_user = curr_user_data.get("login")
+                except Exception:
+                    trusted_user = os.getenv("GITHUB_ACTOR")
 
-        if trusted_user:
-            logger.info("Only trusting PR reviews authored by: '%s'", trusted_user)
-        else:
-            logger.warning(
-                "Could not determine trusted judge username. Review author verification skipped."
-            )
+            if trusted_user:
+                logger.info("Only trusting PR reviews authored by: '%s'", trusted_user)
+            else:
+                logger.warning(
+                    "Could not determine trusted judge username. Review author verification skipped."
+                )
 
         # 3. Polling loop
         poll_interval = int(os.getenv("AGENT_MERGE_POLL_INTERVAL", "10"))
-        poll_timeout = int(os.getenv("AGENT_MERGE_POLL_TIMEOUT", "300"))
+        # Timeout selection (ADR-0053 edge case): in no-judge mode the
+        # human-scale AGENT_NO_JUDGE_MERGE_TIMEOUT fully replaces the
+        # machine-scale AGENT_MERGE_POLL_TIMEOUT (which is not consulted at
+        # all). A non-positive value disables the window: the loop waits for
+        # an external merge indefinitely, per the documented operational
+        # expectation that a human merges or aborts the run.
+        if judge_enabled:
+            poll_timeout: int | None = int(os.getenv("AGENT_MERGE_POLL_TIMEOUT", "300"))
+        else:
+            try:
+                no_judge_window = int(
+                    os.getenv("AGENT_NO_JUDGE_MERGE_TIMEOUT", "86400")
+                )
+            except ValueError:
+                logger.warning(
+                    "Environment variable AGENT_NO_JUDGE_MERGE_TIMEOUT has "
+                    "non-integer value '%s'; falling back to default (86400).",
+                    os.getenv("AGENT_NO_JUDGE_MERGE_TIMEOUT"),
+                )
+                no_judge_window = 86400
+            poll_timeout = no_judge_window if no_judge_window > 0 else None
 
         start_time = time.time()
-        logger.info(
-            "Polling PR #%d status (timeout: %ds, interval: %ds)...",
-            pr_num,
-            poll_timeout,
-            poll_interval,
-        )
+        if poll_timeout is None:
+            logger.info(
+                "Polling PR #%d status (no-judge mode, waiting indefinitely "
+                "for external merge, interval: %ds)...",
+                pr_num,
+                poll_interval,
+            )
+        else:
+            logger.info(
+                "Polling PR #%d status (%stimeout: %ds, interval: %ds)...",
+                pr_num,
+                "" if judge_enabled else "no-judge mode, ",
+                poll_timeout,
+                poll_interval,
+            )
 
         pr_merged = False
         failure_reason = None
+        verdicts: dict[str, str | None] = {}
         # Body of the qualifying review that carried the parsed verdict block
         # (newest wins), retained so actionable findings can be extracted from
-        # it when the merge-fix loop is triggered (ADR-0036).
+        # it when the merge-fix loop is triggered (ADR-0036). Remains None in
+        # no-judge mode, which keeps the post-loop actionable-verdict check
+        # deterministically False.
         verdict_review_body: str | None = None
 
-        # Determine reference time to anchor freshness (push time recorded by orchestrator)
-        pushed_at_str = state.get("pushed_at")
-        if pushed_at_str:
-            ref_time = _parse_iso_datetime(pushed_at_str)
-        else:
-            commit_time_str = get_commit_time(workspace_path, "HEAD")
-            ref_time = _parse_iso_datetime(commit_time_str)
+        # Determine reference time to anchor freshness (push time recorded by orchestrator).
+        # Judge-mode only: freshness filtering exists to gate verdict blocks.
+        ref_time: datetime.datetime | None = None
+        if judge_enabled:
+            pushed_at_str = state.get("pushed_at")
+            if pushed_at_str:
+                ref_time = _parse_iso_datetime(pushed_at_str)
+            else:
+                commit_time_str = get_commit_time(workspace_path, "HEAD")
+                ref_time = _parse_iso_datetime(commit_time_str)
 
-        while time.time() - start_time < poll_timeout:
+        while poll_timeout is None or time.time() - start_time < poll_timeout:
             # Fetch latest PR data
             pr_data = _github_api_request("GET", f"/repos/{github_repo}/pulls/{pr_num}")
             if not isinstance(pr_data, dict):
@@ -2186,81 +2269,120 @@ def merge_node(state: AgentState) -> AgentState:
                 failure_reason = f"PR #{pr_num} was closed without being merged."
                 break
 
-            reviews = _github_api_request(
-                "GET", f"/repos/{github_repo}/pulls/{pr_num}/reviews"
-            )
+            # Verdict parsing runs only in judge mode; in no-judge mode the
+            # reviews endpoint is never fetched (no judge-keys log spam) and
+            # the parsing logic itself is untouched behind this gate.
+            if judge_enabled:
+                reviews = _github_api_request(
+                    "GET", f"/repos/{github_repo}/pulls/{pr_num}/reviews"
+                )
 
-            judge_keys = ["syntax_lint", "test_coverage", "architecture", "security"]
-            verdicts = {k: None for k in judge_keys}
-            block_found = False
-            verdict_block_re = re.compile(
-                r"<!--\s*llm-pr-review-verdicts\s*\n(.*?)-->", re.DOTALL
-            )
-            verdict_line_re = re.compile(r"^(\w+):\s*(PASS|FAIL|NEEDS REVIEW)\s*$")
+                judge_keys = [
+                    "syntax_lint",
+                    "test_coverage",
+                    "architecture",
+                    "security",
+                ]
+                verdicts = {k: None for k in judge_keys}
+                block_found = False
+                verdict_block_re = re.compile(
+                    r"<!--\s*llm-pr-review-verdicts\s*\n(.*?)-->", re.DOTALL
+                )
+                verdict_line_re = re.compile(r"^(\w+):\s*(PASS|FAIL|NEEDS REVIEW)\s*$")
 
-            for r in reviews:
-                submitted_at_str = r.get("submitted_at")
-                if not submitted_at_str:
-                    continue
-                submitted_dt = _parse_iso_datetime(submitted_at_str)
-
-                # Verify review author is the trusted judge user to prevent spoofing
-                reviewer = r.get("user", {}).get("login")
-                if trusted_user and reviewer != trusted_user:
-                    logger.debug("Ignoring review from untrusted user '%s'", reviewer)
-                    continue
-
-                # Only check reviews posted after the trusted reference/push time
-                if submitted_dt >= ref_time:
-                    body = r.get("body") or ""
-                    block_match = verdict_block_re.search(body)
-                    if not block_match:
+                for r in reviews:
+                    submitted_at_str = r.get("submitted_at")
+                    if not submitted_at_str:
                         continue
-                    block_found = True
-                    inner = block_match.group(1)
-                    parsed = {}
-                    for line in inner.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        line_match = verdict_line_re.match(line)
-                        if line_match:
-                            parsed[line_match.group(1)] = line_match.group(2)
-                    # Later qualifying reviews overwrite earlier ones (newest wins).
-                    for k in judge_keys:
-                        if k in parsed:
-                            verdicts[k] = parsed[k]
-                        else:
-                            verdicts[k] = "NEEDS REVIEW"
-                    # Retain the body of the newest qualifying review so its
-                    # [SEVERITY]-tagged findings can be extracted on an
-                    # actionable verdict (ADR-0036).
-                    verdict_review_body = body
+                    submitted_dt = _parse_iso_datetime(submitted_at_str)
 
-            # Only block when we have actually parsed a hidden verdict block.
-            if block_found:
-                for k in judge_keys:
-                    if verdicts[k] in ("FAIL", "NEEDS REVIEW"):
-                        failure_reason = (
-                            f"PR review block: {k} check verdict is '{verdicts[k]}'."
+                    # Verify review author is the trusted judge user to prevent spoofing
+                    reviewer = r.get("user", {}).get("login")
+                    if trusted_user and reviewer != trusted_user:
+                        logger.debug(
+                            "Ignoring review from untrusted user '%s'", reviewer
                         )
+                        continue
+
+                    # Only check reviews posted after the trusted reference/push time
+                    assert ref_time is not None
+                    if submitted_dt >= ref_time:
+                        body = r.get("body") or ""
+                        block_match = verdict_block_re.search(body)
+                        if not block_match:
+                            continue
+                        block_found = True
+                        inner = block_match.group(1)
+                        parsed = {}
+                        for line in inner.splitlines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            line_match = verdict_line_re.match(line)
+                            if line_match:
+                                parsed[line_match.group(1)] = line_match.group(2)
+                        # Later qualifying reviews overwrite earlier ones (newest wins).
+                        for k in judge_keys:
+                            if k in parsed:
+                                verdicts[k] = parsed[k]
+                            else:
+                                verdicts[k] = "NEEDS REVIEW"
+                        # Retain the body of the newest qualifying review so its
+                        # [SEVERITY]-tagged findings can be extracted on an
+                        # actionable verdict (ADR-0036).
+                        verdict_review_body = body
+
+                # Only block when we have actually parsed a hidden verdict block.
+                if block_found:
+                    for k in judge_keys:
+                        if verdicts[k] in ("FAIL", "NEEDS REVIEW"):
+                            failure_reason = f"PR review block: {k} check verdict is '{verdicts[k]}'."
+                            break
+                    if failure_reason:
                         break
-                if failure_reason:
-                    break
 
             if failure_reason is None:
-                logger.info(
-                    "PR #%d is still open. LLM Judge verdicts: syntax_lint='%s', test_coverage='%s', architecture='%s', security='%s'. Sleeping %ds...",
-                    pr_num,
-                    verdicts["syntax_lint"],
-                    verdicts["test_coverage"],
-                    verdicts["architecture"],
-                    verdicts["security"],
-                    poll_interval,
-                )
+                if judge_enabled:
+                    logger.info(
+                        "PR #%d is still open. LLM Judge verdicts: syntax_lint='%s', test_coverage='%s', architecture='%s', security='%s'. Sleeping %ds...",
+                        pr_num,
+                        verdicts["syntax_lint"],
+                        verdicts["test_coverage"],
+                        verdicts["architecture"],
+                        verdicts["security"],
+                        poll_interval,
+                    )
+                else:
+                    logger.info(
+                        "PR #%d is still open. No-judge mode: waiting for external merge. Sleeping %ds...",
+                        pr_num,
+                        poll_interval,
+                    )
                 time.sleep(poll_interval)
 
         if not pr_merged:
+            if not failure_reason and not judge_enabled:
+                # Interim no-judge mode (ADR-0053): the human-review window
+                # elapsed without an external merge. This is an expected
+                # operational state, not a failure: pause resumably by leaving
+                # status/phase as "merging" (route_after_merge ends this graph
+                # run; Stateful Resume routes the next invocation back here).
+                # Recovery is deliberately NOT triggered — the issue keeps its
+                # agent-in-progress label and the workspace keeps its branch.
+                window_desc = (
+                    "no time limit"
+                    if poll_timeout is None
+                    else f"window of {poll_timeout}s"
+                )
+                logger.info(
+                    "No-judge merge %s elapsed for PR #%d without an external "
+                    "merge. Pausing in resumable state 'merging'; the next "
+                    "orchestrator invocation resumes Merge Polling.",
+                    window_desc,
+                    pr_num,
+                )
+                state_module.save(state)
+                return state
             if not failure_reason:
                 failure_reason = f"Polling timed out after {poll_timeout} seconds."
             logger.error("Merge phase failed: %s", failure_reason)

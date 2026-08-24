@@ -155,7 +155,9 @@ Copy [`.env.example`](.env.example) to `.env` for the full environment surface. 
 | `AGENT_VERIFY_TIMEOUT` | Timeout in seconds for the verify command (default `300`); must not be blank. |
 | `AGENT_TRUSTED_JUDGE_USER` | GitHub login that must author a PR Review Judge review for the Merge-Node to trust it (spoofing guard, ADR-0014). Must equal the owner of the target repo's `JUDGE_GH_TOKEN`. If unset, the Merge-Node falls back to the orchestrator's own identity and ignores reviews posted under another account. See [target-repo judge setup](docs/target-repo-judge-setup.md). |
 | `AGENT_MERGE_POLL_INTERVAL` | Seconds between Merge-Node polls of target-repo PR reviews (default `10`). |
-| `AGENT_MERGE_POLL_TIMEOUT` | Max seconds the Merge-Node polls before escalating to recovery (default `300`). A target repo without the [Reusable Judge Workflow](docs/target-repo-judge-setup.md) installed will hit this timeout. |
+| `AGENT_MERGE_POLL_TIMEOUT` | Max seconds the Merge-Node polls for judge verdicts before escalating to recovery (default `300`). Only consulted when judges are enabled. |
+| `AGENT_JUDGE_ENABLED` | Set to `false` for the interim [No-Judge Merge Mode](CONTEXT.md): the Merge-Node waits only for an external (human/policy) merge — no verdict parsing, no judge-trust lookup. Unset or `true` preserves judge-based blocking (ADR-0014) exactly. Interim until the [Reusable Judge Workflow](docs/target-repo-judge-setup.md) ships (#132); see ADR-0053. |
+| `AGENT_NO_JUDGE_MERGE_TIMEOUT` | Human-review-scale merge window in seconds for No-Judge Merge Mode (default `86400` = 24 h); fully replaces `AGENT_MERGE_POLL_TIMEOUT` while `AGENT_JUDGE_ENABLED=false`. A non-positive value waits indefinitely — a human merges or aborts. An elapsed window pauses the run resumably (`merging`) instead of failing; Stateful Resume re-enters the merge phase on the next invocation (ADR-0053). |
 
 **Issue label lifecycle**: `agent-ready` → `agent-in-progress` (claimed) / `agent-blocked` (open dependencies) → `agent-ready` (dependencies closed, or recovery after failure).
 
