@@ -87,10 +87,23 @@ jobs:
       - name: Run Pytest Coverage Check
         # --cov=scripts so the changed production code in scripts/review.py
         # (the LLM judge itself) appears in the coverage report consumed by the
-        # Test Coverage PR Review Judge. See ADR-0030.
+        # Test Coverage PR Review Judge. See ADR-0030. The additional JSON
+        # report (coverage.json) feeds the Diff Coverage Gate below; both
+        # reports come from this single test run.
         run: |
           set -o pipefail
-          pytest --cov=orchestrator --cov=scripts --cov-report=term-missing --cov-fail-under=89 2>&1 | tee "$CI_COVERAGE_OUTPUT_PATH"
+          pytest --cov=orchestrator --cov=scripts --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=89 2>&1 | tee "$CI_COVERAGE_OUTPUT_PATH"
+
+      - name: Run Diff Coverage Gate
+        # Deterministic hard check (ADR-0052): fails the job when any
+        # production line added by this branch's diff is not exercised by
+        # the tests — before any LLM judge tokens are spent. The base SHA
+        # comes from the event payload so non-default bases and forked heads
+        # resolve correctly; the script resolves the merge-base itself
+        # (requires fetch-depth: 0 on checkout). No `if: always()` — if
+        # pytest failed, the job is already red, and this gate consumes the
+        # coverage.json that run produces.
+        run: python3 scripts/diff_coverage_gate.py --coverage-json coverage.json --base ${{ github.event.pull_request.base.sha }}
 
       - name: Run Semgrep Security Scan
         run: semgrep scan orchestrator scripts --config=auto --error
