@@ -108,9 +108,11 @@ def test_gate_step_invokes_script_against_event_payload_base() -> None:
     run = str(_step_by_name(_load_workflow(), GATE_STEP)["run"])
     assert "scripts/diff_coverage_gate.py" in run, "gate script not invoked"
     assert "--coverage-json coverage.json" in run, "gate report path not passed"
-    assert (
-        "${{ github.event.pull_request.base.sha }}" in run
-    ), "base SHA must come from the event payload (non-default bases, forks)"
+    # Base SHA must come from the event payload so non-default base branches
+    # and forked-head PRs resolve correctly; a hardcoded branch name breaks
+    # both. Single-line asserts are stable across ruff formatter versions.
+    uses_event_payload_base = "${{ github.event.pull_request.base.sha }}" in run
+    assert uses_event_payload_base, "base SHA must come from the event payload"
     assert "--base main" not in run, "base branch must never be hardcoded"
 
 
@@ -119,10 +121,8 @@ def test_gate_step_runs_unconditionally_after_pytest() -> None:
     steps = _steps(wf)
     names = [s.get("name") for s in steps]
     gate = _step_by_name(wf, GATE_STEP)
-    assert (
-        names.index(GATE_STEP) == names.index(PYTEST_STEP) + 1
-    ), "gate must run directly after the pytest step that writes its report"
-    assert (
-        "if" not in gate
-    ), "no `if:` condition — after a pytest failure the job is already red"
+    gate_directly_after_pytest = names.index(GATE_STEP) == names.index(PYTEST_STEP) + 1
+    assert gate_directly_after_pytest, "gate must run directly after pytest"
+    no_if_condition = "if" not in gate
+    assert no_if_condition, "no `if:` — after pytest failure the job is red"
     assert not gate.get("continue-on-error"), "the gate is a hard check"
