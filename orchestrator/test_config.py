@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -941,6 +942,320 @@ class TestRealFactoryJson(unittest.TestCase):
         for node in ["plan", "test_writer", "execute"]:
             self.assertIn(node, DEFAULT_ROUTING, f"{node} missing from DEFAULT_ROUTING")
             self.assertGreater(len(DEFAULT_ROUTING[node]), 0)
+
+
+class TestResolutionSourceTierLogging(unittest.TestCase):
+    """Tests for the resolution-source log line added by issue #126.
+
+    Every precedence path must report the tier that actually supplied each
+    value: the winning env var name (Model Config Override), "factory.json",
+    or the hardcoded default. Driven exclusively through public surfaces:
+    the resolution chain is redirected by patching the public
+    FACTORY_JSON_PATH constant at a real temp file — never by mocking
+    private helpers.
+
+    Each test resolves a synthetic probe node name that no other test (or
+    production code path) ever resolves, so the process-global log-once
+    registry has necessarily not seen it yet: first-resolution INFO semantics
+    are asserted through observable behavior alone, with no direct
+    manipulation of private module state. Assertions check values and tier
+    labels co-occurring in a record, not exact log-line wording, so
+    alternative valid phrasings stay green.
+    """
+
+    _ENV_VARS = [
+        "AGENT_MODEL",
+        "OPENROUTER_API_KEY",
+        "LOG_PROBE_OVERRIDE_MODEL",
+        "LOG_PROBE_SECRET_MODEL",
+        "LOG_PROBE_EMPTY_MODEL",
+        "LOG_PROBE_EQUAL_MODEL",
+        "AGENT_RECURSION_LIMIT",
+        "LOG_PROBE_MALFORMED_RECURSION_LIMIT",
+        "LOG_PROBE_BUDGET_RECURSION_LIMIT",
+        "AGENT_LOOP_WARN_THRESHOLD",
+        "AGENT_LOOP_HARD_LIMIT",
+    ]
+
+    def setUp(self):
+        self.original_env = {}
+        for var in self._ENV_VARS:
+            self.original_env[var] = os.environ.get(var)
+            os.environ.pop(var, None)
+        # Redirect the public factory path constant at a per-test temp file;
+        # resolved at call time inside _load_factory_config.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.factory_path = Path(tmp.name) / "factory.json"
+        patcher = unittest.mock.patch(
+            "orchestrator.config.FACTORY_JSON_PATH", self.factory_path
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        for var, val in self.original_env.items():
+            if val is not None:
+                os.environ[var] = val
+            else:
+                os.environ.pop(var, None)
+
+    def _write_factory(self, content: dict | str) -> None:
+        """Write content to the patched factory path (dict as JSON, str raw)."""
+        if isinstance(content, dict):
+            self.factory_path.write_text(json.dumps(content), encoding="utf-8")
+        else:
+            self.factory_path.write_text(content, encoding="utf-8")
+
+    @staticmethod
+    def _info_messages(cm) -> list[str]:
+        return [r.getMessage() for r in cm.records if r.levelno == logging.INFO]
+
+    @staticmethod
+    def _msg_with(messages: list[str], *needles: str) -> str | None:
+        """First message containing every needle, else None.
+
+        Verifies that reported values and tier labels co-occur in one record
+        without pinning the surrounding log-line wording.
+        """
+        for message in messages:
+            if all(needle in message for needle in needles):
+                return message
+        return None
+
+    def test_node_env_override_logs_node_var_tier(self):
+        """An active {NODE}_MODEL override logs the Model Config Override tier."""
+        node = "log_probe_override"
+        self._write_factory({node: {"model": "moonshotai/kimi-k2.7-code"}})
+        os.environ["LOG_PROBE_OVERRIDE_MODEL"] = "z-ai/glm-5.2"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        self.assertEqual(cfg["model"], "z-ai/glm-5.2")
+        override_msg = self._msg_with(
+            self._info_messages(cm),
+            "Model Config Override",
+            "z-ai/glm-5.2",
+            "LOG_PROBE_OVERRIDE_MODEL",
+        )
+        self.assertIsNotNone(override_msg)
+
+    def test_no_secret_material_in_log_line(self):
+        """The resolution line never leaks unrelated secret env values."""
+        node = "log_probe_secret"
+        self._write_factory({})
+        os.environ["LOG_PROBE_SECRET_MODEL"] = "z-ai/glm-5.2"
+        os.environ["OPENROUTER_API_KEY"] = "sk-supersecret-value"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            resolve_model_config(node)
+        joined = "\n".join(r.getMessage() for r in cm.records)
+        self.assertNotIn("sk-supersecret-value", joined)
+        self.assertNotIn("OPENROUTER_API_KEY", joined)
+
+    def test_agent_env_override_logs_agent_tier(self):
+        """AGENT_MODEL winning the precedence reports the AGENT_MODEL tier."""
+        node = "log_probe_agent"
+        self._write_factory({})
+        os.environ["AGENT_MODEL"] = "qwen/qwen4-max"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        self.assertEqual(cfg["model"], "qwen/qwen4-max")
+        override_msg = self._msg_with(
+            self._info_messages(cm),
+            "Model Config Override",
+            "AGENT_MODEL",
+            "qwen/qwen4-max",
+        )
+        self.assertIsNotNone(override_msg)
+
+    def test_empty_node_var_falls_to_agent_tier(self):
+        """An empty-string node var does not win; AGENT_MODEL tier is reported."""
+        node = "log_probe_empty"
+        self._write_factory({})
+        os.environ["LOG_PROBE_EMPTY_MODEL"] = ""
+        os.environ["AGENT_MODEL"] = "qwen/qwen4-max"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        self.assertEqual(cfg["model"], "qwen/qwen4-max")
+        info = self._info_messages(cm)
+        self.assertIsNotNone(self._msg_with(info, "AGENT_MODEL", "qwen/qwen4-max"))
+        self.assertIsNone(self._msg_with(info, "LOG_PROBE_EMPTY_MODEL"))
+
+    def test_factory_resolution_logs_factory_tier(self):
+        """Factory resolution reports the factory.json tier without an override."""
+        node = "log_probe_factory"
+        self._write_factory(
+            {node: {"model": "moonshotai/kimi-k2.7-code", "routing": ["Together"]}}
+        )
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        self.assertEqual(cfg["model"], "moonshotai/kimi-k2.7-code")
+        info = "\n".join(self._info_messages(cm))
+        self.assertIsNotNone(
+            self._msg_with(
+                self._info_messages(cm), "moonshotai/kimi-k2.7-code", "factory.json"
+            )
+        )
+        self.assertNotIn("Override", info)
+
+    def test_missing_node_logs_default_model_tier(self):
+        """A node absent from the factory reports the DEFAULT_MODEL tier."""
+        node = "log_probe_absent"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        self.assertEqual(cfg["model"], DEFAULT_MODEL)
+        self.assertIsNotNone(
+            self._msg_with(self._info_messages(cm), DEFAULT_MODEL, "DEFAULT_MODEL")
+        )
+
+    def test_malformed_env_reports_tier_actually_used(self):
+        """A malformed env value is ignored; the reported tier is the next one."""
+        node = "log_probe_malformed"
+        self._write_factory(
+            {node: {"model": "m", "routing": ["X"], "recursion_limit": 99}}
+        )
+        os.environ["LOG_PROBE_MALFORMED_RECURSION_LIMIT"] = "not-an-int"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        self.assertEqual(cfg["recursion_limit"], 99)
+        info = self._info_messages(cm)
+        self.assertIsNotNone(self._msg_with(info, "99", "factory.json"))
+        self.assertIsNone(self._msg_with(info, "LOG_PROBE_MALFORMED_RECURSION_LIMIT"))
+
+    def test_malformed_factory_int_reports_default_tier(self):
+        """A malformed factory integer falls through; the default tier is reported."""
+        node = "log_probe_badint"
+        self._write_factory(
+            {
+                node: {
+                    "model": "m",
+                    "recursion_limit": "not-an-int",
+                    "loop_warn_threshold": "also-bad",
+                }
+            }
+        )
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        self.assertEqual(cfg["recursion_limit"], DEFAULT_RECURSION_LIMIT)
+        self.assertEqual(cfg["loop_warn_threshold"], DEFAULT_LOOP_WARN_THRESHOLD)
+        info = self._info_messages(cm)
+        self.assertIsNotNone(
+            self._msg_with(
+                info,
+                "loop_warn_threshold",
+                str(DEFAULT_LOOP_WARN_THRESHOLD),
+            )
+        )
+        self.assertIsNotNone(
+            self._msg_with(info, str(DEFAULT_RECURSION_LIMIT), "default")
+        )
+
+    def test_recursion_limit_env_override_reported(self):
+        """An env-overridden Recursion Budget names its winning env var."""
+        node = "log_probe_budget"
+        self._write_factory({})
+        os.environ["LOG_PROBE_BUDGET_RECURSION_LIMIT"] = "77"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        self.assertEqual(cfg["recursion_limit"], 77)
+        self.assertIsNotNone(
+            self._msg_with(
+                self._info_messages(cm), "77", "LOG_PROBE_BUDGET_RECURSION_LIMIT"
+            )
+        )
+
+    def test_agent_loop_threshold_override_reported(self):
+        """An env-overridden loop threshold names AGENT_LOOP_HARD_LIMIT."""
+        node = "log_probe_loop"
+        self._write_factory({})
+        os.environ["AGENT_LOOP_HARD_LIMIT"] = "9"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        self.assertEqual(cfg["loop_hard_limit"], 9)
+        self.assertIsNotNone(
+            self._msg_with(
+                self._info_messages(cm),
+                "loop_hard_limit",
+                "9",
+                "AGENT_LOOP_HARD_LIMIT",
+            )
+        )
+
+    def test_defaults_reported_for_loop_thresholds(self):
+        """Un-overridden loop thresholds report their default provenance."""
+        node = "log_probe_defaults"
+        self._write_factory({node: {"model": "m"}})
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        info = self._info_messages(cm)
+        self.assertIsNotNone(
+            self._msg_with(
+                info, "loop_warn_threshold", str(DEFAULT_LOOP_WARN_THRESHOLD)
+            )
+        )
+        self.assertIsNotNone(
+            self._msg_with(
+                info,
+                "loop_window_size",
+                str(DEFAULT_LOOP_WINDOW_SIZE),
+                "default",
+            )
+        )
+        self.assertEqual(cfg["loop_warn_threshold"], DEFAULT_LOOP_WARN_THRESHOLD)
+
+    def test_override_equal_to_factory_still_reports_env_tier(self):
+        """An env override naming the factory's model still reports the override.
+
+        The override is active and would mask subsequent factory.json edits,
+        so the log must attribute the model to the env tier, not the factory.
+        """
+        node = "log_probe_equal"
+        self._write_factory(
+            {node: {"model": "moonshotai/kimi-k2.7-code", "routing": ["X"]}}
+        )
+        os.environ["LOG_PROBE_EQUAL_MODEL"] = "moonshotai/kimi-k2.7-code"
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            resolve_model_config(node)
+        info = self._info_messages(cm)
+        self.assertIsNotNone(
+            self._msg_with(
+                info,
+                "Model Config Override",
+                "LOG_PROBE_EQUAL_MODEL",
+                "moonshotai/kimi-k2.7-code",
+            )
+        )
+        self.assertIsNone(self._msg_with(info, "factory.json"))
+
+    def test_repeat_resolution_downgraded_to_debug(self):
+        """The same node resolves ~10x per cycle; only the first logs INFO."""
+        node = "log_probe_repeat"
+        self._write_factory({node: {"model": "m"}})
+        with self.assertLogs("orchestrator.config", level="DEBUG") as cm:
+            resolve_model_config(node)
+            resolve_model_config(node)
+        self.assertEqual(len(self._info_messages(cm)), 1)
+        # The factory entry above avoids the absent-node fallback notice, so
+        # exactly one DEBUG record may carry the probe: the repeat's
+        # resolution-source line.
+        source_debug = [
+            r
+            for r in cm.records
+            if r.levelno == logging.DEBUG and node in r.getMessage()
+        ]
+        self.assertEqual(len(source_debug), 1)
+
+    def test_distinct_nodes_each_get_one_info_line(self):
+        """The log-once registry is per-node, not per-process-global."""
+        node_a = "log_probe_multi_a"
+        node_b = "log_probe_multi_b"
+        self._write_factory({})
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            resolve_model_config(node_a)
+            resolve_model_config(node_b)
+        nodes = self._info_messages(cm)
+        self.assertEqual(len(nodes), 2)
+        self.assertIn(node_a, nodes[0])
+        self.assertIn(node_b, nodes[1])
 
 
 if __name__ == "__main__":

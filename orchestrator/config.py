@@ -116,7 +116,9 @@ def _load_factory_config(filepath: Path | None = None) -> dict[str, Any]:
     return data
 
 
-def _resolve_recursion_limit(node_name: str, factory_cfg: dict | None) -> int:
+def _resolve_recursion_limit(
+    node_name: str, factory_cfg: dict | None
+) -> tuple[int, str]:
     """Resolve the per-node Worker Recursion Budget (ADR-0045).
 
     Precedence (mirrors the model resolution precedence so the budget is
@@ -131,13 +133,20 @@ def _resolve_recursion_limit(node_name: str, factory_cfg: dict | None) -> int:
     setting a per-node env var or a per-node factory.json entry. A malformed
     env value is logged and ignored, degrading to the next precedence tier
     rather than crashing the run.
+
+    Returns:
+        (value, source_tier) where source_tier names the precedence tier that
+        actually supplied the value: the winning env variable name,
+        "factory.json", or "default". Reported by the resolution-source log
+        line so silent drift between tiers is diagnosable (issue #126).
     """
-    env_val = os.getenv(f"{node_name.upper()}_RECURSION_LIMIT") or os.getenv(
-        "AGENT_RECURSION_LIMIT"
-    )
+    node_var = f"{node_name.upper()}_RECURSION_LIMIT"
+    node_val = os.getenv(node_var)
+    agent_val = os.getenv("AGENT_RECURSION_LIMIT")
+    env_val = node_val or agent_val
     if env_val:
         try:
-            return int(env_val)
+            return int(env_val), node_var if node_val else "AGENT_RECURSION_LIMIT"
         except (TypeError, ValueError):
             logger.warning(
                 "Invalid recursion_limit env value %r for node '%s'; ignoring "
@@ -147,7 +156,7 @@ def _resolve_recursion_limit(node_name: str, factory_cfg: dict | None) -> int:
             )
     if factory_cfg and factory_cfg.get("recursion_limit") is not None:
         try:
-            return int(factory_cfg["recursion_limit"])
+            return int(factory_cfg["recursion_limit"]), "factory.json"
         except (TypeError, ValueError):
             logger.warning(
                 "Invalid recursion_limit in factory.json for node '%s' (%r); "
@@ -156,12 +165,12 @@ def _resolve_recursion_limit(node_name: str, factory_cfg: dict | None) -> int:
                 factory_cfg["recursion_limit"],
                 DEFAULT_RECURSION_LIMIT,
             )
-    return DEFAULT_RECURSION_LIMIT
+    return DEFAULT_RECURSION_LIMIT, "default"
 
 
 def _resolve_int_env(
     node_name: str, factory_cfg: dict | None, factory_key: str, default: int
-) -> int:
+) -> tuple[int, str]:
     """Resolve a per-node integer config value with env precedence.
 
     Shared by loop-detection thresholds (ADR-0046), mirroring the precedence
@@ -173,14 +182,21 @@ def _resolve_int_env(
 
     A malformed value (env or factory) is logged and ignored, degrading to the
     next precedence tier rather than crashing the run.
+
+    Returns:
+        (value, source_tier) where source_tier names the precedence tier that
+        actually supplied the value: the winning env variable name,
+        "factory.json", or "default" (issue #126).
     """
     env_key = factory_key.upper()  # e.g. loop_hard_limit -> LOOP_HARD_LIMIT
-    env_val = os.getenv(f"{node_name.upper()}_{env_key}") or os.getenv(
-        f"AGENT_{env_key}"
-    )
+    node_var = f"{node_name.upper()}_{env_key}"
+    agent_var = f"AGENT_{env_key}"
+    node_val = os.getenv(node_var)
+    agent_val = os.getenv(agent_var)
+    env_val = node_val or agent_val
     if env_val:
         try:
-            return int(env_val)
+            return int(env_val), node_var if node_val else agent_var
         except (TypeError, ValueError):
             logger.warning(
                 "Invalid %s env value %r for node '%s'; ignoring and "
@@ -191,7 +207,7 @@ def _resolve_int_env(
             )
     if factory_cfg and factory_cfg.get(factory_key) is not None:
         try:
-            return int(factory_cfg[factory_key])
+            return int(factory_cfg[factory_key]), "factory.json"
         except (TypeError, ValueError):
             logger.warning(
                 "Invalid %s in factory.json for node '%s' (%r); falling "
@@ -201,30 +217,87 @@ def _resolve_int_env(
                 factory_cfg[factory_key],
                 default,
             )
-    return default
+    return default, "default"
 
 
-def _resolve_loop_config(node_name: str, factory_cfg: dict | None) -> dict[str, int]:
+def _resolve_loop_config(
+    node_name: str, factory_cfg: dict | None
+) -> tuple[dict[str, int], dict[str, str]]:
     """Resolve the per-node Tool Loop Detection config (issue #121 / ADR-0046).
 
-    Returns a dict of ``{"loop_warn_threshold": int, "loop_hard_limit": int,
-    "loop_window_size": int}``, co-located with the rest of the per-node Model
-    Config. Each field follows the env -> factory.json -> default precedence
-    (see ``_resolve_int_env``). Distinct values per node (execute vs
-    test_writer) are supported via per-node env vars or factory.json entries.
-    A ``loop_hard_limit <= 0`` disables loop detection for that node.
+    Returns a ``(values, sources)`` pair of dicts keyed identically by
+    ``{"loop_warn_threshold", "loop_hard_limit", "loop_window_size"}``:
+    ``values`` holds the resolved integers co-located with the rest of the
+    per-node Model Config; ``sources`` holds each field's Resolution Source
+    Tier for the resolution-source log line (issue #126). Each field follows
+    the env -> factory.json -> default precedence (see ``_resolve_int_env``).
+    Distinct values per node (execute vs test_writer) are supported via
+    per-node env vars or factory.json entries. A ``loop_hard_limit <= 0``
+    disables loop detection for that node.
     """
-    return {
-        "loop_warn_threshold": _resolve_int_env(
-            node_name, factory_cfg, "loop_warn_threshold", DEFAULT_LOOP_WARN_THRESHOLD
-        ),
-        "loop_hard_limit": _resolve_int_env(
-            node_name, factory_cfg, "loop_hard_limit", DEFAULT_LOOP_HARD_LIMIT
-        ),
-        "loop_window_size": _resolve_int_env(
-            node_name, factory_cfg, "loop_window_size", DEFAULT_LOOP_WINDOW_SIZE
-        ),
-    }
+    keys = ("loop_warn_threshold", "loop_hard_limit", "loop_window_size")
+    defaults = (
+        DEFAULT_LOOP_WARN_THRESHOLD,
+        DEFAULT_LOOP_HARD_LIMIT,
+        DEFAULT_LOOP_WINDOW_SIZE,
+    )
+    resolved = [
+        _resolve_int_env(node_name, factory_cfg, key, default)
+        for key, default in zip(keys, defaults, strict=True)
+    ]
+    values = {key: value for key, (value, _) in zip(keys, resolved, strict=True)}
+    sources = {key: source for key, (_, source) in zip(keys, resolved, strict=True)}
+    return values, sources
+
+
+# Nodes whose resolution-source summary has already been logged at INFO in
+# this process (issue #126). resolve_model_config is called ~10x per issue
+# cycle by design (no caching), so the first resolution per node logs at INFO
+# and every repeat degrades to DEBUG to avoid log spam.
+_SOURCE_TIER_LOGGED: set[str] = set()
+
+
+def _log_resolution_source(
+    node_name: str,
+    cfg: dict[str, Any],
+    model_tier: str,
+    recursion_tier: str,
+    loop_tiers: dict[str, str],
+) -> None:
+    """Emit the one-line Model Config resolution-source summary (issue #126).
+
+    Makes the 4-tier precedence observable: on 2026-08-14 the workers ran a
+    different model than config/factory.json named because an AGENT_MODEL
+    export outside .env silently won — invisible in the logs. The line names
+    the resolved values plus the tier each came from: the winning env var
+    name (a "Model Config Override" per the glossary), "factory.json", or
+    the hardcoded default.
+
+    Secrets are never logged: only model ids, integer thresholds, env
+    variable NAMES, and routing-free tier labels — no API keys and no env
+    values beyond the resolved config itself. First resolution of a node per
+    process logs at INFO; repeats log at DEBUG.
+    """
+    override_active = model_tier not in ("factory.json", "DEFAULT_MODEL")
+    prefix = (
+        "Model Config Override active" if override_active else "Resolved Model Config"
+    )
+    message = (
+        f"{prefix} (node={node_name}): model={cfg['model']} "
+        f"(source={model_tier}); recursion_limit={cfg['recursion_limit']} "
+        f"(source={recursion_tier}); "
+        f"loop_warn_threshold={cfg['loop_warn_threshold']} "
+        f"(source={loop_tiers['loop_warn_threshold']}); "
+        f"loop_hard_limit={cfg['loop_hard_limit']} "
+        f"(source={loop_tiers['loop_hard_limit']}); "
+        f"loop_window_size={cfg['loop_window_size']} "
+        f"(source={loop_tiers['loop_window_size']})"
+    )
+    if node_name in _SOURCE_TIER_LOGGED:
+        logger.debug(message)
+    else:
+        logger.info(message)
+        _SOURCE_TIER_LOGGED.add(node_name)
 
 
 def resolve_model_config(node_name: str) -> dict[str, Any]:
@@ -240,6 +313,12 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
     None) since the override model may not be registered in the factory's
     routing list. Temperature defaults to 0.0 and options to None unless the
     factory entry for the same model provides them.
+
+    Each resolution also reports its source tiers via a single log line
+    (INFO on this node's first resolution per process, DEBUG afterwards):
+    which precedence tier supplied the model, the Recursion Budget, and the
+    loop-detection thresholds — making silent Model Config Override drift a
+    30-second diagnosis instead of shell-level archaeology (issue #126).
 
     Returns:
         {"model": str, "routing": List[str] | None,
@@ -263,13 +342,16 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
     # alongside the Recursion Budget, mirroring its precedence. Computed once
     # and spread into every return path so loop detection is configured on all
     # resolution tiers (env-override, factory, hardcoded fallback).
-    loop_cfg = _resolve_loop_config(node_name, factory_cfg)
+    loop_cfg, loop_tiers = _resolve_loop_config(node_name, factory_cfg)
+    recursion_limit, recursion_tier = _resolve_recursion_limit(node_name, factory_cfg)
 
     # 1 & 2. Environment overrides
     node_env_var = f"{node_name.upper()}_MODEL"
-    overridden_model = os.getenv(node_env_var) or os.getenv("AGENT_MODEL") or None
+    node_model = os.getenv(node_env_var)
+    overridden_model = node_model or os.getenv("AGENT_MODEL") or None
 
     if overridden_model:
+        model_tier = node_env_var if node_model else "AGENT_MODEL"
         # Env override active => disable specific provider routing.
         # Inherit temperature/options from factory only if the factory entry
         # names the same model; otherwise use safe defaults.
@@ -281,7 +363,7 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
             temperature = 0.0
             options = None
             max_tokens = None
-        return {
+        cfg: dict[str, Any] = {
             "model": overridden_model,
             "routing": None,
             "temperature": temperature,
@@ -290,39 +372,43 @@ def resolve_model_config(node_name: str) -> dict[str, Any]:
             "fallback_model": factory_cfg.get("fallback_model")
             if factory_cfg
             else None,
-            "recursion_limit": _resolve_recursion_limit(node_name, factory_cfg),
+            "recursion_limit": recursion_limit,
             **loop_cfg,
         }
-
-    # 3. Factory configuration
-    if factory_cfg:
-        return {
+    elif factory_cfg:
+        # 3. Factory configuration
+        model_tier = "factory.json"
+        cfg = {
             "model": factory_cfg["model"],
             "routing": factory_cfg.get("routing"),
             "temperature": factory_cfg.get("temperature", 0.0),
             "options": factory_cfg.get("options"),
             "max_tokens": factory_cfg.get("max_tokens"),
             "fallback_model": factory_cfg.get("fallback_model"),
-            "recursion_limit": _resolve_recursion_limit(node_name, factory_cfg),
+            "recursion_limit": recursion_limit,
+            **loop_cfg,
+        }
+    else:
+        # 4. Hardcoded fallback (factory missing/malformed or node absent)
+        logger.debug(
+            "Node '%s' not found in factory configuration; falling back to %s.",
+            node_name,
+            DEFAULT_MODEL,
+        )
+        model_tier = "DEFAULT_MODEL"
+        cfg = {
+            "model": DEFAULT_MODEL,
+            "routing": DEFAULT_ROUTING.get(node_name),
+            "temperature": 0.0,
+            "options": None,
+            "max_tokens": None,
+            "fallback_model": None,
+            "recursion_limit": recursion_limit,
             **loop_cfg,
         }
 
-    # 4. Hardcoded fallback (factory missing/malformed or node absent)
-    logger.debug(
-        "Node '%s' not found in factory configuration; falling back to %s.",
-        node_name,
-        DEFAULT_MODEL,
-    )
-    return {
-        "model": DEFAULT_MODEL,
-        "routing": DEFAULT_ROUTING.get(node_name),
-        "temperature": 0.0,
-        "options": None,
-        "max_tokens": None,
-        "fallback_model": None,
-        "recursion_limit": _resolve_recursion_limit(node_name, factory_cfg),
-        **loop_cfg,
-    }
+    _log_resolution_source(node_name, cfg, model_tier, recursion_tier, loop_tiers)
+    return cfg
 
 
 def get_chat_model_from_config(cfg: dict[str, Any]) -> ChatOpenAI:
