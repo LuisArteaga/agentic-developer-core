@@ -1121,6 +1121,34 @@ class TestResolutionSourceTierLogging(unittest.TestCase):
         self.assertIsNotNone(self._msg_with(info, "99", "factory.json"))
         self.assertIsNone(self._msg_with(info, "LOG_PROBE_MALFORMED_RECURSION_LIMIT"))
 
+    def test_malformed_factory_int_reports_default_tier(self):
+        """A malformed factory integer falls through; the default tier is reported."""
+        node = "log_probe_badint"
+        self._write_factory(
+            {
+                node: {
+                    "model": "m",
+                    "recursion_limit": "not-an-int",
+                    "loop_warn_threshold": "also-bad",
+                }
+            }
+        )
+        with self.assertLogs("orchestrator.config", level="INFO") as cm:
+            cfg = resolve_model_config(node)
+        self.assertEqual(cfg["recursion_limit"], DEFAULT_RECURSION_LIMIT)
+        self.assertEqual(cfg["loop_warn_threshold"], DEFAULT_LOOP_WARN_THRESHOLD)
+        info = self._info_messages(cm)
+        self.assertIsNotNone(
+            self._msg_with(
+                info,
+                "loop_warn_threshold",
+                str(DEFAULT_LOOP_WARN_THRESHOLD),
+            )
+        )
+        self.assertIsNotNone(
+            self._msg_with(info, str(DEFAULT_RECURSION_LIMIT), "default")
+        )
+
     def test_recursion_limit_env_override_reported(self):
         """An env-overridden Recursion Budget names its winning env var."""
         node = "log_probe_budget"
