@@ -116,21 +116,32 @@ SYSTEM_PROMPT_SYNTAX_LINT = (
 )
 
 SYSTEM_PROMPT_TEST_COVERAGE = (
-    "You are a code reviewer specialized in test validation and coverage.\n"
+    "You are a code reviewer specialized in test validation and quality.\n"
     "Review the PR diff against these specific criteria:\n"
     "=== 1. CRITERIA DEFINITION ===\n"
-    "- Q1 (Test Presence): Check if any modified logic or new code is accompanied by new tests or updates to existing tests in the test folders.\n"
-    "- Q2 (Test Quality/Assertions): Check if the tests contain meaningful assertions validating the actual behavior/logic changes, rather than trivial or empty test cases.\n\n"
+    "- ASSERTION STRENGTH: Check if the tests added or modified by the diff "
+    "contain meaningful, behavior-validating assertions - assertions that "
+    "verify the actual expected outcomes of the changed logic - rather than "
+    "trivial, smoke, or empty checks (e.g., asserting only 'not None', bare "
+    "truthiness, or executing code without asserting anything).\n"
+    "- EDGE CASES: Check whether the boundary and error paths of the changed "
+    "logic are considered by the accompanying tests (e.g., empty/zero/None "
+    "inputs, boundary values, and raised exceptions on error conditions).\n"
+    "- IMPLEMENTATION LEAKAGE: Check that the tests do not encode internal "
+    "data structures, private/dunder attributes, or signatures beyond the "
+    "public contract. Tests should validate observable behavior so that an "
+    "alternative valid implementation of the same contract would still pass.\n\n"
     "=== 2. ARGUMENTATION STRUCTURE ===\n"
     "Output your thought process inside <reasoning>...</reasoning> tags.\n"
     "Output any violations inside <findings>...</findings> tags.\n\n"
     "=== 3. SCORING RULE ===\n"
     "- PASS: If there are no violations. Output an empty findings block: <findings></findings>.\n"
     "- FAIL: If one or more criteria fail. Report each violation as a JSON object on a single line inside the findings block: "
-    '{"severity": "error", "message": "[QX] Details of the failure"}\n'
-    'Example: If Q1 fails: {"severity": "error", "message": "[Q1] No tests added for new function compute_hash"}\n\n'
+    '{"severity": "error", "message": "[CRITERION NAME] Details of the failure"}\n'
+    'Example: {"severity": "error", "message": "[ASSERTION STRENGTH] New function compute_hash is tested without asserting its return value"}\n\n'
     "=== 4. EDGE-CASE HANDLING ===\n"
-    "- If the diff is empty, return PASS with empty findings.\n\n"
+    "- If the diff is empty, return PASS with empty findings.\n"
+    "- Evaluate only what the diff itself shows. Do not speculate about whether the tests were executed, passed, or failed, and do not estimate coverage percentages or uncovered line numbers - test execution and changed-line coverage are enforced deterministically elsewhere in CI.\n\n"
     "=== OUTPUT FORMAT ===\n"
     "First, output your reasoning block:\n"
     "<reasoning>\n"
@@ -619,131 +630,6 @@ def load_architecture_context(workspace_dir: str) -> str:
     return "\n".join(context_lines)
 
 
-# Maximum characters of CI coverage output fed to the Test Coverage judge.
-# Bounded to keep the judge's context manageable (LLM-as-judge best practice:
-# bounded, focused context). Tail-bounded (not head) because pytest prints the
-# per-file coverage table and the pass/fail summary at the *end* of its
-# output — the head is test progress dots, which carry little evaluative
-# signal. This is a deliberate, documented deviation from ``clip_chunk``'s
-# head-truncation; see ADR-0030.
-CI_COVERAGE_OUTPUT_MAX_CHARS = 15000
-
-
-def _get_ci_coverage_output_budget() -> int:
-    """Resolve the CI coverage output character budget, overridable via env."""
-    return int(
-        os.getenv("CI_COVERAGE_OUTPUT_MAX_CHARS", str(CI_COVERAGE_OUTPUT_MAX_CHARS))
-    )
-
-
-def _tail_clip(text: str, budget: int) -> str:
-    """Clip ``text`` to its last ``budget`` characters, prefixing a note.
-
-    Tail-clipping preserves the pytest coverage table and the final test
-    summary, which pytest emits at the end of its stream — the most evaluative
-    signal for the Test Coverage judge.
-    """
-    if len(text) <= budget:
-        return text
-    note = (
-        f"[NOTE: CI output truncated to last {budget} chars; head omitted "
-        "because the coverage table and test summary are at the end.]\n"
-    )
-    return note + text[-(budget):]
-
-
-def load_ci_coverage_output() -> str:
-    """Load CI-produced test + coverage output for the Test Coverage judge.
-
-    Resolves the file path from the ``CI_COVERAGE_OUTPUT_PATH`` environment
-    variable (set by the CI workflow), reads it, and tail-clips it to the
-    configured character budget. Returns an empty string when the env var is
-    unset, the file is missing, or the content is empty — callers must treat
-    an empty result as "no CI output available" and degrade to diff-only
-    evaluation (Language Agnosticism + graceful degradation; ADR-0030).
-
-    The judge never runs language-specific tooling itself; it consumes this
-    output produced by the target repository's own test suite.
-    """
-    path = os.getenv("CI_COVERAGE_OUTPUT_PATH", "")
-    if not path:
-        log(
-            "[INFO] CI_COVERAGE_OUTPUT_PATH not set; test_coverage judge runs diff-only"
-        )
-        return ""
-
-    if not os.path.isfile(path):
-        log(
-            f"[WARN] CI coverage output file not found at {path}; test_coverage judge runs diff-only"
-        )
-        return ""
-
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except OSError as e:
-        log(
-            f"[WARN] Failed to read CI coverage output at {path}: {e}; test_coverage judge runs diff-only"
-        )
-        return ""
-
-    if not content.strip():
-        log(
-            f"[WARN] CI coverage output at {path} is empty; test_coverage judge runs diff-only"
-        )
-        return ""
-
-    budget = _get_ci_coverage_output_budget()
-    clipped = _tail_clip(content, budget)
-    if len(content) > budget:
-        log(
-            f"[INFO] CI coverage output clipped from {len(content)} to last "
-            f"{budget} chars for test_coverage judge"
-        )
-    return clipped
-
-
-def build_test_coverage_ci_augmentation(ci_output: str) -> str:
-    """Build the CI-augmentation block appended to the Test Coverage prompt.
-
-    Appends the CI test/coverage output and two additional criteria — Q3
-    (Test Execution) and Q4 (Coverage of Changed Code) — to the base Test
-    Coverage system prompt. The augmentation is only produced when CI output
-    is available; the base prompt's Q1/Q2 remain the diff-only fallback.
-
-    Returns an empty string when ``ci_output`` is empty so callers can simply
-    append the result unconditionally.
-    """
-    if not ci_output or not ci_output.strip():
-        return ""
-
-    return (
-        "\n\n=== CI VERIFICATION & COVERAGE OUTPUT ===\n"
-        "The CI pipeline ran the repository's own test suite with coverage. "
-        "The output below contains the test execution summary and a per-file "
-        "coverage report (including missing/uncovered line numbers). Use it to "
-        "evaluate the additional criteria below. You must NOT run any tools "
-        "yourself — consume this output only (Language Agnosticism).\n\n"
-        "--- BEGIN CI OUTPUT ---\n"
-        f"{ci_output}\n"
-        "--- END CI OUTPUT ---\n\n"
-        "=== ADDITIONAL CRITERIA (from CI output) ===\n"
-        "- Q3 (Test Execution): Determine whether the test suite passes. If "
-        "tests fail or error, report this as a coverage failure for the changed "
-        "code (the changed production code is not exercised by passing tests).\n"
-        "- Q4 (Coverage of Changed Code): Using the coverage report's "
-        "missing-line information, check whether the production code lines "
-        "added or modified in this diff are actually covered by passing tests. "
-        "Report any changed production file/lines that are NOT covered. Do not "
-        "flag test files themselves or files unchanged by this diff.\n"
-        "- If the CI output above contains no coverage information (e.g., it is "
-        "empty or only shows a collection error), evaluate Q1/Q2 from the diff "
-        "alone and skip Q3/Q4.\n\n"
-        "These additional criteria are scored under the same SCORING RULE above: "
-        "any Q3/Q4 failure makes the overall verdict FAIL.\n"
-    )
-
-
 def _get_batch_budget() -> int:
     """Resolve the per-batch character budget, overridable via env var."""
     return int(os.getenv("REVIEW_BATCH_BUDGET_CHARS", str(BATCH_BUDGET_CHARS)))
@@ -754,14 +640,13 @@ def augment_judge_prompt(
     prompt: str,
     syntax_result: tuple[bool, list[str], int] | None,
     arch_context: str,
-    ci_coverage_output: str,
 ) -> str:
     """Apply judge-specific augmentations to a base judge prompt. Pure: no I/O.
 
     Extracted from ``main()`` so the per-judge augmentation dispatch (syntax
-    verification, architecture context, CI coverage output) is unit-testable
-    rather than buried in the untested entrypoint body (mirrors the
-    ``entrypoint.py`` pattern of extracting logic out of ``main()``).
+    verification, architecture context) is unit-testable rather than buried
+    in the untested entrypoint body (mirrors the ``entrypoint.py`` pattern of
+    extracting logic out of ``main()``).
 
     Args:
         judge_key: the judge being augmented.
@@ -769,11 +654,11 @@ def augment_judge_prompt(
         syntax_result: ``(passed, errors, checked)`` from
             :func:`verify_python_syntax`, or ``None`` when not run.
         arch_context: the loaded architecture context string (may be "").
-        ci_coverage_output: the loaded CI coverage output string (may be "").
 
     Returns:
         The augmented prompt. Judges with no applicable augmentation
-        (e.g. ``security``) receive the base prompt unchanged.
+        (e.g. ``security``, ``test_coverage``) receive the base prompt
+        unchanged.
     """
     if judge_key == "syntax_lint" and syntax_result and syntax_result[2] > 0:
         syntax_passed, syntax_errors, _ = syntax_result
@@ -801,8 +686,6 @@ def augment_judge_prompt(
             prompt += "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\n" + arch_context
         else:
             prompt += "\n\n=== REPOSITORY ARCHITECTURE CONTEXT ===\nNo specific architecture documentation found. Falling back to default rules."
-    if judge_key == "test_coverage" and ci_coverage_output:
-        prompt += build_test_coverage_ci_augmentation(ci_coverage_output)
     return prompt
 
 
@@ -1414,13 +1297,6 @@ def main():
                 f"checked, {'all passed' if syntax_passed else f'{len(syntax_errors)} errors'}"
             )
 
-        ci_coverage_output = load_ci_coverage_output()
-        if ci_coverage_output:
-            log(
-                f"[INFO] CI coverage output loaded ({len(ci_coverage_output)} chars) "
-                f"for test_coverage judge"
-            )
-
         # Load once: architecture context is identical across judge iterations.
         arch_context = load_architecture_context(workspace_dir)
         syntax_result = (syntax_passed, syntax_errors, syntax_checked)
@@ -1432,7 +1308,6 @@ def main():
                 judge_info["prompt"],
                 syntax_result,
                 arch_context,
-                ci_coverage_output,
             )
 
             log(f"[INFO] Running judge: {judge_key}")
