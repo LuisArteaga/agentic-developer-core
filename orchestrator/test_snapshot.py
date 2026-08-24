@@ -10,6 +10,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from orchestrator.snapshot import (
     SNAPSHOT_MAX_CHARS,
@@ -66,6 +67,14 @@ class TestBuildDirectoryTree(unittest.TestCase):
 
     def test_empty_workspace(self):
         self.assertEqual(build_directory_tree(self.ws), "(empty directory)")
+
+    def test_unreadable_directory_is_skipped_not_fatal(self):
+        # The walker's defensive branch (snapshot.py iterdir except-path): an
+        # unreadable directory degrades to an empty listing instead of
+        # crashing snapshot construction on the Worker's critical prompt path.
+        with mock.patch("pathlib.Path.iterdir", side_effect=PermissionError("denied")):
+            tree = build_directory_tree(self.ws)
+        self.assertEqual(tree, "(empty directory)")
 
 
 class TestExtractPlanTargetFiles(unittest.TestCase):
