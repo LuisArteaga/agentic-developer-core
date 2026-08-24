@@ -1,4 +1,4 @@
-.PHONY: verify setup secret-scan lint format-check type-check test pre-commit-strict
+.PHONY: verify setup secret-scan lint format-check type-check test pre-commit-strict diff-coverage
 
 verify: lint format-check type-check test
 
@@ -30,3 +30,13 @@ type-check:
 # findings by default, so without it this would advise but not block.
 pre-commit-strict: lint format-check type-check
 	semgrep scan --config=auto --error orchestrator scripts
+
+# Opt-in diff coverage gate: fails when any production line added or modified
+# by this branch's diff is not exercised by the test suite — the arithmetic
+# the Test Coverage PR Review Judge performs under Q4, moved out of the LLM
+# into a deterministic script. 100% changed-line threshold, stateless; does
+# NOT replace the global --cov-fail-under percentage (see ADR-0052). Not part
+# of `verify` (full-suite runtime cost) and not wired into pre-commit, per the
+# tiered-gate model of ADR-0020.
+diff-coverage:
+	python -m pytest --cov=orchestrator --cov=scripts --cov-report=term-missing --cov-report=json:coverage.json && python3 scripts/diff_coverage_gate.py --coverage-json coverage.json --base main
