@@ -343,13 +343,18 @@ def build_outlines(workspace_path: Path, char_cap: int) -> OutlineResult:
     return OutlineResult(outlines=outlines_text, truncated_files=truncated_files)
 
 
-def build_outlines_for_files(workspace_path: Path, file_paths: list[str]) -> str:
-    """Fetch full outlines for specific files (Plan Detail Request).
+def _resolve_outline_targets(
+    workspace_path: Path, file_paths: list[str]
+) -> list[tuple[str, Path]]:
+    """Validate requested relative paths and resolve them inside the workspace.
 
-    No cap — these are targeted requests. Path safety is validated defensively
-    (defense-in-depth) in addition to the primary validation in plan_node.
+    Shared by build_outlines_for_files (Plan Detail Request, ADR-0024) and the
+    Workspace Snapshot builder (issue #124). Applies defense-in-depth path
+    checks — safe-path blocklist, existence, symlink-escape guard, supported
+    extension — and returns ``(rel_path, absolute_path)`` pairs in input order,
+    skipping anything that fails validation.
     """
-    included: list[str] = []
+    resolved_pairs: list[tuple[str, Path]] = []
     workspace_resolved = workspace_path.resolve()
 
     for rel_path in file_paths:
@@ -380,6 +385,20 @@ def build_outlines_for_files(workspace_path: Path, file_paths: list[str]) -> str
             )
             continue
 
+        resolved_pairs.append((rel_path, full_path))
+
+    return resolved_pairs
+
+
+def build_outlines_for_files(workspace_path: Path, file_paths: list[str]) -> str:
+    """Fetch full outlines for specific files (Plan Detail Request).
+
+    No cap — these are targeted requests. Path safety is validated defensively
+    (defense-in-depth) in addition to the primary validation in plan_node.
+    """
+    included: list[str] = []
+
+    for rel_path, full_path in _resolve_outline_targets(workspace_path, file_paths):
         outline = extract_outline(full_path)
         if outline is None:
             continue

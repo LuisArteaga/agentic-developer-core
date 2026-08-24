@@ -741,10 +741,10 @@ class TestPlanNode(unittest.TestCase):
         (self.workspace_dir / ".venv" / "bin").mkdir()
         (self.workspace_dir / ".venv" / "lib").mkdir()
 
-        from orchestrator.nodes import _get_directory_tree
+        from orchestrator.snapshot import build_directory_tree
 
         # Generate tree
-        tree = _get_directory_tree(self.workspace_dir)
+        tree = build_directory_tree(self.workspace_dir)
 
         # Verify output contains files/folders and shows hierarchy
         self.assertIn("README.md", tree)

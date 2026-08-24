@@ -16,7 +16,6 @@ from pydantic import BaseModel, Field
 
 from orchestrator import state as state_module
 from orchestrator.config import get_chat_model_from_config, resolve_model_config
-from orchestrator.constants import IGNORE_DIRS
 from orchestrator.git import (
     add,
     checkout,
@@ -39,6 +38,7 @@ from orchestrator.outline import (
     build_outlines_for_files,
 )
 from orchestrator.path_safety import is_safe_path
+from orchestrator.snapshot import build_directory_tree
 from orchestrator.state import AgentState
 from orchestrator.tools import _truncate_output
 from scripts.telemetry import (
@@ -653,36 +653,6 @@ def _is_safe_path(path_str: str) -> bool:
     return is_safe_path(path_str)
 
 
-def _get_directory_tree(workspace_path: Path) -> str:
-    """Generates a text-based visual tree of the workspace directory, ignoring common build and environment folders."""
-    ignore_dirs = IGNORE_DIRS
-    lines = []
-
-    def walk(directory: Path, prefix: str = ""):
-        try:
-            # Sort directories first, then files alphabetically
-            entries = sorted(
-                list(directory.iterdir()),
-                key=lambda x: (not x.is_dir(), x.name.lower()),
-            )
-        except Exception:
-            return
-
-        entries = [e for e in entries if e.name not in ignore_dirs]
-        for i, entry in enumerate(entries):
-            is_last = i == len(entries) - 1
-            connector = "└── " if is_last else "├── "
-            lines.append(
-                f"{prefix}{connector}{entry.name}{'/' if entry.is_dir() else ''}"
-            )
-            if entry.is_dir():
-                new_prefix = prefix + ("    " if is_last else "│   ")
-                walk(entry, new_prefix)
-
-    walk(workspace_path)
-    return "\n".join(lines) if lines else "(empty directory)"
-
-
 def _extract_structured_output(
     raw_result: dict, schema_name: str
 ) -> tuple[Any, str | None]:
@@ -768,7 +738,7 @@ def plan_node(state: AgentState) -> AgentState:
         issue_body = issue_data.get("body", "")
 
         # 3. Get codebase structure (directory tree + structural outlines)
-        codebase_structure = _get_directory_tree(workspace_path)
+        codebase_structure = build_directory_tree(workspace_path)
 
         outlines_budget = max(0, OUTLINE_CHAR_CAP - len(codebase_structure))
         outline_result: OutlineResult = build_outlines(workspace_path, outlines_budget)
