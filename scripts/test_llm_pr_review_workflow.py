@@ -73,9 +73,8 @@ def test_coverage_artifact_inputs_retired() -> None:
     wf = _load_workflow()
     steps = wf["jobs"]["llm-pr-review"]["steps"]
     uses = [s.get("uses", "") for s in steps]
-    assert not any(
-        "download-artifact" in u for u in uses
-    ), "retired artifact download step reintroduced"
+    has_download_step = any("download-artifact" in u for u in uses)
+    assert not has_download_step, "retired artifact download step reintroduced"
 
 
 def test_declared_secrets_required() -> None:
