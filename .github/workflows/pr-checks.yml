@@ -110,5 +110,11 @@ jobs:
         run: pip-audit .
 
       - name: Run LLM review
-        if: always()
+        # Default success gating — deliberately NO `if: always()`. The judges
+        # only spend tokens when every deterministic gate above is green:
+        # a failing lint/mypy/pytest/diff-coverage run already blocks the
+        # merge, so reviewing that diff adds cost without authority. The old
+        # `always()` was a visibility fallback from before the deterministic
+        # syntax pre-check (ADR-0025) and the Diff Coverage Gate (ADR-0052)
+        # made it redundant.
         run: git diff -w origin/main...HEAD -- . ':(exclude)uv.lock' | scripts/review.sh
