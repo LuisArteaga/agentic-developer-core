@@ -1,4 +1,4 @@
-# ADR 0054: Check-Run Fail-Fast in Merge Polling with Dual-Triage Feedback Routing
+# ADR 0055: Check-Run Fail-Fast in Merge Polling with Dual-Triage Feedback Routing
 
 * **Status**: Accepted
 * **Date**: 2026-08-25
@@ -111,7 +111,7 @@ signals feed the same feedback channel.
 1000 runs); non-dict payloads, missing `check_runs` keys, non-dict entries,
 and raised API errors each log a warning and degrade to "no signal" — the
 poll continues unchanged. Absent check runs (repo without CI) reproduce
-pre-ADR-0054 behavior exactly. No-Judge mode ([ADR-0053](./0053-interim-no-judge-merge-mode.md))
+pre-ADR-0055 behavior exactly. No-Judge mode ([ADR-0054](./0054-interim-no-judge-merge-mode.md))
 keeps skipping reviews/verdicts entirely but *does* gain check-run fail-fast:
 a red CI build during the human-review window is exactly as fixable as in
 judge mode, and waiting 24 h for a human to notice is strictly worse than a
