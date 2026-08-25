@@ -1,0 +1,155 @@
+# Cloud Deployment Requirements — Split-Plane Execution Sandboxing
+
+Technical requirements for running the Orchestrator Repository in the cloud
+(netcup RS) with hardened isolation of untrusted code execution. This document
+is the traceability anchor for the issue breakdown; decisions are recorded in
+[ADR-0056](./adr/0056-split-plane-execution-sandbox-on-cloud-vps.md).
+
+## 1. Goal & protection goals
+
+Primary driver: **isolation/security** — an LLM Worker must not be able to do
+damage ("stupid things"). The loop should additionally run 24/7 unattended.
+
+A compromised/prompt-injected Worker must be unable to reach:
+
+1. **Host integrity** — the server OS/filesystem outside the workspace.
+2. **Secrets** — `GH_PAT`, `OPENROUTER_API_KEY`, telemetry keys.
+3. **Unscoped GitHub access** — PAT rights exceed the single Target Repository's needs.
+4. **Unrestricted web** — outbound fetch stays allowlisted (`config/sources.toml`, ADR-0028).
+
+## 2. Decided architecture (summary of ADR-0056)
+
+- **Split-plane**: trusted control plane (Orchestrator, holds all secrets) vs.
+  ephemeral credential-free Execution Sandbox(es) where Worker command execution
+  and Verification run. Commits/pushes remain control-plane operations (PR-Node).
+- **Hosting**: single netcup Root Server (KVM guest, dedicated cores/RAM). No
+  nested KVM exists on netcup (verified — see references), therefore Firecracker/
+  self-hosted E2B/Daytona are excluded by constraint, not preference.
+- **Sandbox runtime**: Docker + gVisor (`runsc`) from day one — user-space kernel,
+  no `/dev/kvm` required, runs inside a KVM guest.
+- **Swappable interface**: the sandbox is accessed through a runner abstraction
+  (spawn → exec command → collect bounded output → destroy) so the runtime can be
+  exchanged later without moving the boundary.
+
+## 3. Functional requirements
+
+### FR-1 Execution Sandbox runner
+
+- New runner module exposing: create (from image, workspace mount, resource caps),
+  exec (command + timeout + bounded output capture), destroy; idempotent cleanup.
+- Output truncation reuses the Verification Feedback bounds (150 lines / 10 KB).
+- Exit code, stdout/stderr, duration returned to the caller; non-zero exits are
+  data, not runner failures.
+- Runner failures (daemon unreachable, image missing) fail loudly and route into
+  existing error handling (Graph error routing to recovery, ADR-0038).
+
+### FR-2 Verify phase containment (first containment slice)
+
+- `AGENT_VERIFY_COMMAND` executes inside the Execution Sandbox, not on the host;
+  `AGENT_VERIFY_TIMEOUT` maps to the exec timeout.
+- Workspace bind-mounted read-write; no orchestrator environment variables leak
+  beyond a minimal allowlist (extends ADR-0043 semantics to sandboxes).
+
+### FR-3 Worker command containment
+
+- Worker Tool `run_command` routes through the same runner; binary allowlist
+  (ADR-0037) continues to apply *inside* the sandbox.
+- No dual code path: after migration, host-side execution of untrusted commands
+  is removed (fail closed if the daemon is unavailable).
+
+### FR-4 Runtime hardening
+
+- gVisor registered as Docker runtime; all sandboxes start with `--runtime=runsc`.
+- Documented fallback posture if `runsc` is unavailable at startup: refuse to run
+  (fail closed) rather than silently degrading to shared-kernel containers.
+
+### FR-5 Egress lockdown
+
+- Default-deny network egress from sandboxes; explicit allowlist only:
+  PyPI/npm/GitHub/OS package mirrors as required by Verification installs, plus
+  the URL Fetch/Web Search paths already governed by `config/sources.toml`.
+- Hard-block link-local (169.254.169.254 metadata), RFC 1918, loopback destinations.
+- Enforcement independent of the sandbox's cooperation (nftables/proxy layer on
+  the host, INNOQ pattern); allowlist changes require root, not container access.
+
+### FR-6 Credential scoping
+
+- Migration guidance to a GitHub fine-grained PAT scoped to the single Target
+  Repository: Contents RW, Pull requests RW, Issues RW, Metadata R, Checks R;
+  Workflows RW only because pushes may touch `.github/workflows/*`.
+- Regression test asserting the sandbox environment contains none of
+  `GH_PAT`/`OPENROUTER_API_KEY`/Langfuse keys under any configuration.
+
+### FR-7 Resource caps & lifecycle mapping
+
+- Per-sandbox CPU/memory/PID/disk caps (fork-bomb/runaway-loop containment).
+- Lifecycle mirrors Hybrid Retry semantics: one sandbox persists across Execute
+  attempts within a cycle (workspace state incl. untracked Test-Writer files is
+  preserved); destroyed on Failure Recovery and at cycle end; recreated on
+  Stateful Resume if absent (fresh clone of the resumed branch).
+
+### FR-8 Deployment stack & operations
+
+- Ubuntu LTS on netcup RS; minimum RS 1000 G12 (4 dedicated EPYC cores, 8 GB),
+  recommended RS 2000 G12 (8 cores, 16 GB) for parallel verify workloads.
+- Control plane runs via existing Docker image + Process Supervisor (ADR-0015)
+  under systemd; restart/backoff behavior preserved.
+- `.agent_logs/` (state.json, traces, metrics) included in host backup routine;
+  log rotation added.
+- SSH hardening, automatic security updates, firewall default-deny inbound —
+  documented runbook (no inbound services required; everything is outbound polling).
+
+### FR-9 Local development without container backend
+
+- Unit-level/TDD development requires no Docker: the runner interface is
+  consumed through fakes in tests.
+- An explicitly opted-in **dev-only host backend** (`AGENT_SANDBOX_BACKEND=host`)
+  executes untrusted commands directly on the host, preserving today's
+  pre-migration behavior (binary allowlist, env stripping) behind the same
+  runner interface — for end-to-end cycle debugging on WSL2 without Docker.
+- The host backend **refuses to start** in production contexts (orchestrator
+  container image, `AGENT_MODE=ci`, server deployment markers) with an
+  actionable error; when active it logs a loud, once-per-run warning.
+- Default backend remains Docker; the host path is never selected implicitly.
+  Rationale: a *silent* host fallback would be a permanent escape hatch
+  undermining the split-plane boundary — an *explicit, prod-refusing* one keeps
+  dev/prod parity honest.
+
+### FR-10 Repository provisioning & maintenance
+
+The instance maintains two repository classes with distinct lifecycles:
+
+- **Target Repository checkout(s)** (`GITHUB_WORKSPACE`): cloned once per target
+  repository (single-branch, default branch), then **synced at Claim time before
+  every cycle** (`fetch` + hard reset to origin default) so work never starts
+  from a stale base. [Workspace Hygiene](../CONTEXT.md) applies between cycles;
+  `git gc` plus an LRU eviction cap bound disk growth across many target repos.
+  Private-repo clone auth uses the scoped fine-grained PAT (FR-6).
+- **Orchestrator Repository** (control-plane deployment): reaches the server via
+  a documented update procedure — pull, image rebuild, Process Supervisor
+  restart — applied **only between cycles**, never mid-cycle; startup logs the
+  running version stamp for diagnosability.
+- **Self-target case**: when `GITHUB_REPOSITORY` equals the Orchestrator
+  Repository itself (the loop improving its own code), the deploy checkout and
+  the workspace remain strictly separate paths; a running cycle is never
+  invalidated by a concurrent self-update.
+
+## 4. Non-goals
+
+- MicroVM/Firecracker-class isolation (blocked by provider constraint; revisit on
+  bare-metal or via managed APIs later — the runner interface anticipates this).
+- Multi-tenant hardening (single-tenant threat model).
+- Managed sandbox services (E2B Cloud etc.) — cost/latency per tool call; Daytona
+  self-hosting no longer exists (closed-source since June 2026).
+
+## 5. References (accessed 2026-08-25)
+
+| Fact | Source | Tier |
+| --- | --- | --- |
+| netcup: no nested virtualization, "not even on root servers" | [forum.netcup.de thread 22070](https://forum.netcup.de/thread/22070-can-you-virtualise-on-a-root-server) (Apr 2026) | T2 |
+| Firecracker/E2B self-host requires `/dev/kvm`; Nomad+Consul+Terraform ops weight | [e2b-dev/E2B](https://github.com/e2b-dev/e2b), [temps.sh analysis](https://temps.sh/blog/best-e2b-alternatives-ai-sandboxes-2026) | T1/T3 |
+| Daytona no longer self-hostable | [awesome-sandbox §Daytona](https://github.com/restyler/awesome-sandbox) (Jun 2026) | T3 |
+| gVisor install/runtime registration, Linux ≥5.6, no hardware virt needed | [gvisor.dev install](https://gvisor.dev/docs/user_guide/install), [Docker quick start](https://gvisor.dev/docs/user_guide/quick_start/docker) | T1 |
+| Default-deny egress + proxy/nftables allowlist pattern; block metadata IP/RFC1918 | [INNOQ blog](https://www.innoq.com/en/blog/2026/03/dev-sandbox-network), [Augment guide](https://www.augmentcode.com/guides/agent-execution-sandbox) | T2/T3 |
+| Fine-grained PAT scopes; workflow-scope push requirement | [GitHub docs](https://docs.github.com/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens), [community discussion #26254](https://github.com/orgs/community/discussions/26254) | T1/T2 |
+| netcup RS G12 specs/pricing (RS 1000: 4c/8GB/256GB €12.79) | [netcup.com](https://www.netcup.com/en/server/root-server) | T2 |
