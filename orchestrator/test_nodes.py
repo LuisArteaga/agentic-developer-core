@@ -3734,7 +3734,7 @@ class TestMergeNode(unittest.TestCase):
 
 
 class TestMergeNodeNoJudgeMode(unittest.TestCase):
-    """Interim no-judge merge mode (``AGENT_JUDGE_ENABLED=false``, ADR-0053).
+    """Interim no-judge merge mode (``AGENT_JUDGE_ENABLED=false``, ADR-0054).
 
     The Merge-Phase waits only for an external (human/policy) merge: verdict
     parsing and judge trust resolution are skipped entirely, the machine-scale
@@ -4003,7 +4003,7 @@ class TestMergeNodeNoJudgeMode(unittest.TestCase):
     def test_no_judge_window_replaces_legacy_poll_timeout(
         self, mock_api, mock_commit_time
     ):
-        """Precedence (ADR-0053): in no-judge mode AGENT_MERGE_POLL_TIMEOUT is
+        """Precedence (ADR-0054): in no-judge mode AGENT_MERGE_POLL_TIMEOUT is
         not consulted at all — the no-judge window governs exclusively."""
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
         # A zero legacy timeout would exit before the first poll in judge mode;
@@ -5143,7 +5143,7 @@ class TestGithubApiRetry(unittest.TestCase):
 
 
 class TestMergeNodeCheckRunFailFast(unittest.TestCase):
-    """Check-Run Fail-Fast in Merge Polling (issue #140, ADR-0054).
+    """Check-Run Fail-Fast in Merge Polling (issue #140, ADR-0055).
 
     Each poll iteration additionally fetches the PR head SHA's check runs. A
     concluded product-CI failure breaks the poll early into the Merge-Fix Loop

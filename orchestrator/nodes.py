@@ -2066,7 +2066,7 @@ def _post_pr_comment(github_repo: str, pr_num: int, body: str) -> None:
         )
 
 
-# --- Check-Run Fail-Fast in Merge Polling (issue #140, ADR-0054) ---
+# --- Check-Run Fail-Fast in Merge Polling (issue #140, ADR-0055) ---
 #
 # Conclusions treated as a concluded check failure. Deliberately excludes
 # success/neutral/skipped (not failures per the issue contract), plus the
@@ -2143,7 +2143,7 @@ def _evaluate_check_failures(
     Returns ``(fixable, infra)``: product-CI failures the Worker can address
     through the Merge-Fix Loop, versus failures on checks matching the judge
     fragments — infrastructure the Worker cannot fix, which must escalate
-    instead of burning budget (ADR-0050 / ADR-0054).
+    instead of burning budget (ADR-0050 / ADR-0055).
     """
     fixable: list[dict] = []
     infra: list[dict] = []
@@ -2186,7 +2186,7 @@ def _check_signal_time(entries: list[dict]) -> datetime.datetime | None:
 
 
 def _check_run_feedback(failed_checks: list[dict], attempt: int, cap: int) -> str:
-    """Build the Worker feedback message from failed CI checks (ADR-0054).
+    """Build the Worker feedback message from failed CI checks (ADR-0055).
 
     Structured like ``_merge_fix_feedback`` so both signals share the existing
     Verification Feedback channel consumed by ``execute_node``: each failing
@@ -2225,7 +2225,7 @@ def _judge_infra_failure_comment(infra_failures: list[dict]) -> str:
 
     A failed judge-workflow check is infrastructure the Worker cannot fix, so
     the loop escalates to a human instead of entering the Merge-Fix Loop
-    (ADR-0050 / ADR-0054); no merge-fix budget is consumed.
+    (ADR-0050 / ADR-0055); no merge-fix budget is consumed.
     """
     lines = [
         "### Merge paused: judge workflow infrastructure failure",
@@ -2275,7 +2275,7 @@ def _checks_exhaustion_comment(failed_checks: list[dict], merge_attempts: int) -
 
 
 def _parse_env_flag(name: str, default: bool) -> bool:
-    """Parse a boolean ``AGENT_*`` environment flag (ADR-0053).
+    """Parse a boolean ``AGENT_*`` environment flag (ADR-0054).
 
     Accepts case-insensitive ``1/true/yes/on`` and ``0/false/no/off``. An
     unset or blank variable yields ``default``. A malformed value degrades to
@@ -2315,7 +2315,7 @@ def merge_node(state: AgentState) -> AgentState:
     a poll timeout (no actionable verdict) transitions to ``failed``/recovery
     unchanged.
 
-    Interim no-judge mode (``AGENT_JUDGE_ENABLED=false``, ADR-0053): the phase
+    Interim no-judge mode (``AGENT_JUDGE_ENABLED=false``, ADR-0054): the phase
     waits only for an external (human/policy) merge — verdict parsing, judge
     trust resolution, and freshness anchoring are skipped entirely, and the
     machine-scale ``AGENT_MERGE_POLL_TIMEOUT`` is replaced by the human-scale
@@ -2325,7 +2325,7 @@ def merge_node(state: AgentState) -> AgentState:
     poll-timeout failure. The default (flag unset or truthy) preserves
     ADR-0014 semantics exactly.
 
-    Check-Run Fail-Fast (issue #140, ADR-0054): each poll iteration additionally
+    Check-Run Fail-Fast (issue #140, ADR-0055): each poll iteration additionally
     fetches the PR head SHA's check runs. A concluded product-CI failure breaks
     the poll early and routes into the Merge-Fix Loop with structured check
     output as feedback; a failed judge-workflow check escalates to Failure
@@ -2345,7 +2345,7 @@ def merge_node(state: AgentState) -> AgentState:
         raise ValueError("Cannot run Merge-Node: 'branch' is not set in the state.")
 
     # Mode is resolved once per Merge-Node entry, before any API call, so
-    # resume behavior is deterministic (ADR-0053 edge case): whatever the
+    # resume behavior is deterministic (ADR-0054 edge case): whatever the
     # environment says at (re-)entry wins — the persisted state carries no
     # mode marker, making mid-run toggles well-defined across invocations.
     judge_enabled = _parse_env_flag("AGENT_JUDGE_ENABLED", True)
@@ -2408,7 +2408,7 @@ def merge_node(state: AgentState) -> AgentState:
 
         # 3. Polling loop
         poll_interval = int(os.getenv("AGENT_MERGE_POLL_INTERVAL", "10"))
-        # Timeout selection (ADR-0053 edge case): in no-judge mode the
+        # Timeout selection (ADR-0054 edge case): in no-judge mode the
         # human-scale AGENT_NO_JUDGE_MERGE_TIMEOUT fully replaces the
         # machine-scale AGENT_MERGE_POLL_TIMEOUT (which is not consulted at
         # all). A non-positive value disables the window: the loop waits for
@@ -2458,12 +2458,12 @@ def merge_node(state: AgentState) -> AgentState:
         verdict_review_body: str | None = None
         # Submission time of the newest qualifying verdict review — used to
         # resolve mixed signals (failed CI check vs actionable verdict) to the
-        # newest actionable signal (ADR-0054).
+        # newest actionable signal (ADR-0055).
         verdict_signal_time: datetime.datetime | None = None
         # Whether the newest qualifying review carried an actionable verdict.
         # Always False in no-judge mode (no reviews are parsed).
         verdict_actionable = False
-        # Check-Run Fail-Fast signal state (ADR-0054): failed checks split into
+        # Check-Run Fail-Fast signal state (ADR-0055): failed checks split into
         # fixable product-CI failures (merge-fix) and judge-workflow failures
         # (escalation). None means "no failure observed this run so far".
         ci_fixable: list[dict] | None = None
@@ -2570,19 +2570,19 @@ def merge_node(state: AgentState) -> AgentState:
                 # An actionable verdict is collected as a pending signal rather
                 # than breaking immediately: the same iteration still evaluates
                 # CI check runs so mixed signals resolve to the newest
-                # actionable one (ADR-0054). The ADR-0019 verdict block remains
+                # actionable one (ADR-0055). The ADR-0019 verdict block remains
                 # the primary signal when timestamps are missing or unparseable.
                 verdict_actionable = block_found and any(
                     v in ("FAIL", "NEEDS REVIEW") for v in verdicts.values()
                 )
 
-            # Check-Run Fail-Fast (ADR-0054): fetch the current head SHA's
+            # Check-Run Fail-Fast (ADR-0055): fetch the current head SHA's
             # check runs every iteration. Keyed to the fresh head SHA from this
             # iteration's PR fetch, so a merge-fix push mid-poll automatically
             # re-anchors evaluation to the new head (freshness by SHA keying,
             # consistent with the pushed_at anchor for verdicts). Skipped when
             # no head SHA is available (e.g. degenerate API payloads), leaving
-            # polling behavior identical to pre-ADR-0054 runs.
+            # polling behavior identical to pre-ADR-0055 runs.
             head_sha = ""
             head_obj = pr_data.get("head")
             if isinstance(head_obj, dict):
@@ -2597,7 +2597,7 @@ def merge_node(state: AgentState) -> AgentState:
                         # Judge-workflow failures are infrastructure the Worker
                         # cannot fix; they outrank any fixable product-CI
                         # failure because a fix cycle could not converge while
-                        # the hard gate is broken (ADR-0050 / ADR-0054).
+                        # the hard gate is broken (ADR-0050 / ADR-0055).
                         ci_infra = infra
                         ci_fixable = None
                     elif fixable:
@@ -2678,7 +2678,7 @@ def merge_node(state: AgentState) -> AgentState:
 
         if not pr_merged:
             if not failure_reason and not judge_enabled:
-                # Interim no-judge mode (ADR-0053): the human-review window
+                # Interim no-judge mode (ADR-0054): the human-review window
                 # elapsed without an external merge. This is an expected
                 # operational state, not a failure: pause resumably by leaving
                 # status/phase as "merging" (route_after_merge ends this graph
@@ -2704,13 +2704,13 @@ def merge_node(state: AgentState) -> AgentState:
             logger.error("Merge phase failed: %s", failure_reason)
 
             # Post-PR judge-feedback loop (ADR-0036) extended by Check-Run
-            # Fail-Fast (ADR-0054): an actionable judge verdict OR a failed
+            # Fail-Fast (ADR-0055): an actionable judge verdict OR a failed
             # product-CI check is distinct from a poll timeout. Either triggers
             # a bounded merge-fix retry through the shared budget and feedback
             # channel; a timeout (nothing actionable) transitions to recovery
             # unchanged.
             if escalate_infra:
-                # ADR-0050 / ADR-0054: a failed judge-workflow check is
+                # ADR-0050 / ADR-0055: a failed judge-workflow check is
                 # infrastructure the Worker cannot fix — escalate with an
                 # explanatory PR comment WITHOUT consuming merge-fix budget.
                 _post_pr_comment(

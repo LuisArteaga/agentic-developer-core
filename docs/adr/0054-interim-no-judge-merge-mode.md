@@ -1,4 +1,4 @@
-# ADR 0053: Interim No-Judge Merge Mode with Resumable Pause
+# ADR 0054: Interim No-Judge Merge Mode with Resumable Pause
 
 * **Status**: Accepted (interim — to be superseded by the judge-integration outcome of #132)
 * **Date**: 2026-08-24
