@@ -5142,6 +5142,742 @@ class TestGithubApiRetry(unittest.TestCase):
         mock_sleep.assert_not_called()
 
 
+class TestMergeNodeCheckRunFailFast(unittest.TestCase):
+    """Check-Run Fail-Fast in Merge Polling (issue #140, ADR-0054).
+
+    Each poll iteration additionally fetches the PR head SHA's check runs. A
+    concluded product-CI failure breaks the poll early into the Merge-Fix Loop
+    with structured check output as feedback; a failed judge-workflow check
+    escalates to Failure Recovery WITHOUT consuming merge-fix budget. The
+    ADR-0019 verdict block remains the primary signal: mixed signals resolve to
+    the newest actionable signal by completion/submission time.
+    """
+
+    HEAD_SHA = "abc123def456"
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+            "AGENT_MERGE_POLL_INTERVAL": "1",
+            "AGENT_MERGE_POLL_TIMEOUT": "2",
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+        # Same determinism scrubs as TestMergeNode: a machine-local trusted
+        # user would reject mocked reviews, a machine-local judge-check list
+        # would redirect the escalation-vs-fixable discrimination, and a
+        # machine-local mode flag could flip the poll into the wrong branch.
+        for scrubbed in (
+            "AGENT_TRUSTED_JUDGE_USER",
+            "AGENT_JUDGE_CHECK_NAMES",
+            "AGENT_JUDGE_ENABLED",
+        ):
+            self.original_env[scrubbed] = os.environ.get(scrubbed)
+            os.environ.pop(scrubbed, None)
+
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+
+        initial_file = self.workspace_dir / "README.md"
+        initial_file.write_text("# Test Repo", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @staticmethod
+    def _merge_state():
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        return state
+
+    @staticmethod
+    def _hidden_block_body(verdicts):
+        return TestMergeNode._hidden_block_body(verdicts)
+
+    @staticmethod
+    def _check_run(
+        name,
+        conclusion,
+        completed_at="2026-06-27T12:06:00Z",
+        title=None,
+        summary=None,
+    ):
+        run = {
+            "name": name,
+            "status": "completed",
+            "conclusion": conclusion,
+            "completed_at": completed_at,
+        }
+        if title is not None or summary is not None:
+            run["output"] = {"title": title or "", "summary": summary or ""}
+        return run
+
+    def _api_side_effect(self, pr_payloads_by_call, check_runs_pages):
+        """Build an api_side_effect closure driven per-call.
+
+        pr_payloads_by_call: list of payloads returned by successive in-loop
+        GET /pulls/{n} fetches (last one repeats). check_runs_pages: list of
+        page payloads returned for successive GET .../check-runs requests
+        across the whole poll. Records every served path into self.calls.
+        """
+        self.calls: list[str] = []
+        pulls_seen = {"n": 0}
+        checks_seen = {"n": 0}
+
+        def side_effect(method, path, body=None):
+            self.calls.append(path)
+            if method != "GET":
+                raise ValueError(f"Unexpected API call: {method} {path}")
+            if path.endswith("/user"):
+                return {"login": "test-judge-user"}
+            if path.endswith("/reviews"):
+                return self.reviews_fixture
+            if "/check-runs" in path:
+                idx = min(checks_seen["n"], len(check_runs_pages) - 1)
+                checks_seen["n"] += 1
+                return check_runs_pages[idx]
+            if "/pulls" in path and path.endswith("/pulls/1"):
+                idx = min(pulls_seen["n"], len(pr_payloads_by_call) - 1)
+                pulls_seen["n"] += 1
+                return pr_payloads_by_call[idx]
+            if "/pulls" in path:
+                return [{"number": 1}]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        return side_effect
+
+    def _run_merge_node(self, mock_api, mock_commit_time, **kwargs):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        self.reviews_fixture = kwargs.pop("reviews", [])
+        mock_api.side_effect = self._api_side_effect(**kwargs)
+        state = self._merge_state()
+        state_module.save(state)
+        from orchestrator.nodes import merge_node
+
+        return merge_node(state)
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_ci_failure_breaks_poll_into_merge_fix_with_check_output(
+        self, mock_api, mock_commit_time
+    ):
+        """A concluded product-CI failure routes to merge-fix immediately."""
+        long_summary = "x" * 600
+        failing = [
+            self._check_run(
+                "lint",
+                "failure",
+                title="ruff failed",
+                summary=long_summary,
+            )
+        ]
+        # Six more failures exercise the bounded-list omission note.
+        failing.extend(
+            self._check_run(f"extra-check-{i}", "cancelled") for i in range(6)
+        )
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}}
+        ]
+        check_pages = [{"total_count": len(failing), "check_runs": failing}]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+        )
+
+        # Fast path: broke out of the poll on the FIRST iteration instead of
+        # burning the timeout window.
+        in_loop_pull_fetches = sum(1 for p in self.calls if p.endswith("/pulls/1"))
+        self.assertEqual(in_loop_pull_fetches, 1)
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        self.assertEqual(new_state["attempts"].get("merge"), 1)
+        self.assertEqual(new_state["attempts"].get("verify_cmd"), 0)
+        self.assertEqual(new_state["attempts"].get("bineval"), 0)
+        assert new_state["feedback"] is not None
+        self.assertIn("merge-fix attempt 1/", new_state["feedback"])
+        self.assertIn("lint", new_state["feedback"])
+        self.assertIn("ruff failed", new_state["feedback"])
+        # Oversized summaries are truncated before entering the channel.
+        self.assertIn("[truncated]", new_state["feedback"])
+        self.assertNotIn("x" * 600, new_state["feedback"])
+        # Only the first five failed checks are listed; the rest are counted.
+        self.assertIn("extra-check-3", new_state["feedback"])
+        self.assertIn("(+2 more failed checks omitted.)", new_state["feedback"])
+        self.assertNotIn("extra-check-5", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_judge_workflow_failure_escalates_without_budget(
+        self, mock_api, mock_commit_time
+    ):
+        """A failed judge-workflow check escalates; no budget is consumed."""
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}}
+        ]
+        check_pages = [
+            {
+                "total_count": 1,
+                # Reusable-workflow checks are named 'caller / callee' — the
+                # substring heuristic must still recognize them.
+                "check_runs": [
+                    self._check_run(
+                        "build / llm-pr-review",
+                        "timed_out",
+                        title="Judge workflow timed out",
+                        summary="y" * 600,
+                    )
+                ],
+            }
+        ]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+        )
+
+        self.assertEqual(new_state["status"], "failed")
+        # No merge-fix budget consumed.
+        self.assertIsNone(new_state["attempts"].get("merge"))
+        assert new_state["feedback"] is not None
+        self.assertIn("escalated without consuming", new_state["feedback"])
+        self.assertIn("llm-pr-review", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_pending_checks_keep_polling_until_merge(self, mock_api, mock_commit_time):
+        """In-progress checks are not failures: the poll continues normally."""
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}},
+            {"merged": True, "state": "closed", "head": {"sha": self.HEAD_SHA}},
+        ]
+        check_pages = [
+            {
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "ci",
+                        "status": "in_progress",
+                        "conclusion": None,
+                    }
+                ],
+            }
+        ]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+        )
+
+        self.assertEqual(new_state["status"], "done")
+        self.assertIsNone(new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_absent_check_runs_keep_polling(self, mock_api, mock_commit_time):
+        """No check runs at all (repo without CI): behavior identical to today."""
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}},
+            {"merged": True, "state": "closed", "head": {"sha": self.HEAD_SHA}},
+        ]
+        check_pages = [{"total_count": 0, "check_runs": []}]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+        )
+
+        self.assertEqual(new_state["status"], "done")
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_green_neutral_skipped_conclusions_are_not_failures(
+        self, mock_api, mock_commit_time
+    ):
+        """success / neutral / skipped conclusions never trigger fail-fast."""
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}},
+            {"merged": True, "state": "closed", "head": {"sha": self.HEAD_SHA}},
+        ]
+        check_pages = [
+            {
+                "total_count": 3,
+                "check_runs": [
+                    self._check_run("build", "success"),
+                    self._check_run("license-check", "neutral"),
+                    self._check_run("docs", "skipped"),
+                ],
+            }
+        ]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+        )
+
+        self.assertEqual(new_state["status"], "done")
+        self.assertIsNone(new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_pagination_follows_subsequent_pages(self, mock_api, mock_commit_time):
+        """A failure beyond the first page is still found (bounded pagination)."""
+        first_page = {
+            "total_count": 101,
+            "check_runs": [self._check_run(f"job-{i}", "success") for i in range(100)],
+        }
+        second_page = {
+            "total_count": 101,
+            # Non-dict entries are filtered defensively.
+            "check_runs": [None, self._check_run("e2e-nightly", "cancelled")],
+        }
+
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}}
+        ]
+        check_pages = [first_page, second_page]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+        )
+
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        assert new_state["feedback"] is not None
+        self.assertIn("e2e-nightly", new_state["feedback"])
+        # Both pages were requested.
+        check_run_calls = [p for p in self.calls if "/check-runs" in p]
+        self.assertEqual(len(check_run_calls), 2)
+        self.assertIn("page=1", check_run_calls[0])
+        self.assertIn("page=2", check_run_calls[1])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_degenerate_payloads_never_break_the_poll(self, mock_api, mock_commit_time):
+        """Non-dict / key-less check-run payloads degrade to 'no signal'."""
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}},
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}},
+            {"merged": True, "state": "closed", "head": {"sha": self.HEAD_SHA}},
+        ]
+        # First iteration: a bare list (not a CheckRunsResponse dict).
+        # Second iteration: a dict without the check_runs key.
+        # Third iteration: merged. Three iterations need a 3s window.
+        check_pages: list[object] = [[], {}]
+
+        old_timeout = os.environ.get("AGENT_MERGE_POLL_TIMEOUT")
+        os.environ["AGENT_MERGE_POLL_TIMEOUT"] = "3"
+        try:
+            new_state = self._run_merge_node(
+                mock_api,
+                mock_commit_time,
+                pr_payloads_by_call=pr_payloads,
+                check_runs_pages=check_pages,
+            )
+        finally:
+            if old_timeout is None:
+                os.environ.pop("AGENT_MERGE_POLL_TIMEOUT", None)
+            else:
+                os.environ["AGENT_MERGE_POLL_TIMEOUT"] = old_timeout
+
+        self.assertEqual(new_state["status"], "done")
+        self.assertIsNone(new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_transient_api_error_continues_polling(self, mock_api, mock_commit_time):
+        """A raised check-runs error logs and continues; never fails the poll."""
+
+        base_effect_calls = {"checks": 0, "pulls": 0}
+
+        def flaky_side_effect(method, path, body=None):
+            if "/check-runs" in path:
+                base_effect_calls["checks"] += 1
+                if base_effect_calls["checks"] == 1:
+                    raise RuntimeError("GitHub API request exhausted retries")
+                return {"total_count": 0, "check_runs": []}
+            if method == "GET":
+                if path.endswith("/pulls/1"):
+                    base_effect_calls["pulls"] += 1
+                    # First iteration is open so the flaky check-runs fetch is
+                    # reached; the second reports merged.
+                    if base_effect_calls["pulls"] == 1:
+                        return {
+                            "merged": False,
+                            "state": "open",
+                            "head": {"sha": self.HEAD_SHA},
+                        }
+                    return {"merged": True, "state": "closed"}
+                if "/pulls" in path:
+                    return [{"number": 1}]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        mock_api.side_effect = flaky_side_effect
+        state = self._merge_state()
+        state_module.save(state)
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(state)
+
+        self.assertEqual(new_state["status"], "done")
+        self.assertIsNone(new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_mixed_signals_newer_check_failure_wins(self, mock_api, mock_commit_time):
+        """Failed CI check completed AFTER an actionable verdict -> checks win."""
+        reviews = [
+            {
+                "submitted_at": "2026-06-27T12:05:00Z",
+                "body": self._hidden_block_body({"security": "FAIL"}),
+                "user": {"login": "test-judge-user"},
+            }
+        ]
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}}
+        ]
+        check_pages = [
+            {
+                "total_count": 1,
+                "check_runs": [
+                    # Completed AFTER the 12:05 verdict.
+                    self._check_run(
+                        "integration",
+                        "failure",
+                        completed_at="2026-06-27T12:07:00Z",
+                        title="3 tests failed",
+                        summary="test_payment::failed assertion on total",
+                    )
+                ],
+            }
+        ]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+            reviews=reviews,
+        )
+
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        assert new_state["feedback"] is not None
+        # The check output feeds the channel, not the judge findings.
+        self.assertIn("integration", new_state["feedback"])
+        self.assertIn("3 tests failed", new_state["feedback"])
+        self.assertNotIn("security (FAIL)", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_mixed_signals_newer_verdict_wins_and_unparseable_time_prefers_verdict(
+        self, mock_api, mock_commit_time
+    ):
+        """Verdict submitted after the check failure wins; a check with an
+        unparseable completion time cannot outrank the primary signal either."""
+        reviews = [
+            {
+                "submitted_at": "2026-06-27T12:09:00Z",
+                "body": self._hidden_block_body({"security": "FAIL"}),
+                "user": {"login": "test-judge-user"},
+            }
+        ]
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}}
+        ]
+        check_pages = [
+            {
+                "total_count": 3,
+                "check_runs": [
+                    # Older than the 12:09 verdict.
+                    self._check_run(
+                        "integration",
+                        "failure",
+                        completed_at="2026-06-27T12:07:00Z",
+                    ),
+                    # Unparseable completion time.
+                    self._check_run(
+                        "soak",
+                        "failure",
+                        completed_at="not-a-timestamp",
+                    ),
+                    # Missing completion time entirely.
+                    self._check_run("boot", "failure", completed_at=None),
+                ],
+            }
+        ]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+            reviews=reviews,
+        )
+
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        assert new_state["feedback"] is not None
+        # The judge findings feed the channel, not the check output.
+        self.assertIn("security (FAIL)", new_state["feedback"])
+        self.assertNotIn("integration", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_no_judge_mode_still_fails_fast_on_ci_failure(
+        self, mock_api, mock_commit_time
+    ):
+        """Check-run fail-fast works without judges; review endpoints untouched."""
+        os.environ["AGENT_JUDGE_ENABLED"] = "false"
+        try:
+            pr_payloads = [
+                {
+                    "merged": False,
+                    "state": "open",
+                    "head": {"sha": self.HEAD_SHA},
+                }
+            ]
+            check_pages = [
+                {
+                    "total_count": 1,
+                    "check_runs": [
+                        self._check_run(
+                            "lint",
+                            "action_required",
+                            title="manual review needed",
+                            summary="workflow requires intervention",
+                        )
+                    ],
+                }
+            ]
+
+            new_state = self._run_merge_node(
+                mock_api,
+                mock_commit_time,
+                pr_payloads_by_call=pr_payloads,
+                check_runs_pages=check_pages,
+            )
+        finally:
+            os.environ.pop("AGENT_JUDGE_ENABLED", None)
+
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        assert new_state["feedback"] is not None
+        self.assertIn("lint", new_state["feedback"])
+        # Judge-only endpoints must never be touched in no-judge mode.
+        self.assertFalse(any(p.endswith("/reviews") for p in self.calls))
+        self.assertFalse(any(p.endswith("/user") for p in self.calls))
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_checks_budget_exhaustion_posts_comment_and_fails(
+        self, mock_api, mock_commit_time
+    ):
+        """At exhaustion, check-triggered cycles post the handover comment."""
+        posted_comments = []
+        old_fix_max = os.environ.get("AGENT_PR_FIX_MAX")
+        os.environ["AGENT_PR_FIX_MAX"] = "1"
+        try:
+
+            def effect(method, path, body=None):
+                if method == "POST" and path.endswith("/comments"):
+                    posted_comments.append(body)
+                    return {}
+                if method == "GET":
+                    if path.endswith("/user"):
+                        return {"login": "test-judge-user"}
+                    if path.endswith("/reviews"):
+                        return []
+                    if "/check-runs" in path:
+                        return {
+                            "total_count": 1,
+                            "check_runs": [
+                                self._check_run(
+                                    "nightly-suite",
+                                    "failure",
+                                    title="suite red",
+                                    summary="50 failures",
+                                )
+                            ],
+                        }
+                    if path.endswith("/pulls/1"):
+                        return {
+                            "merged": False,
+                            "state": "open",
+                            "head": {"sha": self.HEAD_SHA},
+                        }
+                    if "/pulls" in path:
+                        return [{"number": 1}]
+                raise ValueError(f"Unexpected API call: {method} {path}")
+
+            mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+            mock_api.side_effect = effect
+            state = self._merge_state()
+            # Budget already exhausted: cap=1 with one cycle spent.
+            state["attempts"] = {"merge": 1, "verify_cmd": 0, "bineval": 0}
+            state_module.save(state)
+
+            from orchestrator.nodes import merge_node
+
+            new_state = merge_node(state)
+        finally:
+            if old_fix_max is None:
+                os.environ.pop("AGENT_PR_FIX_MAX", None)
+            else:
+                os.environ["AGENT_PR_FIX_MAX"] = old_fix_max
+
+        self.assertEqual(new_state["status"], "failed")
+        # Budget NOT incremented past its prior value.
+        self.assertEqual(new_state["attempts"].get("merge"), 1)
+        self.assertEqual(len(posted_comments), 1)
+        self.assertIn("Merge-fix budget exhausted", posted_comments[0]["body"])
+        self.assertIn("nightly-suite", posted_comments[0]["body"])
+        assert new_state["feedback"] is not None
+        self.assertIn("Merge-fix budget exhausted", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_custom_judge_check_names_redirect_escalation(
+        self, mock_api, mock_commit_time
+    ):
+        """AGENT_JUDGE_CHECK_NAMES overrides the default judge-name fragments."""
+        old_names = os.environ.get("AGENT_JUDGE_CHECK_NAMES")
+        os.environ["AGENT_JUDGE_CHECK_NAMES"] = "custom-judge-ci"
+        try:
+            pr_payloads = [
+                {
+                    "merged": False,
+                    "state": "open",
+                    "head": {"sha": self.HEAD_SHA},
+                }
+            ]
+            check_pages = [
+                {
+                    "total_count": 2,
+                    "check_runs": [
+                        self._check_run("lint", "failure"),
+                        self._check_run(
+                            "custom-judge-ci",
+                            "failure",
+                            title="judge crashed",
+                        ),
+                    ],
+                }
+            ]
+
+            new_state = self._run_merge_node(
+                mock_api,
+                mock_commit_time,
+                pr_payloads_by_call=pr_payloads,
+                check_runs_pages=check_pages,
+            )
+        finally:
+            if old_names is None:
+                os.environ.pop("AGENT_JUDGE_CHECK_NAMES", None)
+            else:
+                os.environ["AGENT_JUDGE_CHECK_NAMES"] = old_names
+
+        # Only the custom-named check escalates; 'lint' would have been
+        # fixable, but infra escalation outranks fixable failures.
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIsNone(new_state["attempts"].get("merge"))
+        assert new_state["feedback"] is not None
+        self.assertIn("custom-judge-ci", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_blank_judge_check_names_fall_back_to_default_fragment(
+        self, mock_api, mock_commit_time
+    ):
+        """An empty/blank AGENT_JUDGE_CHECK_NAMES yields the default fragment."""
+        for blank in ("", " , ,"):
+            old_names = os.environ.get("AGENT_JUDGE_CHECK_NAMES")
+            os.environ["AGENT_JUDGE_CHECK_NAMES"] = blank
+            try:
+                pr_payloads = [
+                    {
+                        "merged": False,
+                        "state": "open",
+                        "head": {"sha": self.HEAD_SHA},
+                    }
+                ]
+                check_pages = [
+                    {
+                        "total_count": 1,
+                        "check_runs": [self._check_run("llm-pr-review", "failure")],
+                    }
+                ]
+
+                new_state = self._run_merge_node(
+                    mock_api,
+                    mock_commit_time,
+                    pr_payloads_by_call=pr_payloads,
+                    check_runs_pages=check_pages,
+                )
+            finally:
+                if old_names is None:
+                    os.environ.pop("AGENT_JUDGE_CHECK_NAMES", None)
+                else:
+                    os.environ["AGENT_JUDGE_CHECK_NAMES"] = old_names
+
+            self.assertEqual(new_state["status"], "failed")
+
+
 class TestRecoveryOnException(unittest.TestCase):
     """ADR-0038: a node exception is recorded (status=failed, return state) so
     the status-based conditional edges route to recovery_node, which cleans the

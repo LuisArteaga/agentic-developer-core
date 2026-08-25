@@ -2066,6 +2066,214 @@ def _post_pr_comment(github_repo: str, pr_num: int, body: str) -> None:
         )
 
 
+# --- Check-Run Fail-Fast in Merge Polling (issue #140, ADR-0054) ---
+#
+# Conclusions treated as a concluded check failure. Deliberately excludes
+# success/neutral/skipped (not failures per the issue contract), plus the
+# GitHub-managed stale and startup_failure conclusions, which fall through to
+# the existing polling/timeout behavior rather than consuming merge-fix budget.
+_CHECK_RUNS_FAILURE_CONCLUSIONS = frozenset(
+    {"failure", "cancelled", "timed_out", "action_required"}
+)
+_CHECK_RUNS_PAGE_SIZE = 100
+_CHECK_RUNS_MAX_PAGES = 10
+_CHECK_SUMMARY_MAX_CHARS = 500
+_CHECK_RUN_FEEDBACK_MAX_CHECKS = 5
+_DEFAULT_JUDGE_CHECK_FRAGMENTS = ("llm-pr-review",)
+
+
+def _parse_judge_check_names() -> tuple[str, ...]:
+    """Resolve the judge-workflow check-name fragments from the environment.
+
+    ``AGENT_JUDGE_CHECK_NAMES`` is a comma-separated list of case-insensitive
+    substrings identifying check runs owned by the PR Review Judge workflow.
+    Substring matching is deliberate: when a target repository invokes the
+    Reusable Judge Workflow (ADR-0050), GitHub registers the called job's check
+    as ``<caller-job> / <called-job>``, so an exact-name match would miss it.
+    An unset, blank, or fragments-only-comma value degrades to the default
+    fragment derived from this repository's canonical judge job name.
+    """
+    raw = os.getenv("AGENT_JUDGE_CHECK_NAMES")
+    if raw:
+        names = tuple(s.strip().lower() for s in raw.split(",") if s.strip())
+        if names:
+            return names
+    return _DEFAULT_JUDGE_CHECK_FRAGMENTS
+
+
+def _fetch_check_runs(github_repo: str, head_sha: str) -> list[dict]:
+    """Fetch all check runs for a commit SHA, following page pagination.
+
+    Requests the maximum page size and iterates the ``page`` parameter until a
+    short page is seen, bounded by ``_CHECK_RUNS_MAX_PAGES`` so a pathological
+    API response cannot loop forever. Malformed payloads degrade to whatever
+    was collected so far; callers are responsible for transient-error
+    resilience (the underlying request helper already retries internally).
+    """
+    runs: list[dict] = []
+    for page in range(1, _CHECK_RUNS_MAX_PAGES + 1):
+        payload = _github_api_request(
+            "GET",
+            f"/repos/{github_repo}/commits/{head_sha}/check-runs"
+            f"?per_page={_CHECK_RUNS_PAGE_SIZE}&page={page}",
+        )
+        if not isinstance(payload, dict):
+            logger.warning(
+                "Check-runs payload for SHA %s was %s; using %d collected run(s).",
+                head_sha,
+                type(payload).__name__,
+                len(runs),
+            )
+            break
+        page_runs = payload.get("check_runs")
+        if not isinstance(page_runs, list):
+            break
+        runs.extend(r for r in page_runs if isinstance(r, dict))
+        if len(page_runs) < _CHECK_RUNS_PAGE_SIZE:
+            break
+    return runs
+
+
+def _evaluate_check_failures(
+    check_runs: list[dict],
+    judge_fragments: tuple[str, ...],
+) -> tuple[list[dict], list[dict]]:
+    """Split concluded-failure check runs into fixable vs judge-infrastructure.
+
+    Returns ``(fixable, infra)``: product-CI failures the Worker can address
+    through the Merge-Fix Loop, versus failures on checks matching the judge
+    fragments — infrastructure the Worker cannot fix, which must escalate
+    instead of burning budget (ADR-0050 / ADR-0054).
+    """
+    fixable: list[dict] = []
+    infra: list[dict] = []
+    for run in check_runs:
+        conclusion = run.get("conclusion")
+        if conclusion not in _CHECK_RUNS_FAILURE_CONCLUSIONS:
+            continue
+        name = str(run.get("name") or "unnamed-check").strip() or "unnamed-check"
+        output = run.get("output")
+        output = output if isinstance(output, dict) else {}
+        entry = {
+            "name": name,
+            "conclusion": str(conclusion),
+            "title": str(output.get("title") or "").strip(),
+            "summary": str(output.get("summary") or "").strip(),
+            "completed_at": str(run.get("completed_at") or ""),
+        }
+        lowered = name.lower()
+        if any(fragment in lowered for fragment in judge_fragments):
+            infra.append(entry)
+        else:
+            fixable.append(entry)
+    return fixable, infra
+
+
+def _check_signal_time(entries: list[dict]) -> datetime.datetime | None:
+    """Return the newest ``completed_at`` among failed-check entries, or None."""
+    newest: datetime.datetime | None = None
+    for entry in entries:
+        raw = entry.get("completed_at")
+        if not raw:
+            continue
+        try:
+            completed = _parse_iso_datetime(raw)
+        except (ValueError, TypeError):
+            continue
+        if newest is None or completed > newest:
+            newest = completed
+    return newest
+
+
+def _check_run_feedback(failed_checks: list[dict], attempt: int, cap: int) -> str:
+    """Build the Worker feedback message from failed CI checks (ADR-0054).
+
+    Structured like ``_merge_fix_feedback`` so both signals share the existing
+    Verification Feedback channel consumed by ``execute_node``: each failing
+    check contributes its name, conclusion, output title, and a truncated
+    output summary — GitHub check output only, keeping Language Agnosticism.
+    """
+    lines = [
+        f"CI check feedback — merge-fix attempt {attempt}/{cap}.",
+        "One or more CI checks failed on the current PR head. Diagnose each "
+        "failure below from its output and fix the underlying code.",
+        "",
+    ]
+    for check in failed_checks[:_CHECK_RUN_FEEDBACK_MAX_CHECKS]:
+        lines.append(f"Check '{check['name']}' concluded {check['conclusion']}.")
+        if check["title"]:
+            lines.append(f"  Title: {check['title']}")
+        summary = check["summary"]
+        if len(summary) > _CHECK_SUMMARY_MAX_CHARS:
+            summary = summary[:_CHECK_SUMMARY_MAX_CHARS] + "… [truncated]"
+        if summary:
+            lines.append(f"  Summary: {summary}")
+        lines.append("")
+    remaining = len(failed_checks) - _CHECK_RUN_FEEDBACK_MAX_CHECKS
+    if remaining > 0:
+        lines.append(f"(+{remaining} more failed checks omitted.)")
+        lines.append("")
+    lines.append(
+        "Fix the failures. The next push triggers a fresh CI run; the loop "
+        "re-polls the merge."
+    )
+    return "\n".join(lines)
+
+
+def _judge_infra_failure_comment(infra_failures: list[dict]) -> str:
+    """Build the escalation PR comment for a failed judge-workflow check.
+
+    A failed judge-workflow check is infrastructure the Worker cannot fix, so
+    the loop escalates to a human instead of entering the Merge-Fix Loop
+    (ADR-0050 / ADR-0054); no merge-fix budget is consumed.
+    """
+    lines = [
+        "### Merge paused: judge workflow infrastructure failure",
+        "",
+        "The autonomous loop detected that a PR Review Judge workflow check "
+        "failed. This is infrastructure the Worker cannot fix, so no automated "
+        "merge-fix attempt was made.",
+        "",
+    ]
+    for check in infra_failures[:_CHECK_RUN_FEEDBACK_MAX_CHECKS]:
+        lines.append(f"- Check '{check['name']}' concluded {check['conclusion']}.")
+        if check["title"]:
+            lines.append(f"  Title: {check['title']}")
+        summary = check["summary"]
+        if len(summary) > _CHECK_SUMMARY_MAX_CHARS:
+            summary = summary[:_CHECK_SUMMARY_MAX_CHARS] + "… [truncated]"
+        if summary:
+            lines.append(f"  Summary: {summary}")
+    lines.append("")
+    lines.append(
+        "A human should inspect the judge workflow run (permissions, secrets, "
+        "quota) and re-run it; the issue will be re-queued."
+    )
+    return "\n".join(lines)
+
+
+def _checks_exhaustion_comment(failed_checks: list[dict], merge_attempts: int) -> str:
+    """Build the PR comment posted at merge-fix budget exhaustion on CI checks."""
+    lines = [
+        "### Merge-fix budget exhausted",
+        "",
+        f"The autonomous loop exhausted its merge-fix retry budget "
+        f"({merge_attempts} attempts) addressing failed CI checks.",
+        "",
+        "Unresolved checks:",
+    ]
+    for check in failed_checks[:_CHECK_RUN_FEEDBACK_MAX_CHECKS]:
+        lines.append(f"- Check '{check['name']}' concluded {check['conclusion']}.")
+        if check["title"]:
+            lines.append(f"  Title: {check['title']}")
+    lines.append("")
+    lines.append(
+        "The issue is being re-queued for a future attempt. A human reviewer may "
+        "wish to resolve the failures above directly on this branch."
+    )
+    return "\n".join(lines)
+
+
 def _parse_env_flag(name: str, default: bool) -> bool:
     """Parse a boolean ``AGENT_*`` environment flag (ADR-0053).
 
@@ -2116,6 +2324,15 @@ def merge_node(state: AgentState) -> AgentState:
     Stateful Resume routes back here) instead of producing a misleading
     poll-timeout failure. The default (flag unset or truthy) preserves
     ADR-0014 semantics exactly.
+
+    Check-Run Fail-Fast (issue #140, ADR-0054): each poll iteration additionally
+    fetches the PR head SHA's check runs. A concluded product-CI failure breaks
+    the poll early and routes into the Merge-Fix Loop with structured check
+    output as feedback; a failed judge-workflow check escalates to Failure
+    Recovery with an explanatory PR comment instead of consuming merge-fix
+    budget (infrastructure the Worker cannot fix, ADR-0050). The ADR-0019
+    hidden verdict block remains the primary signal — mixed signals resolve to
+    the newest actionable signal, compared by completion/submission time.
     """
     issue_num = state.get("issue_number")
     if issue_num is None:
@@ -2239,6 +2456,23 @@ def merge_node(state: AgentState) -> AgentState:
         # no-judge mode, which keeps the post-loop actionable-verdict check
         # deterministically False.
         verdict_review_body: str | None = None
+        # Submission time of the newest qualifying verdict review — used to
+        # resolve mixed signals (failed CI check vs actionable verdict) to the
+        # newest actionable signal (ADR-0054).
+        verdict_signal_time: datetime.datetime | None = None
+        # Whether the newest qualifying review carried an actionable verdict.
+        # Always False in no-judge mode (no reviews are parsed).
+        verdict_actionable = False
+        # Check-Run Fail-Fast signal state (ADR-0054): failed checks split into
+        # fixable product-CI failures (merge-fix) and judge-workflow failures
+        # (escalation). None means "no failure observed this run so far".
+        ci_fixable: list[dict] | None = None
+        ci_infra: list[dict] | None = None
+        escalate_infra = False
+        # Which actionable signal ended the poll: "verdict", "checks", or None
+        # (timeout / closed-without-merge).
+        signal_kind: str | None = None
+        judge_check_fragments = _parse_judge_check_names()
 
         # Determine reference time to anchor freshness (push time recorded by orchestrator).
         # Judge-mode only: freshness filtering exists to gate verdict blocks.
@@ -2331,15 +2565,97 @@ def merge_node(state: AgentState) -> AgentState:
                         # [SEVERITY]-tagged findings can be extracted on an
                         # actionable verdict (ADR-0036).
                         verdict_review_body = body
+                        verdict_signal_time = submitted_dt
 
-                # Only block when we have actually parsed a hidden verdict block.
-                if block_found:
-                    for k in judge_keys:
-                        if verdicts[k] in ("FAIL", "NEEDS REVIEW"):
-                            failure_reason = f"PR review block: {k} check verdict is '{verdicts[k]}'."
-                            break
-                    if failure_reason:
-                        break
+                # An actionable verdict is collected as a pending signal rather
+                # than breaking immediately: the same iteration still evaluates
+                # CI check runs so mixed signals resolve to the newest
+                # actionable one (ADR-0054). The ADR-0019 verdict block remains
+                # the primary signal when timestamps are missing or unparseable.
+                verdict_actionable = block_found and any(
+                    v in ("FAIL", "NEEDS REVIEW") for v in verdicts.values()
+                )
+
+            # Check-Run Fail-Fast (ADR-0054): fetch the current head SHA's
+            # check runs every iteration. Keyed to the fresh head SHA from this
+            # iteration's PR fetch, so a merge-fix push mid-poll automatically
+            # re-anchors evaluation to the new head (freshness by SHA keying,
+            # consistent with the pushed_at anchor for verdicts). Skipped when
+            # no head SHA is available (e.g. degenerate API payloads), leaving
+            # polling behavior identical to pre-ADR-0054 runs.
+            head_sha = ""
+            head_obj = pr_data.get("head")
+            if isinstance(head_obj, dict):
+                head_sha = str(head_obj.get("sha") or "").strip()
+            if head_sha:
+                try:
+                    runs = _fetch_check_runs(github_repo, head_sha)
+                    fixable, infra = _evaluate_check_failures(
+                        runs, judge_check_fragments
+                    )
+                    if infra:
+                        # Judge-workflow failures are infrastructure the Worker
+                        # cannot fix; they outrank any fixable product-CI
+                        # failure because a fix cycle could not converge while
+                        # the hard gate is broken (ADR-0050 / ADR-0054).
+                        ci_infra = infra
+                        ci_fixable = None
+                    elif fixable:
+                        ci_fixable = fixable
+                except Exception as e:  # noqa: BLE001 - resilience contract
+                    logger.warning(
+                        "Check-run fetch failed for PR #%d (SHA %s); continuing "
+                        "poll: %s",
+                        pr_num,
+                        head_sha,
+                        e,
+                    )
+
+            # Decide which actionable signal (if any) ends the poll.
+            if ci_infra:
+                names = ", ".join(f"'{c['name']}'" for c in ci_infra[:3])
+                failure_reason = (
+                    f"Judge workflow check failed on PR #{pr_num}: {names}."
+                )
+                escalate_infra = True
+                break
+
+            ci_time = _check_signal_time(ci_fixable) if ci_fixable else None
+            chosen_kind: str | None = None
+            if verdict_actionable and ci_fixable:
+                # Mixed signals: the newest actionable signal wins; when either
+                # timestamp is missing or unparseable, the verdict wins as the
+                # primary ADR-0019 signal.
+                checks_newer = (
+                    ci_time is not None
+                    and verdict_signal_time is not None
+                    and ci_time > verdict_signal_time
+                )
+                chosen_kind = "checks" if checks_newer else "verdict"
+            elif verdict_actionable:
+                chosen_kind = "verdict"
+            elif ci_fixable:
+                chosen_kind = "checks"
+
+            if chosen_kind == "checks":
+                assert ci_fixable is not None
+                failed_names = ", ".join(f"'{c['name']}'" for c in ci_fixable[:3])
+                failure_reason = (
+                    f"CI check(s) failed on PR #{pr_num} head: {failed_names}."
+                )
+                signal_kind = "checks"
+                break
+            if chosen_kind == "verdict":
+                failing_key = next(
+                    (k for k in judge_keys if verdicts[k] in ("FAIL", "NEEDS REVIEW")),
+                    "unknown",
+                )
+                failure_reason = (
+                    f"PR review block: {failing_key} check verdict is "
+                    f"'{verdicts[failing_key]}'."
+                )
+                signal_kind = "verdict"
+                break
 
             if failure_reason is None:
                 if judge_enabled:
@@ -2387,79 +2703,109 @@ def merge_node(state: AgentState) -> AgentState:
                 failure_reason = f"Polling timed out after {poll_timeout} seconds."
             logger.error("Merge phase failed: %s", failure_reason)
 
-            # Post-PR judge-feedback loop (ADR-0036): an actionable verdict is
-            # distinct from a poll timeout (no review posted). Only an
-            # actionable verdict triggers a bounded merge-fix retry; a timeout
-            # (no actionable verdict) transitions to recovery unchanged.
-            # Derive actionable from the parsed verdicts dict (any FAIL /
-            # NEEDS REVIEW) rather than the failure_reason log-message prefix,
-            # so the signal survives wording changes to failure_reason
-            # (quick win).
-            actionable = verdict_review_body is not None and any(
-                v in ("FAIL", "NEEDS REVIEW") for v in verdicts.values()
-            )
-            if actionable:
-                merge_attempts = state.get("attempts", {}).get("merge", 0)
-                pr_fix_max = int(os.getenv("AGENT_PR_FIX_MAX", "3"))
-                if merge_attempts < pr_fix_max:
-                    # Budget remaining: signal a bounded merge-fix retry. The
-                    # findings are injected into the existing feedback channel
-                    # (consumed by execute_node), and a fresh per-cycle verify
-                    # budget is granted so the Hybrid Retry threshold (ADR-0034)
-                    # counts Execute attempts within this merge-fix cycle, not
-                    # across cycles. Both per-gate counters are reset (ADR-0047):
-                    # a stale BinEval/make-verify count from the pre-PR phase must
-                    # not carry into the merge-fix cycle and trigger spurious
-                    # exhaustion.
-                    attempts = state.get("attempts", {}).copy()
-                    attempts["merge"] = merge_attempts + 1
-                    attempts["verify_cmd"] = 0
-                    attempts["bineval"] = 0
-                    state["attempts"] = attempts
-                    state["feedback"] = _merge_fix_feedback(
-                        verdict_review_body or "",
-                        verdicts,
-                        merge_attempts + 1,
-                        pr_fix_max,
-                    )
-                    state["status"] = "executing"
-                    state["phase"] = "merge_fix"
-                    logger.info(
-                        "Merge-fix retry %d/%d triggered for PR #%d (actionable "
-                        "judge feedback). Routing back to execute.",
-                        merge_attempts + 1,
-                        pr_fix_max,
-                        pr_num,
-                    )
-                else:
-                    # Budget exhausted: post a summary PR comment with the
-                    # unresolved findings before transitioning to recovery,
-                    # preserving a human-readable handover (replacing the prior
-                    # silent re-queue).
-                    _post_pr_comment(
-                        github_repo,
-                        pr_num,
-                        _merge_fix_escalation_comment(
-                            verdict_review_body or "",
-                            verdicts,
-                            merge_attempts,
-                        ),
-                    )
-                    state["status"] = "failed"
-                    state["feedback"] = (
-                        f"Merge-fix budget exhausted ({merge_attempts}/"
-                        f"{pr_fix_max}). Unresolved judge feedback: {failure_reason}"
-                    )
-                    logger.warning(
-                        "Merge-fix budget exhausted (%d/%d) for PR #%d. Posted "
-                        "escalation comment; transitioning to recovery.",
-                        merge_attempts,
-                        pr_fix_max,
-                        pr_num,
-                    )
-            else:
+            # Post-PR judge-feedback loop (ADR-0036) extended by Check-Run
+            # Fail-Fast (ADR-0054): an actionable judge verdict OR a failed
+            # product-CI check is distinct from a poll timeout. Either triggers
+            # a bounded merge-fix retry through the shared budget and feedback
+            # channel; a timeout (nothing actionable) transitions to recovery
+            # unchanged.
+            if escalate_infra:
+                # ADR-0050 / ADR-0054: a failed judge-workflow check is
+                # infrastructure the Worker cannot fix — escalate with an
+                # explanatory PR comment WITHOUT consuming merge-fix budget.
+                _post_pr_comment(
+                    github_repo,
+                    pr_num,
+                    _judge_infra_failure_comment(ci_infra or []),
+                )
                 state["status"] = "failed"
-                state["feedback"] = failure_reason
+                state["feedback"] = (
+                    f"{failure_reason} Judge workflow infrastructure is not "
+                    "fixable by the Worker; escalated without consuming "
+                    "merge-fix budget."
+                )
+                logger.warning(
+                    "Judge-workflow check failure for PR #%d. Posted escalation "
+                    "comment; transitioning to recovery without merge-fix.",
+                    pr_num,
+                )
+            else:
+                actionable = signal_kind in ("verdict", "checks")
+                if actionable:
+                    merge_attempts = state.get("attempts", {}).get("merge", 0)
+                    pr_fix_max = int(os.getenv("AGENT_PR_FIX_MAX", "3"))
+                    if merge_attempts < pr_fix_max:
+                        # Budget remaining: signal a bounded merge-fix retry. The
+                        # findings are injected into the existing feedback channel
+                        # (consumed by execute_node), and a fresh per-cycle verify
+                        # budget is granted so the Hybrid Retry threshold (ADR-0034)
+                        # counts Execute attempts within this merge-fix cycle, not
+                        # across cycles. Both per-gate counters are reset (ADR-0047):
+                        # a stale BinEval/make-verify count from the pre-PR phase must
+                        # not carry into the merge-fix cycle and trigger spurious
+                        # exhaustion.
+                        attempts = state.get("attempts", {}).copy()
+                        attempts["merge"] = merge_attempts + 1
+                        attempts["verify_cmd"] = 0
+                        attempts["bineval"] = 0
+                        state["attempts"] = attempts
+                        if signal_kind == "checks":
+                            state["feedback"] = _check_run_feedback(
+                                ci_fixable or [],
+                                merge_attempts + 1,
+                                pr_fix_max,
+                            )
+                        else:
+                            state["feedback"] = _merge_fix_feedback(
+                                verdict_review_body or "",
+                                verdicts,
+                                merge_attempts + 1,
+                                pr_fix_max,
+                            )
+                        state["status"] = "executing"
+                        state["phase"] = "merge_fix"
+                        logger.info(
+                            "Merge-fix retry %d/%d triggered for PR #%d "
+                            "(%s). Routing back to execute.",
+                            merge_attempts + 1,
+                            pr_fix_max,
+                            pr_num,
+                            "failed CI checks"
+                            if signal_kind == "checks"
+                            else "actionable judge feedback",
+                        )
+                    else:
+                        # Budget exhausted: post a summary PR comment with the
+                        # unresolved findings before transitioning to recovery,
+                        # preserving a human-readable handover (replacing the prior
+                        # silent re-queue).
+                        if signal_kind == "checks":
+                            escalation_body = _checks_exhaustion_comment(
+                                ci_fixable or [],
+                                merge_attempts,
+                            )
+                        else:
+                            escalation_body = _merge_fix_escalation_comment(
+                                verdict_review_body or "",
+                                verdicts,
+                                merge_attempts,
+                            )
+                        _post_pr_comment(github_repo, pr_num, escalation_body)
+                        state["status"] = "failed"
+                        state["feedback"] = (
+                            f"Merge-fix budget exhausted ({merge_attempts}/"
+                            f"{pr_fix_max}). Unresolved feedback: {failure_reason}"
+                        )
+                        logger.warning(
+                            "Merge-fix budget exhausted (%d/%d) for PR #%d. Posted "
+                            "escalation comment; transitioning to recovery.",
+                            merge_attempts,
+                            pr_fix_max,
+                            pr_num,
+                        )
+                else:
+                    state["status"] = "failed"
+                    state["feedback"] = failure_reason
         else:
             state["status"] = "done"
             state["feedback"] = None
