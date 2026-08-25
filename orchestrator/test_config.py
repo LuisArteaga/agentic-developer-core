@@ -480,6 +480,70 @@ class TestResolveRecursionLimit(unittest.TestCase):
         self.assertEqual(cfg["recursion_limit"], 55)
 
 
+class TestProductionFactoryRecursionBudget(unittest.TestCase):
+    """Guard: the production config/factory.json carries explicit per-node
+    Recursion Budgets for the ReAct worker nodes (issue #143).
+
+    Unlike TestResolveRecursionLimit, these tests are deliberately unmocked:
+    they resolve through the public ``resolve_model_config`` against the real
+    factory file, so accidentally dropping an explicit ``recursion_limit``
+    (silently reverting a node to DEFAULT_RECURSION_LIMIT) fails here. The
+    assertions are value-agnostic — re-sizing from measured Trajectory Length
+    data (ADR-0029) must never require touching this test.
+    """
+
+    _ENV_VARS = [
+        "AGENT_RECURSION_LIMIT",
+        "EXECUTE_RECURSION_LIMIT",
+        "TEST_WRITER_RECURSION_LIMIT",
+        "PLAN_RECURSION_LIMIT",
+        "EXECUTE_MODEL",
+        "TEST_WRITER_MODEL",
+    ]
+
+    def setUp(self):
+        self.original_env = {}
+        for var in self._ENV_VARS:
+            self.original_env[var] = os.environ.get(var)
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        for var, val in self.original_env.items():
+            if val is not None:
+                os.environ[var] = val
+            else:
+                os.environ.pop(var, None)
+
+    def _raw_node_config(self, node: str) -> dict:
+        self.assertTrue(FACTORY_JSON_PATH.exists(), f"{FACTORY_JSON_PATH} missing")
+        with open(FACTORY_JSON_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        self.assertIn(node, raw, f"production factory.json lacks node '{node}'")
+        self.assertIn(
+            "recursion_limit",
+            raw[node],
+            f"node '{node}' has no explicit recursion_limit; "
+            "it would silently fall back to DEFAULT_RECURSION_LIMIT",
+        )
+        return raw[node]
+
+    def test_execute_carries_explicit_recursion_budget(self):
+        """execute's budget is explicit in factory.json and resolves verbatim."""
+        node_cfg = self._raw_node_config("execute")
+        self.assertIsInstance(node_cfg["recursion_limit"], int)
+        self.assertGreater(node_cfg["recursion_limit"], 0)
+        cfg = resolve_model_config("execute")
+        self.assertEqual(cfg["recursion_limit"], node_cfg["recursion_limit"])
+
+    def test_test_writer_carries_explicit_recursion_budget(self):
+        """test_writer's budget is explicit in factory.json and resolves verbatim."""
+        node_cfg = self._raw_node_config("test_writer")
+        self.assertIsInstance(node_cfg["recursion_limit"], int)
+        self.assertGreater(node_cfg["recursion_limit"], 0)
+        cfg = resolve_model_config("test_writer")
+        self.assertEqual(cfg["recursion_limit"], node_cfg["recursion_limit"])
+
+
 class TestResolveLoopConfig(unittest.TestCase):
     """Tests for the per-node Tool Loop Detection config (issue #121 / ADR-0046)."""
 
