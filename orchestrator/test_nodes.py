@@ -3891,7 +3891,6 @@ class TestMergeNodeNoJudgeMode(unittest.TestCase):
 
         self.assertEqual(new_state["status"], "done")
         self.assertIsNone(new_state["feedback"])
-        mock_commit_time.assert_not_called()
         # Freshness anchoring exists solely to gate verdict blocks.
         mock_commit_time.assert_not_called()
 
