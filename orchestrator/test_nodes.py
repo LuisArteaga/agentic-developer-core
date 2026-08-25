@@ -3034,6 +3034,59 @@ class TestMergeNode(unittest.TestCase):
 
     @patch("orchestrator.nodes.get_commit_time")
     @patch("orchestrator.nodes._github_api_request")
+    def test_merge_node_skips_malformed_reviews(self, mock_api, mock_commit_time):
+        """Reviews without ``submitted_at`` and verdict blocks containing blank
+        lines are skipped defensively instead of crashing or misparsing."""
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+
+        pulls_seen = {"n": 0}
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    pulls_seen["n"] += 1
+                    if pulls_seen["n"] >= 2:
+                        return {"merged": True, "state": "closed"}
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return [
+                        {
+                            # No submitted_at -> skipped entirely.
+                            "body": self._hidden_block_body({"syntax_lint": "PASS"}),
+                            "user": {"login": "test-judge-user"},
+                        },
+                        {
+                            "submitted_at": "2026-06-27T12:05:00Z",
+                            # Blank lines inside the hidden block are ignored;
+                            # every parsed judge key is PASS.
+                            "body": "<!-- llm-pr-review-verdicts\n\n"
+                            + "syntax_lint: PASS\ntest_coverage: PASS\n"
+                            + "architecture: PASS\nsecurity: PASS\n\n-->",
+                            "user": {"login": "test-judge-user"},
+                        },
+                    ]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(state)
+
+        self.assertEqual(new_state["status"], "done")
+        self.assertIsNone(new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
     def test_merge_node_ignores_untrusted_review(self, mock_api, mock_commit_time):
         mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
 
@@ -3678,6 +3731,425 @@ class TestMergeNode(unittest.TestCase):
         loaded = state_module.load()
         self.assertEqual(loaded["status"], "failed")
         self.assertEqual(loaded["phase"], "merging")
+
+
+class TestMergeNodeNoJudgeMode(unittest.TestCase):
+    """Interim no-judge merge mode (``AGENT_JUDGE_ENABLED=false``, ADR-0053).
+
+    The Merge-Phase waits only for an external (human/policy) merge: verdict
+    parsing and judge trust resolution are skipped entirely, the machine-scale
+    ``AGENT_MERGE_POLL_TIMEOUT`` is replaced by the human-scale
+    ``AGENT_NO_JUDGE_MERGE_TIMEOUT`` (non-positive = wait indefinitely), and an
+    elapsed window pauses the run *resumably* (status stays "merging") instead
+    of producing a misleading poll-timeout failure. The default (flag unset)
+    preserves ADR-0014 semantics exactly — covered by TestMergeNode, which
+    runs with the flag unset.
+    """
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+            # No-judge mode is the default posture for this class; individual
+            # tests override the flag to exercise fallback semantics.
+            "AGENT_JUDGE_ENABLED": "false",
+            "AGENT_MERGE_POLL_INTERVAL": "0",
+            # Human-review-scale default; tests needing a bounded fast window
+            # override this explicitly.
+            "AGENT_NO_JUDGE_MERGE_TIMEOUT": "86400",
+            # Legacy knob deliberately left at a value that would instantly
+            # time out a judge-mode poll, proving it is ignored when unset.
+            "AGENT_MERGE_POLL_TIMEOUT": "300",
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+        # Same determinism scrub as TestMergeNode.
+        self.original_env["AGENT_TRUSTED_JUDGE_USER"] = os.environ.get(
+            "AGENT_TRUSTED_JUDGE_USER"
+        )
+        os.environ.pop("AGENT_TRUSTED_JUDGE_USER", None)
+
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+
+        initial_file = self.workspace_dir / "README.md"
+        initial_file.write_text("# Test Repo", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    @staticmethod
+    def _merge_state():
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        return state
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_no_judge_merges_without_fetching_reviews(self, mock_api, mock_commit_time):
+        """Acceptance: waits for external merge, no verdicts parsed, done on merge."""
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+
+        reviews_seen = []
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/pulls/1"):
+                    return {"merged": True, "state": "closed"}
+                elif "/pulls" in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews") or path.endswith("/user"):
+                    # Judge-only endpoints must never be touched in no-judge mode.
+                    reviews_seen.append(path)
+                    raise ValueError(f"No-judge mode must not call {path}")
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state_module.save(self._merge_state())
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(self._merge_state())
+
+        self.assertEqual(new_state["status"], "done")
+        self.assertIsNone(new_state["feedback"])
+        # Judge-only endpoints were never fetched during the whole poll.
+        self.assertEqual(reviews_seen, [])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_no_judge_malformed_window_falls_back_to_default(
+        self, mock_api, mock_commit_time
+    ):
+        """A non-integer AGENT_NO_JUDGE_MERGE_TIMEOUT degrades to the 24h
+        default with a warning instead of crashing the node (warn-and-degrade
+        posture); the run still completes normally on an external merge."""
+        os.environ["AGENT_NO_JUDGE_MERGE_TIMEOUT"] = "twenty-four-hours"
+
+        calls = {"n": 0}
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if "/pulls" in path and "/reviews" not in path:
+                    # First call finds the PR; the in-loop fetch reports merged.
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        return [{"number": 1}]
+                    return {"merged": True, "state": "closed"}
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(state)
+
+        self.assertEqual(new_state["status"], "done")
+        self.assertIsNone(new_state["feedback"])
+        # Freshness anchoring exists solely to gate verdict blocks.
+        mock_commit_time.assert_not_called()
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_no_judge_closed_pr_still_fails(self, mock_api, mock_commit_time):
+        """Merge-detection contract unchanged: closed without merge -> failure."""
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "closed"}
+                elif "/pulls" in path:
+                    return [{"number": 1}]
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state_module.save(self._merge_state())
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(self._merge_state())
+
+        self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
+        self.assertIn("closed without being merged", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_no_judge_window_elapsed_pauses_resumably(self, mock_api, mock_commit_time):
+        """An elapsed human-review window pauses resumably, not as a failure.
+
+        Status stays "merging" so Stateful Resume routes the next invocation
+        back into the Merge phase (route_after_claim); recovery never runs, so
+        the issue label and workspace branch survive.
+        """
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        os.environ["AGENT_NO_JUDGE_MERGE_TIMEOUT"] = "1"
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews") or path.endswith("/user"):
+                    raise ValueError(f"No-judge mode must not call {path}")
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state = self._merge_state()
+        state_module.save(state)
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(state)
+
+        self.assertEqual(new_state["status"], "merging")
+        self.assertEqual(new_state["phase"], "merging")
+        self.assertIsNone(new_state["feedback"])
+
+        loaded = state_module.load()
+        self.assertEqual(loaded["status"], "merging")
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_no_judge_zero_window_waits_indefinitely_until_merge(
+        self, mock_api, mock_commit_time
+    ):
+        """A non-positive window disables the timeout entirely (waits forever).
+
+        Deliberately opposite of the judge-mode convention where a zero
+        AGENT_MERGE_POLL_TIMEOUT skips the loop: here the poll keeps running
+        until an external merge arrives.
+        """
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        os.environ["AGENT_NO_JUDGE_MERGE_TIMEOUT"] = "0"
+
+        polls = {"count": 0}
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/pulls/1"):
+                    polls["count"] += 1
+                    if polls["count"] >= 3:
+                        return {"merged": True, "state": "closed"}
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews") or path.endswith("/user"):
+                    raise ValueError(f"No-judge mode must not call {path}")
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state_module.save(self._merge_state())
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(self._merge_state())
+
+        self.assertEqual(new_state["status"], "done")
+        self.assertEqual(polls["count"], 3)
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_no_judge_window_replaces_legacy_poll_timeout(
+        self, mock_api, mock_commit_time
+    ):
+        """Precedence (ADR-0053): in no-judge mode AGENT_MERGE_POLL_TIMEOUT is
+        not consulted at all — the no-judge window governs exclusively."""
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        # A zero legacy timeout would exit before the first poll in judge mode;
+        # it must be irrelevant here.
+        os.environ["AGENT_MERGE_POLL_TIMEOUT"] = "0"
+
+        polls = {"count": 0}
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/pulls/1"):
+                    polls["count"] += 1
+                    if polls["count"] >= 2:
+                        return {"merged": True, "state": "closed"}
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews") or path.endswith("/user"):
+                    raise ValueError(f"No-judge mode must not call {path}")
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        state_module.save(self._merge_state())
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(self._merge_state())
+
+        self.assertEqual(new_state["status"], "done")
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_flag_parsing_is_case_insensitive(self, mock_api, mock_commit_time):
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        os.environ["AGENT_JUDGE_ENABLED"] = "FALSE"
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/pulls/1"):
+                    return {"merged": True, "state": "closed"}
+                elif "/pulls" in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews") or path.endswith("/user"):
+                    raise ValueError(f"No-judge mode must not call {path}")
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(self._merge_state())
+
+        self.assertEqual(new_state["status"], "done")
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_garbage_flag_falls_back_to_judge_mode(self, mock_api, mock_commit_time):
+        """A malformed flag degrades to the safe default (judges enabled).
+
+        Warn-and-degrade mirrors the factory-config posture; the safe fallback
+        direction preserves ADR-0014 blocking semantics rather than silently
+        disabling them on a typo.
+        """
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+        os.environ["AGENT_JUDGE_ENABLED"] = "flase"
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                elif path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return []
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_side_effect
+        # Judge-mode instant timeout via the legacy knob proves the fallback.
+        os.environ["AGENT_MERGE_POLL_TIMEOUT"] = "0"
+
+        state_module.save(self._merge_state())
+
+        from orchestrator.nodes import merge_node
+
+        new_state = merge_node(self._merge_state())
+
+        self.assertEqual(new_state["status"], "failed")
+        assert new_state["feedback"] is not None
+        self.assertIn("Polling timed out", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_mode_resolved_at_entry_toggle_determinism(
+        self, mock_api, mock_commit_time
+    ):
+        """Mid-run flag toggle (issue edge case) is deterministic on resume.
+
+        Mode + window are resolved once per Merge-Node entry from the current
+        environment; the persisted state carries no mode marker. A run paused
+        in no-judge mode resumes under judge-mode semantics if the operator
+        flipped the flag between invocations (e.g. judges shipped meanwhile).
+        """
+        mock_commit_time.return_value = "2026-06-27T12:00:00+00:00"
+
+        def api_open_forever(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/pulls/1"):
+                    return {"merged": False, "state": "open"}
+                elif "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                elif path.endswith("/reviews"):
+                    return []
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        mock_api.side_effect = api_open_forever
+
+        state = self._merge_state()
+        state_module.save(state)
+
+        from orchestrator.nodes import merge_node
+
+        # Invocation 1: no-judge mode, short window -> resumable pause.
+        os.environ["AGENT_JUDGE_ENABLED"] = "false"
+        os.environ["AGENT_NO_JUDGE_MERGE_TIMEOUT"] = "1"
+        paused = merge_node(state)
+        self.assertEqual(paused["status"], "merging")
+
+        # Operator flips the flag between invocations (judges deployed).
+        os.environ["AGENT_JUDGE_ENABLED"] = "true"
+        os.environ["AGENT_MERGE_POLL_TIMEOUT"] = "0"
+
+        # Invocation 2 (resume): judge-mode semantics apply immediately.
+        resumed = merge_node(paused)
+        self.assertEqual(resumed["status"], "failed")
+        assert resumed["feedback"] is not None
+        self.assertIn("Polling timed out", resumed["feedback"])
+
+    def test_route_after_merge_ends_on_resumable_pause(self):
+        """A resumable pause ("merging") ends the graph run without recovery."""
+        from orchestrator.graph import route_after_merge
+
+        state = cast(AgentState, {"status": "merging", "phase": "merging"})
+        self.assertEqual(route_after_merge(state), "end")
 
 
 class TestRouteAfterMerge(unittest.TestCase):
@@ -5179,14 +5651,25 @@ class TestIsinstanceGuardCoverage(unittest.TestCase):
     ):
         from orchestrator.nodes import merge_node
 
-        state = DEFAULT_STATE.copy()
-        state["issue_number"] = 42
-        state["status"] = "pr_open"
-        state["branch"] = "feat/issue-42"
-        state["pushed_at"] = "2024-01-01T00:00:00Z"
-        state_module.save(state)
+        # CI runners always export GITHUB_ACTOR; scrub it so the fallback
+        # deterministically lands on the warn-and-continue branch (trusted
+        # user unresolvable) instead of silently resolving to the actor.
+        original_actor = os.environ.get("GITHUB_ACTOR")
+        os.environ.pop("GITHUB_ACTOR", None)
+        try:
+            state = DEFAULT_STATE.copy()
+            state["issue_number"] = 42
+            state["status"] = "pr_open"
+            state["branch"] = "feat/issue-42"
+            state["pushed_at"] = "2024-01-01T00:00:00Z"
+            state_module.save(state)
 
-        result = merge_node(state)
+            result = merge_node(state)
+        finally:
+            if original_actor is None:
+                os.environ.pop("GITHUB_ACTOR", None)
+            else:
+                os.environ["GITHUB_ACTOR"] = original_actor
 
         # The /user isinstance guard was swallowed by the inner except
         # (fallback to GITHUB_ACTOR). The poll loop is skipped (timeout=0),
