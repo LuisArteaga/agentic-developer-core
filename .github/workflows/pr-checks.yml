@@ -109,12 +109,15 @@ jobs:
       - name: Run Gitleaks
         # Opt-in for target repositories; this repository's dedicated
         # secret-scan.yml already covers push + pull_request events.
-        # `== true`, not bare truthiness: native runs see an empty inputs
-        # context and gitleaks must stay off there.
+        # Pinned binary instead of gitleaks-action@v2: the action posts PR
+        # comments and therefore demands pull-requests: write, which this
+        # workflow deliberately denies (contents: read, least privilege).
+        # `detect --no-banner --redact` exits nonzero on any finding.
         if: inputs.enable-gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -fsSL -o /tmp/gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks detect --source . --no-banner --redact --verbose
 
       - name: Validate OpenRouter API key
         if: inputs.enable-llm-review

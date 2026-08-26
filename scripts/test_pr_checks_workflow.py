@@ -245,6 +245,12 @@ def test_gitleaks_step_is_strictly_opt_in() -> None:
     gitleaks = _step_by_name(_load_workflow(), "Run Gitleaks")
     opt_in_comparison = gitleaks.get("if") == "inputs.enable-gitleaks"
     assert opt_in_comparison, "Gitleaks must gate on its bare enable-gitleaks input"
+    uses_action_only = str(gitleaks.get("uses", "")).startswith(
+        "gitleaks/gitleaks-action"
+    )
+    assert not uses_action_only, "use the pinned binary"
+    runs_detector = "gitleaks detect --source ." in str(gitleaks.get("run", ""))
+    assert runs_detector, "the binary scan must be the enforcement mechanism"
 
 
 def test_no_step_uses_always_gating() -> None:
