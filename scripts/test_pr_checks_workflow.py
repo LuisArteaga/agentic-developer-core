@@ -105,9 +105,7 @@ def test_reusable_input_defaults_preserve_local_behavior() -> None:
     floor_is_native = inputs["coverage-floor"]["default"] == 89
     assert floor_is_native, "coverage floor default drifted from 89"
     assert inputs["enable-diff-gate"]["default"] is True, "gate must stay on by default"
-    assert (
-        inputs["enable-llm-review"]["default"] is True
-    ), "judges must stay on by default"
+    assert inputs["enable-llm-review"]["default"] is True, "judges must stay on"
     tree_sitter_on = inputs["prefetch-tree-sitter"]["default"] is True
     assert tree_sitter_on, "native runs need the tree-sitter prefetch"
     gitleaks_off = inputs["enable-gitleaks"]["default"] is False
@@ -211,9 +209,9 @@ def test_gate_step_skip_conditions_are_scoped_to_reusability() -> None:
     scoped_to_pr_events = "github.event_name == 'pull_request'" in gate_if
     assert scoped_to_pr_events, "gate must be scoped to pull_request events"
     honors_opt_out = "inputs.enable-diff-gate != false" in gate_if
-    assert (
-        honors_opt_out
-    ), "opt-out must use != false so native PR runs keep the gate enabled"
+    # Single-line assert by design: the pinned and latest ruff formatters
+    # disagree on wrapping long assert messages (PR #151 / #173 skew).
+    assert honors_opt_out, "gate opt-out must use != false"
 
 
 def test_llm_review_skipped_when_deterministic_checks_fail() -> None:
