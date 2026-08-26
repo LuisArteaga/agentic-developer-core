@@ -739,10 +739,10 @@ class TestResolveJudgeConfigs(unittest.TestCase):
         )
 
         sec = resolve_model_config("security")
-        self.assertEqual(sec["model"], "z-ai/glm-5.3-flash")
+        self.assertEqual(sec["model"], "moonshotai/kimi-k3")
         self.assertEqual(
             sec["routing"],
-            ["Z.AI", "Novita"],
+            ["Together", "Fireworks", "Parasail", "Moonshot AI", "DeepInfra"],
         )
         self.assertEqual(sec["options"], {"reasoning": {"effort": "high"}})
 

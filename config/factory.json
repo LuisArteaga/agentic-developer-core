@@ -36,8 +36,14 @@
     "fallback_model": "moonshotai/kimi-k3"
   },
   "security": {
-    "model": "z-ai/glm-5.3-flash",
-    "routing": ["Z.AI", "Novita"],
+    "model": "moonshotai/kimi-k3",
+    "routing": [
+      "Together",
+      "Fireworks",
+      "Parasail",
+      "Moonshot AI",
+      "DeepInfra"
+    ],
     "temperature": 0.0,
     "options": { "reasoning": { "effort": "high" } },
     "fallback_model": "z-ai/glm-5.2"

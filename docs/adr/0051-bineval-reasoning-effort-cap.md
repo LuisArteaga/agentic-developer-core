@@ -60,11 +60,17 @@ translated per provider.
   `thinking` parameter — so `"options": {"thinking": "max"}` was necessarily
   migrated to the standardized cross-provider form
   `{"reasoning": {"effort": "high"}}`, keeping security as the deepest-reasoning
-  judge (`high`, not a BinEval-style `low`). The provider-independent
-  standardized parameter is supported by every routed endpoint (verified via
-  the OpenRouter model endpoints API); layered fallback to glm-5.2 and
-  ADR-0021's retry semantics are unchanged. This remains specific to the
-  model-platform migration — still not a general effort-cap policy.)*
+  judge (`high`, not a BinEval-style `low`). In the same change, security was
+  subsequently upgraded from the shared flash model to
+  `moonshotai/kimi-k3` — a dedicated deep-reasoning model (every routed
+  endpoint declares `reasoning` / `reasoning_effort` support, verified via the
+  OpenRouter model endpoints API) — so its reasoning posture now exceeds the
+  flash-tier judges rather than merely matching them; `effort: high` is the
+  top of OpenRouter's unified effort scale, the portable maximum across
+  providers. The provider-independent standardized parameter is supported by
+  every routed endpoint; layered fallback to glm-5.2 and ADR-0021's retry
+  semantics are unchanged. This remains specific to the model-platform
+  migration — still not a general effort-cap policy.)*
 - **Next lever unchanged.** If truncation persists despite the cap,
   ADR-0049's Option 2 (route `bin_eval` to a non-reasoning model) remains the
   escalation path; rollout should be observed via BinEval `finish_reason` and
