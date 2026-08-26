@@ -19,11 +19,29 @@ defined at `.github/workflows/llm-pr-review.yml` ([ADR-0050](./adr/0050-reusable
    `AGENT_TRUSTED_JUDGE_USER` must match that author or the Merge-Node ignores
    it (spoofing guard, [ADR-0014](./adr/0014-pr-verification-and-llm-judge-review-integration.md)).
 
+## Step 0 — Grant cross-repo access to the reusable workflow
+
+Because this repository is private, it must explicitly allow other
+repositories to invoke its reusable workflows:
+
+1. In **this** (source) repository: **Settings → Actions → General →**
+   scroll to the **Access** section (below "Actions permissions") →
+   select *Accessible from repositories owned by `<owner>`*.
+2. Do **not** confuse this with the "Actions permissions" radios at the top of
+   the same page. That policy governs which actions/workflows may run *inside*
+   a repository; the Access section governs who may call *into* it. Setting
+   `local_only` here does not block callers — but it breaks this repository's
+   own CI, because GitHub-owned actions (`actions/checkout`) no longer count
+   as local.
+
+Without this grant the target repo's caller run fails immediately as
+`startup_failure` with zero jobs.
+
 ## Step 1 — Create the required secrets in the target repository
 
 | Secret | Purpose |
 | --- | --- |
-| `JUDGE_GH_TOKEN` | A GitHub PAT (or App token) with `pull-requests: write` on the target repo. **Its owner must equal the orchestrator's `AGENT_TRUSTED_JUDGE_USER`.** |
+| `JUDGE_GH_TOKEN` | A GitHub PAT (or App token) with `pull-requests: write` on the target repo **and read access to this orchestrator repo** (the reusable workflow checks out `scripts/review.py` with it). **Its owner must equal the orchestrator's `AGENT_TRUSTED_JUDGE_USER`.** |
 | `OPENROUTER_API_KEY` | OpenRouter API key for the LLM judges. |
 
 No secrets are committed to any repository file.
@@ -42,10 +60,19 @@ on:
 jobs:
   judge:
     uses: LuisArteaga/agentic-developer-core/.github/workflows/llm-pr-review.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
     secrets:
       judge-token: ${{ secrets.JUDGE_GH_TOKEN }}
       openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
+
+The `permissions:` block is **required** unless the target repo's default
+workflow permissions already include `pull-requests: write`: a called reusable
+workflow may narrow but never widen the caller-granted `GITHUB_TOKEN`, so the
+callee's `pull-requests: write` request is otherwise rejected as an escalation
+— another `startup_failure` with zero jobs.
 
 Pin `@main` to a release tag (e.g. `@v1`) once one is cut, so the verdict-block
 writer stays in lockstep with the orchestrator's parser ([ADR-0019](./adr/0019-combined-pr-review-body-with-hidden-verdict-block.md)).
@@ -81,7 +108,10 @@ The Merge-Node also only considers reviews whose `submitted_at` is on or after t
 **Fine-grained PAT (recommended, least privilege):**
 
 1. Sign in as the judge account → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**.
-2. **Resource owner**: the judge account. **Repository access**: *Only select repositories* → the target repo.
+2. **Resource owner**: the judge account. **Repository access**: *Only select
+   repositories* → the target repo **and** this orchestrator repo — the
+   reusable workflow checks out `scripts/review.py` from the latter, and a PAT
+   without read access there fails the checkout with HTTP 403.
 3. **Permissions**: *Pull requests* → Read and write; *Contents* → Read-only.
 4. Generate, copy the `github_pat_…` value, add it as target-repo secret `JUDGE_GH_TOKEN`.
 
@@ -124,6 +154,15 @@ consistently so the required-status-check name is stable.
 
 ## Failure modes
 
+- **Caller run shows `startup_failure` with zero jobs** → either the source
+  repo's Actions **Access** grant is missing (Step 0), or the caller job lacks
+  the `permissions:` block so the callee's `pull-requests: write` request is
+  rejected as an escalation (Step 2). GitHub surfaces both with a generic
+  "workflow file issue" hint; check the settings, not the YAML.
+- **Orchestrator-repo checkout fails with `repository not found` or HTTP 403**
+  → the `JUDGE_GH_TOKEN` PAT cannot read this private repository (`repository
+  not found`: no usable credential sent; `403`: credential lacks scope — see
+  Step 1 / "Creating `JUDGE_GH_TOKEN`").
 - **Judge workflow fails or never runs** → no review is posted; the Merge-Node
   terminates via its existing poll-timeout path (`AGENT_MERGE_POLL_TIMEOUT`) and
   escalates to recovery. No infinite hang.
