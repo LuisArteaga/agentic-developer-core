@@ -719,31 +719,32 @@ class TestResolveJudgeConfigs(unittest.TestCase):
     def test_resolve_judge_configs(self):
         """Each judge resolves its model/routing/temperature from factory.json; security has options."""
         syntax = resolve_model_config("syntax_lint")
-        self.assertEqual(syntax["model"], "moonshotai/kimi-k2.7-code")
+        self.assertEqual(syntax["model"], "z-ai/glm-5.3-flash")
         self.assertEqual(
-            syntax["routing"], ["Together", "SiliconFlow", "MoonshotAI", "Inceptron"]
+            syntax["routing"],
+            ["Z.AI", "Novita"],
         )
         self.assertEqual(syntax["temperature"], 0.0)
         self.assertIsNone(syntax["options"])
 
         test_cov = resolve_model_config("test_coverage")
-        self.assertEqual(test_cov["model"], "moonshotai/kimi-k2.7-code")
+        self.assertEqual(test_cov["model"], "z-ai/glm-5.3-flash")
         self.assertEqual(test_cov["temperature"], 0.0)
 
         arch = resolve_model_config("architecture")
-        self.assertEqual(arch["model"], "z-ai/glm-5.2")
+        self.assertEqual(arch["model"], "z-ai/glm-5.3-flash")
         self.assertEqual(
             arch["routing"],
-            ["Together", "DeepInfra", "Fireworks", "Parasail", "Inceptron"],
+            ["Z.AI", "Novita"],
         )
 
         sec = resolve_model_config("security")
-        self.assertEqual(sec["model"], "deepseek/deepseek-v4-pro")
+        self.assertEqual(sec["model"], "z-ai/glm-5.3-flash")
         self.assertEqual(
             sec["routing"],
-            ["DeepInfra", "SiliconFlow", "Novita", "Parasail", "DeepSeek"],
+            ["Z.AI", "Novita"],
         )
-        self.assertEqual(sec["options"], {"thinking": "max"})
+        self.assertEqual(sec["options"], {"reasoning": {"effort": "high"}})
 
     def test_resolve_judge_fallback_models(self):
         """Each judge resolves its fallback_model from factory.json (ADR-0021)."""
@@ -754,7 +755,7 @@ class TestResolveJudgeConfigs(unittest.TestCase):
         self.assertEqual(test_cov["fallback_model"], "z-ai/glm-5.2")
 
         arch = resolve_model_config("architecture")
-        self.assertEqual(arch["fallback_model"], "deepseek/deepseek-v4-pro")
+        self.assertEqual(arch["fallback_model"], "moonshotai/kimi-k3")
 
         sec = resolve_model_config("security")
         self.assertEqual(sec["fallback_model"], "z-ai/glm-5.2")
