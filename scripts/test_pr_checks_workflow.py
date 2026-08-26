@@ -245,6 +245,13 @@ def test_gitleaks_step_is_strictly_opt_in() -> None:
     gitleaks = _step_by_name(_load_workflow(), "Run Gitleaks")
     opt_in_comparison = gitleaks.get("if") == "inputs.enable-gitleaks"
     assert opt_in_comparison, "Gitleaks must gate on its bare enable-gitleaks input"
+    # Contract (not mechanism): the scan runs under this workflow's read-only
+    # token policy, so the step must not inject credentials, and a finding
+    # must fail the job. Which scanner runs is pinned by the step name.
+    injects_credentials = "GITHUB_TOKEN" in str(gitleaks.get("env", {}))
+    assert not injects_credentials, "scan must not require elevated scopes"
+    is_hard_gate = not gitleaks.get("continue-on-error")
+    assert is_hard_gate, "a leak finding must fail the job"
 
 
 def test_no_step_uses_always_gating() -> None:
