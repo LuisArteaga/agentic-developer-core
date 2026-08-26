@@ -13,9 +13,14 @@ name: PR checks
 # subscribe to the PR Review Judges keep using the dedicated reusable judge
 # workflow (ADR-0050) so verdict-block writer/parser stay in lockstep.
 
+# PURE reusable workflow (no direct triggers). This repository's own CI runs
+# it via the thin caller .github/workflows/ci.yml; target repositories call it
+# with their own inputs. Rationale (PR #173/#174): inside a called workflow
+# `github.event_name` mirrors the CALLER's event, so no expression can
+# distinguish native from called execution — dual triggering made every
+# conditional silently mode-dependent. With workflow_call as the only entry,
+# `inputs` is always fully materialized and bare-truthiness guards are exact.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
   workflow_call:
     inputs:
       python-version:
@@ -85,14 +90,10 @@ on:
 # covers checkout and git diffs. Judge reviews authenticate via GH_PAT, not
 # GITHUB_TOKEN.
 #
-# INPUT PARITY RULE (learned twice on PR #173): on NATIVE pull_request runs
-# the `inputs` context is EMPTY — declared defaults materialize only inside
-# workflow_call, and GitHub compares operands NUMERICALLY, so `'' != false`
-# is FALSE ('' and false both cast to 0). Typed-comparison guards therefore
-# silently skip steps natively. Coercion-proof patterns used below:
-#   strings/numbers  -> ${{ inputs.x || 'native-default' }}    (run/env/with)
-#   default-on bools -> github.event_name != 'workflow_call' || inputs.x
-#   opt-in bool      -> github.event_name == 'workflow_call' && inputs.x
+# STRING/NUMBER FALLBACKS (`${{ inputs.x || 'default' }}`) remain in
+# run/env/with so callers may omit optional knobs; booleans need none —
+# callers pass them explicitly and this repository's caller mirrors its
+# historical behavior.
 permissions:
   contents: read
 
@@ -110,13 +111,13 @@ jobs:
         # secret-scan.yml already covers push + pull_request events.
         # `== true`, not bare truthiness: native runs see an empty inputs
         # context and gitleaks must stay off there.
-        if: github.event_name == 'workflow_call' && inputs.enable-gitleaks
+        if: inputs.enable-gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate OpenRouter API key
-        if: github.event_name != 'workflow_call' || inputs.enable-llm-review
+        if: inputs.enable-llm-review
         env:
           # This repository's own pull_request runs resolve the repo-level
           # secret; called workflows receive the declared input secret. An
@@ -147,7 +148,7 @@ jobs:
           done
 
       - name: Cache tree-sitter parsers
-        if: github.event_name != 'workflow_call' || inputs.prefetch-tree-sitter
+        if: inputs.prefetch-tree-sitter
         uses: actions/cache@v4
         with:
           path: ~/.cache/tree-sitter-language-pack
@@ -162,7 +163,7 @@ jobs:
         # causing cascading test failures in outline-dependent tests
         # (ADR-0017). Prefetch the required languages (Python, TypeScript)
         # with retries so tests have parsers available locally.
-        if: github.event_name != 'workflow_call' || inputs.prefetch-tree-sitter
+        if: inputs.prefetch-tree-sitter
         run: |
           python3 -c "
           import tree_sitter_language_pack as tsp
@@ -181,7 +182,7 @@ jobs:
           "
 
       - name: Run secret scan
-        if: github.event_name != 'workflow_call' || inputs.enable-secret-scan-script
+        if: inputs.enable-secret-scan-script
         run: python3 scripts/secret_scan.py
 
       - name: Run Ruff Lint & Format Checks
@@ -221,20 +222,20 @@ jobs:
         # (push builds have no diff base; the floor above still guards them)
         # or explicit caller opt-out — hence `!= false`, which also keeps the
         # gate ON for native PR runs whose inputs context is empty.
-        if: (github.event_name != 'workflow_call' || inputs.enable-diff-gate) && github.event_name == 'pull_request'
+        if: inputs.enable-diff-gate && github.event_name == 'pull_request'
         run: python3 scripts/diff_coverage_gate.py --coverage-json coverage.json --base ${{ github.event.pull_request.base.sha }}
 
       - name: Run Semgrep Security Scan
         # Installed step-locally so callers whose dev extras lack semgrep
         # still get a working scan (idempotent where it is already present).
-        if: github.event_name != 'workflow_call' || inputs.enable-semgrep
+        if: inputs.enable-semgrep
         run: |
           pip install -q semgrep
           semgrep scan ${{ inputs.lint-paths || 'orchestrator scripts' }} --config=auto --error
 
       - name: Run Pip-Audit Dependency Check
         # Installed step-locally for caller self-containment (see Semgrep).
-        if: github.event_name != 'workflow_call' || inputs.enable-pip-audit
+        if: inputs.enable-pip-audit
         run: |
           pip install -q pip-audit
           pip-audit .
@@ -249,7 +250,7 @@ jobs:
         # made it redundant. Target repositories usually leave this off and
         # use the ADR-0050 reusable judge workflow instead (`!= false` keeps
         # it ON for native PR runs whose inputs context is empty).
-        if: github.event_name != 'workflow_call' || inputs.enable-llm-review
+        if: inputs.enable-llm-review
         env:
           AGENT_MODE: ci
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY || secrets.openrouter-api-key }}
