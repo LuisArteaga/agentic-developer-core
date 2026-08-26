@@ -137,6 +137,14 @@ docker run --rm \
 
 The Merge-Node polls the **target** repository's PRs for the PR Review Judges' hidden verdict block (ADR-0019). The judges ship in this repository's CI by default; to have them run on a target repository's PRs, install the reusable judge workflow — see [docs/target-repo-judge-setup.md](docs/target-repo-judge-setup.md) (ADR-0050).
 
+Cross-repo invocation is gated by **three independent settings**, each with a distinct failure signature when missing:
+
+1. **Source repo (this one) — Actions Access grant.** Settings → Actions → General → section **Access** (below "Actions permissions") → *Accessible from repositories owned by `<owner>`*. Without it the caller cannot invoke the reusable workflow at all. Note this is a different setting from the "Actions permissions" radios, which only govern what runs *inside* a repo — setting those to a restrictive value (e.g. `local_only`) breaks the repo's own CI instead.
+2. **Target repo caller job — explicit `permissions:`** (`contents: read`, `pull-requests: write`). A called reusable workflow may narrow but never widen the caller-granted `GITHUB_TOKEN`; against the default read-only token the callee's `pull-requests: write` request is rejected as an escalation before any job starts.
+3. **Target repo secret `JUDGE_GH_TOKEN` — PAT with cross-repo read.** Its repository access must include **both** repos (fine-grained: *Pull requests* Read-and-write + *Contents* Read-only; classic: `repo` scope), and its owner must equal `AGENT_TRUSTED_JUDGE_USER` (spoofing guard, ADR-0014).
+
+Failure signatures: a `startup_failure` run with **zero jobs** points to 1 or 2; the orchestrator-repo checkout failing with `repository not found` (no credential) or `HTTP 403` (credential without scope) points to 3.
+
 ## Environment & labels
 
 Copy [`.env.example`](.env.example) to `.env` for the full environment surface. Key variables:
