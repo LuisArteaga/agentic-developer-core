@@ -208,10 +208,11 @@ def test_gate_step_skip_conditions_are_scoped_to_reusability() -> None:
     gate_if = str(gate.get("if", ""))
     scoped_to_pr_events = "github.event_name == 'pull_request'" in gate_if
     assert scoped_to_pr_events, "gate must be scoped to pull_request events"
-    honors_opt_out = "inputs.enable-diff-gate != false" in gate_if
+    mode_guard = "github.event_name != 'workflow_call' || inputs.enable-diff-gate"
+    honors_opt_out = mode_guard in gate_if
     # Single-line assert by design: the pinned and latest ruff formatters
     # disagree on wrapping long assert messages (PR #151 / #173 skew).
-    assert honors_opt_out, "gate opt-out must use != false"
+    assert honors_opt_out, "gate opt-out must use the mode guard"
 
 
 def test_llm_review_skipped_when_deterministic_checks_fail() -> None:
@@ -227,8 +228,11 @@ def test_llm_review_skipped_when_deterministic_checks_fail() -> None:
     review = _step_by_name(_load_workflow(), REVIEW_STEP)
     # Boolean variables + short messages: stable across ruff formatter
     # versions (see PR #151).
-    bare_input_toggle_only = review.get("if") == "inputs.enable-llm-review != false"
-    assert bare_input_toggle_only, "review condition must be the != false input toggle"
+    mode_guarded_toggle = (
+        review.get("if")
+        == "github.event_name != 'workflow_call' || inputs.enable-llm-review"
+    )
+    assert mode_guarded_toggle, "review condition must be the mode-guarded toggle"
     assert not review.get("continue-on-error"), "a failed judge run fails the job"
 
 
@@ -237,8 +241,11 @@ def test_gitleaks_step_is_strictly_opt_in() -> None:
     # the in-workflow Gitleaks step exists purely for target repositories, so
     # its condition must be exactly the input toggle.
     gitleaks = _step_by_name(_load_workflow(), "Run Gitleaks")
-    opt_in_comparison = gitleaks.get("if") == "inputs.enable-gitleaks == true"
-    assert opt_in_comparison, "Gitleaks must gate on the == true opt-in comparison"
+    opt_in_guard = (
+        gitleaks.get("if")
+        == "github.event_name == 'workflow_call' && inputs.enable-gitleaks"
+    )
+    assert opt_in_guard, "Gitleaks must be a called-mode-only opt-in"
 
 
 def test_no_step_uses_always_gating() -> None:
@@ -258,26 +265,30 @@ def test_no_step_uses_always_gating() -> None:
 
 def test_every_inputs_reference_keeps_native_fallback() -> None:
     # Native pull_request runs see an EMPTY inputs context (defaults only
-    # materialize for workflow_call). Observed on PR #173: a bare
+    # materialize for workflow_call). Observed twice on PR #173: a bare
     # `${{ inputs.lint-paths }}` degraded the native ruff scope to the whole
-    # repository, and bare-truthiness toggles silently disabled the judges
-    # and the Diff Coverage Gate on this repository's own PRs. The parity
-    # rule is therefore structural: conditions use `!= false` / `== true`,
-    # interpolated run strings carry an `|| 'native default'` fallback.
+    # repository, and typed-comparison toggles (`!= false`) silently skipped
+    # the judges and the Diff Coverage Gate natively — GitHub casts operands
+    # to numbers, so `'' != false` is FALSE. The structural parity rules:
+    # conditions reference inputs only behind an explicit workflow_call mode
+    # guard; run/env/with interpolations carry an `|| 'native default'`.
     wf = _load_workflow()
     condition_offenders = []
     run_offenders = []
     for job_id, job in wf["jobs"].items():
         for step in job.get("steps", []):
             name = f"{job_id}/{step.get('name')}"
-            gate_if = str(step.get("if", ""))
-            if "inputs." in gate_if:
-                has_typed_comparison = "!= false" in gate_if or "== true" in gate_if
-                if not has_typed_comparison:
+            step_if = str(step.get("if", ""))
+            if "inputs." in step_if:
+                has_mode_guard = (
+                    "github.event_name != 'workflow_call'" in step_if
+                    or "github.event_name == 'workflow_call'" in step_if
+                )
+                if not has_mode_guard:
                     condition_offenders.append(name)
             for key in ("run", "env", "with"):
                 block = str(step.get(key, ""))
                 if "inputs." in block and " || " not in block:
                     run_offenders.append(f"{name} ({key})")
-    assert condition_offenders == [], "boolean inputs need typed comparisons"
+    assert condition_offenders == [], "input conditions need a workflow_call mode guard"
     assert run_offenders == [], "string/number inputs need || fallbacks"

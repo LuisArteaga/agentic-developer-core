@@ -48,18 +48,24 @@ Contract:
 
 ### Decision (2) — Input parity rule
 
-First CI run on this ADR's PR surfaced a GitHub semantics trap: the `inputs`
-context is EMPTY on native `pull_request` runs — declared defaults materialize
-only inside `workflow_call`. Bare `${{ inputs.x }}` therefore degraded native
-ruff/mypy scope to the whole repository, and bare-truthiness toggles silently
-skipped the judges, the Diff Coverage Gate, and tree-sitter prefetch for this
-repository's own PRs. Every reference now carries an explicit fallback:
-strings/numbers use `${{ inputs.x || 'native-default' }}`; default-true
-booleans use `inputs.x != false`; the opt-in Gitleaks uses
-`inputs.x == true`. Callers that need "no extra packages" pass the sentinel
-token `none` (an explicitly-empty string is indistinguishable from unset in
-GitHub expressions). The contract suite pins the rule structurally
-(`test_every_inputs_reference_keeps_native_fallback`).
+First CI run on this ADR's PR surfaced a GitHub semantics trap, then a second
+one behind it. (a) The `inputs` context is EMPTY on native `pull_request`
+runs — declared defaults materialize only inside `workflow_call` — so bare
+`${{ inputs.x }}` degraded native ruff/mypy scope to the whole repository.
+(b) The seemingly obvious fix, typed comparisons like `inputs.x != false`,
+is worse: GitHub casts comparison operands to NUMBERS, and both `''` and
+`false` cast to 0, so on native runs `'' != false` is FALSE and every
+default-on step was silently skipped — judges included. Coercion-proof
+patterns adopted:
+
+* strings/numbers: `${{ inputs.x || 'native-default' }}` in run/env/with;
+* default-on booleans: `github.event_name != 'workflow_call' || inputs.x`;
+* opt-in booleans: `github.event_name == 'workflow_call' && inputs.x`;
+* callers needing "no extra packages" pass the sentinel token `none`.
+
+The contract suite pins all three rules structurally
+(`test_every_inputs_reference_keeps_native_fallback` and per-step
+condition assertions).
 
 ## Consequences
 
