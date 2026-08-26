@@ -71,6 +71,10 @@ jobs:
           repository: ${{ inputs.orchestrator-repo }}
           ref: ${{ inputs.orchestrator-ref }}
           path: orchestrator-src
+          # The caller's GITHUB_TOKEN cannot read this (private)
+          # repository; cross-repo content access requires the PAT
+          # passed as judge-token.
+          token: ${{ secrets.judge-token }}
 
       - name: Set up Python
         uses: actions/setup-python@v5

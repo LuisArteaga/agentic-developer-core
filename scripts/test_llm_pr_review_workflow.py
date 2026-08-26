@@ -101,6 +101,9 @@ def test_checks_out_orchestrator_repo_and_target_repo() -> None:
     )
     assert orch_checkout is not None, "no checkout pins the orchestrator repository"
     assert orch_checkout["with"]["repository"] == "${{ inputs.orchestrator-repo }}"
+    # The caller's GITHUB_TOKEN cannot read the private orchestrator repo; the
+    # checkout must use the judge-token PAT for cross-repo content access.
+    assert orch_checkout["with"]["token"] == "${{ secrets.judge-token }}"
 
 
 def test_runs_review_py_with_pr_diff() -> None:
