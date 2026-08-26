@@ -46,6 +46,21 @@ Contract:
 7. **Job identity is stable**: the job id stays `pr-checks` so required-status-check names survive for both trigger modes.
 8. The structural contract tests in `scripts/test_pr_checks_workflow.py` pin all of the above at `make verify` surface, including the defaults table.
 
+### Decision (2) — Input parity rule
+
+First CI run on this ADR's PR surfaced a GitHub semantics trap: the `inputs`
+context is EMPTY on native `pull_request` runs — declared defaults materialize
+only inside `workflow_call`. Bare `${{ inputs.x }}` therefore degraded native
+ruff/mypy scope to the whole repository, and bare-truthiness toggles silently
+skipped the judges, the Diff Coverage Gate, and tree-sitter prefetch for this
+repository's own PRs. Every reference now carries an explicit fallback:
+strings/numbers use `${{ inputs.x || 'native-default' }}`; default-true
+booleans use `inputs.x != false`; the opt-in Gitleaks uses
+`inputs.x == true`. Callers that need "no extra packages" pass the sentinel
+token `none` (an explicitly-empty string is indistinguishable from unset in
+GitHub expressions). The contract suite pins the rule structurally
+(`test_every_inputs_reference_keeps_native_fallback`).
+
 ## Consequences
 
 * Target repositories onboard the full deterministic layer with one caller job and ~10 input lines; `ot-telemetry-engine` is the reference consumer.

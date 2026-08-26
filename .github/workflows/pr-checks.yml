@@ -38,6 +38,9 @@ on:
       extra-pip-packages:
         description: >-
           Space-separated PyPI packages installed after `pip install -e .[dev]`.
+          Pass the single token `none` to skip (empty string falls back to the
+          default: GitHub expressions cannot distinguish an explicitly empty
+          input from an unset one).
         type: string
         default: >-
           opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp
@@ -81,6 +84,14 @@ on:
 # A called workflow may only narrow the caller's token scope; contents:read
 # covers checkout and git diffs. Judge reviews authenticate via GH_PAT, not
 # GITHUB_TOKEN.
+#
+# INPUT PARITY RULE (learned on PR #173): on NATIVE pull_request runs the
+# `inputs` context is EMPTY — defaults only materialize for workflow_call.
+# Every reference therefore carries an explicit fallback so both modes behave
+# identically:
+#   strings           -> ${{ inputs.x || 'native-default' }}
+#   default-true bool -> ${{ inputs.x != false }}
+#   opt-in bool       -> ${{ inputs.x == true }}
 permissions:
   contents: read
 
@@ -96,13 +107,15 @@ jobs:
       - name: Run Gitleaks
         # Opt-in for target repositories; this repository's dedicated
         # secret-scan.yml already covers push + pull_request events.
-        if: inputs.enable-gitleaks
+        # `== true`, not bare truthiness: native runs see an empty inputs
+        # context and gitleaks must stay off there.
+        if: inputs.enable-gitleaks == true
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate OpenRouter API key
-        if: inputs.enable-llm-review
+        if: inputs.enable-llm-review != false
         env:
           # This repository's own pull_request runs resolve the repo-level
           # secret; called workflows receive the declared input secret. An
@@ -118,18 +131,22 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ inputs.python-version }}
+          python-version: ${{ inputs.python-version || '3.12' }}
 
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -e .[dev]
-          for pkg in ${{ inputs.extra-pip-packages }}; do
+          # The `||` fallback restores the orchestrator stack on native runs,
+          # where inputs.* is empty rather than defaulted. Callers without
+          # extra runtime packages pass the single token `none`.
+          for pkg in ${{ inputs.extra-pip-packages || 'opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp openinference-semantic-conventions' }}; do
+            if [ "$pkg" = "none" ]; then continue; fi
             pip install "$pkg"
           done
 
       - name: Cache tree-sitter parsers
-        if: inputs.prefetch-tree-sitter
+        if: inputs.prefetch-tree-sitter != false
         uses: actions/cache@v4
         with:
           path: ~/.cache/tree-sitter-language-pack
@@ -144,7 +161,7 @@ jobs:
         # causing cascading test failures in outline-dependent tests
         # (ADR-0017). Prefetch the required languages (Python, TypeScript)
         # with retries so tests have parsers available locally.
-        if: inputs.prefetch-tree-sitter
+        if: inputs.prefetch-tree-sitter != false
         run: |
           python3 -c "
           import tree_sitter_language_pack as tsp
@@ -163,16 +180,16 @@ jobs:
           "
 
       - name: Run secret scan
-        if: inputs.enable-secret-scan-script
+        if: inputs.enable-secret-scan-script != false
         run: python3 scripts/secret_scan.py
 
       - name: Run Ruff Lint & Format Checks
         run: |
-          ruff check ${{ inputs.lint-paths }}
-          ruff format --check ${{ inputs.lint-paths }}
+          ruff check ${{ inputs.lint-paths || 'orchestrator scripts' }}
+          ruff format --check ${{ inputs.lint-paths || 'orchestrator scripts' }}
 
       - name: Run Mypy Typecheck
-        run: mypy ${{ inputs.lint-paths }}
+        run: mypy ${{ inputs.lint-paths || 'orchestrator scripts' }}
 
       - name: Run Pytest Coverage Check
         # --cov=scripts keeps the judge code itself (scripts/review.py,
@@ -186,10 +203,10 @@ jobs:
         run: |
           set -o pipefail
           COV_FLAGS=""
-          for path in ${{ inputs.cov-paths }}; do
+          for path in ${{ inputs.cov-paths || 'orchestrator scripts' }}; do
             COV_FLAGS="$COV_FLAGS --cov=$path"
           done
-          pytest $COV_FLAGS --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=${{ inputs.coverage-floor }}
+          pytest $COV_FLAGS --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=${{ inputs.coverage-floor || 89 }}
 
       - name: Run Diff Coverage Gate
         # Deterministic hard check (ADR-0052): fails the job when any
@@ -201,21 +218,22 @@ jobs:
         # pytest failed, the job is already red, and this gate consumes the
         # coverage.json that run produces. Skipped only for non-PR events
         # (push builds have no diff base; the floor above still guards them)
-        # or explicit caller opt-out.
-        if: inputs.enable-diff-gate && github.event_name == 'pull_request'
+        # or explicit caller opt-out — hence `!= false`, which also keeps the
+        # gate ON for native PR runs whose inputs context is empty.
+        if: inputs.enable-diff-gate != false && github.event_name == 'pull_request'
         run: python3 scripts/diff_coverage_gate.py --coverage-json coverage.json --base ${{ github.event.pull_request.base.sha }}
 
       - name: Run Semgrep Security Scan
         # Installed step-locally so callers whose dev extras lack semgrep
         # still get a working scan (idempotent where it is already present).
-        if: inputs.enable-semgrep
+        if: inputs.enable-semgrep != false
         run: |
           pip install -q semgrep
-          semgrep scan ${{ inputs.lint-paths }} --config=auto --error
+          semgrep scan ${{ inputs.lint-paths || 'orchestrator scripts' }} --config=auto --error
 
       - name: Run Pip-Audit Dependency Check
         # Installed step-locally for caller self-containment (see Semgrep).
-        if: inputs.enable-pip-audit
+        if: inputs.enable-pip-audit != false
         run: |
           pip install -q pip-audit
           pip-audit .
@@ -228,8 +246,9 @@ jobs:
         # `always()` was a visibility fallback from before the deterministic
         # syntax pre-check (ADR-0025) and the Diff Coverage Gate (ADR-0052)
         # made it redundant. Target repositories usually leave this off and
-        # use the ADR-0050 reusable judge workflow instead.
-        if: inputs.enable-llm-review
+        # use the ADR-0050 reusable judge workflow instead (`!= false` keeps
+        # it ON for native PR runs whose inputs context is empty).
+        if: inputs.enable-llm-review != false
         env:
           AGENT_MODE: ci
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY || secrets.openrouter-api-key }}

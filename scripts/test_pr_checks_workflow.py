@@ -165,7 +165,7 @@ def test_pytest_step_emits_json_report_and_readable_output() -> None:
     assert "| tee" not in run, "ADR-0030 output capture must stay retired"
     expands_cov_paths = "--cov=$path" in run
     assert expands_cov_paths, "cov paths must expand into repeated --cov flags"
-    floor_wired_to_input = "--cov-fail-under=${{ inputs.coverage-floor }}" in run
+    floor_wired_to_input = "--cov-fail-under=${{ inputs.coverage-floor || 89 }}" in run
     assert floor_wired_to_input, "percentage floor must stay driven by its input"
 
 
@@ -210,8 +210,10 @@ def test_gate_step_skip_conditions_are_scoped_to_reusability() -> None:
     gate_if = str(gate.get("if", ""))
     scoped_to_pr_events = "github.event_name == 'pull_request'" in gate_if
     assert scoped_to_pr_events, "gate must be scoped to pull_request events"
-    honors_opt_out = "inputs.enable-diff-gate" in gate_if
-    assert honors_opt_out, "callers must be able to opt out via enable-diff-gate"
+    honors_opt_out = "inputs.enable-diff-gate != false" in gate_if
+    assert (
+        honors_opt_out
+    ), "opt-out must use != false so native PR runs keep the gate enabled"
 
 
 def test_llm_review_skipped_when_deterministic_checks_fail() -> None:
@@ -227,8 +229,8 @@ def test_llm_review_skipped_when_deterministic_checks_fail() -> None:
     review = _step_by_name(_load_workflow(), REVIEW_STEP)
     # Boolean variables + short messages: stable across ruff formatter
     # versions (see PR #151).
-    bare_input_toggle_only = review.get("if") == "inputs.enable-llm-review"
-    assert bare_input_toggle_only, "LLM review condition must be the bare input toggle"
+    bare_input_toggle_only = review.get("if") == "inputs.enable-llm-review != false"
+    assert bare_input_toggle_only, "review condition must be the != false input toggle"
     assert not review.get("continue-on-error"), "a failed judge run fails the job"
 
 
@@ -237,10 +239,8 @@ def test_gitleaks_step_is_strictly_opt_in() -> None:
     # the in-workflow Gitleaks step exists purely for target repositories, so
     # its condition must be exactly the input toggle.
     gitleaks = _step_by_name(_load_workflow(), "Run Gitleaks")
-    bare_input_toggle_only = gitleaks.get("if") == "inputs.enable-gitleaks"
-    assert (
-        bare_input_toggle_only
-    ), "Gitleaks must gate on the bare enable-gitleaks input"
+    opt_in_comparison = gitleaks.get("if") == "inputs.enable-gitleaks == true"
+    assert opt_in_comparison, "Gitleaks must gate on the == true opt-in comparison"
 
 
 def test_no_step_uses_always_gating() -> None:
@@ -256,3 +256,30 @@ def test_no_step_uses_always_gating() -> None:
         if "always()" in str(step.get("if", ""))
     ]
     assert offenders == [], "steps with always() gating defeat the tiered gates"
+
+
+def test_every_inputs_reference_keeps_native_fallback() -> None:
+    # Native pull_request runs see an EMPTY inputs context (defaults only
+    # materialize for workflow_call). Observed on PR #173: a bare
+    # `${{ inputs.lint-paths }}` degraded the native ruff scope to the whole
+    # repository, and bare-truthiness toggles silently disabled the judges
+    # and the Diff Coverage Gate on this repository's own PRs. The parity
+    # rule is therefore structural: conditions use `!= false` / `== true`,
+    # interpolated run strings carry an `|| 'native default'` fallback.
+    wf = _load_workflow()
+    condition_offenders = []
+    run_offenders = []
+    for job_id, job in wf["jobs"].items():
+        for step in job.get("steps", []):
+            name = f"{job_id}/{step.get('name')}"
+            gate_if = str(step.get("if", ""))
+            if "inputs." in gate_if:
+                has_typed_comparison = "!= false" in gate_if or "== true" in gate_if
+                if not has_typed_comparison:
+                    condition_offenders.append(name)
+            for key in ("run", "env", "with"):
+                block = str(step.get(key, ""))
+                if "inputs." in block and " || " not in block:
+                    run_offenders.append(f"{name} ({key})")
+    assert condition_offenders == [], "boolean inputs need typed comparisons"
+    assert run_offenders == [], "string/number inputs need || fallbacks"
