@@ -143,6 +143,10 @@ The caller may pass inputs to the reusable workflow:
 > unexpected-input validation error — delete those inputs from your caller
 > workflow when upgrading.
 
+## Deterministic static checks
+
+The judges are the *semantic* tier of the quality model (ADR-0020); the deterministic tier (ruff, mypy, coverage floor, Diff Coverage Gate, dependency and secret scans) is reusable too: see [ADR-0057](../docs/adr/0057-reusable-pr-checks-workflow-for-target-repos.md) and call `.github/workflows/pr-checks.yml` from a caller job, passing your repository's paths and thresholds as inputs. Running the deterministic gates in the same PR event as the judges preserves the cost ordering — judges only spend tokens once every mechanical gate is green.
+
 ## Branch protection & review event type
 
 The judge posts the review as `approve` (all PASS) or `request-changes` (any
