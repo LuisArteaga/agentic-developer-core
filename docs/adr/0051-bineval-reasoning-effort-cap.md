@@ -5,6 +5,10 @@
 Accepted (extends [ADR-0049](./0049-bineval-length-limit-budget-retry.md);
 addresses [issue #139](https://github.com/LuisArteaga/agentic-developer-core/issues/139))
 
+**Amended 2026-08-26:** the `security` clause of the Decision ("Other reasoning
+nodes untouched") was superseded by the judge model swap to
+`z-ai/glm-5.3-flash` — see the amended bullet for the documented justification.
+
 ## Context
 
 [ADR-0049](./0049-bineval-length-limit-budget-retry.md) responded to BinEval
@@ -50,6 +54,23 @@ translated per provider.
 - **Other reasoning nodes untouched.** `security` (`options.thinking: max`)
   keeps its deliberate unbounded reasoning: the burn is specific to BinEval's
   single-call, fixed-budget, structured-output shape, not a general policy.
+  *(Amended 2026-08-26: this clause no longer holds for `security`. The judge
+  model swap replaced all four PR-review judges with
+  `z-ai/glm-5.3-flash`, which does not support DeepSeek's native
+  `thinking` parameter — so `"options": {"thinking": "max"}` was necessarily
+  migrated to the standardized cross-provider form
+  `{"reasoning": {"effort": "high"}}`, keeping security as the deepest-reasoning
+  judge (`high`, not a BinEval-style `low`). In the same change, security was
+  subsequently upgraded from the shared flash model to
+  `moonshotai/kimi-k3` — a dedicated deep-reasoning model (every routed
+  endpoint declares `reasoning` / `reasoning_effort` support, verified via the
+  OpenRouter model endpoints API) — so its reasoning posture now exceeds the
+  flash-tier judges rather than merely matching them; `effort: high` is the
+  top of OpenRouter's unified effort scale, the portable maximum across
+  providers. The provider-independent standardized parameter is supported by
+  every routed endpoint; layered fallback to glm-5.2 and ADR-0021's retry
+  semantics are unchanged. This remains specific to the model-platform
+  migration — still not a general effort-cap policy.)*
 - **Next lever unchanged.** If truncation persists despite the cap,
   ADR-0049's Option 2 (route `bin_eval` to a non-reasoning model) remains the
   escalation path; rollout should be observed via BinEval `finish_reason` and
