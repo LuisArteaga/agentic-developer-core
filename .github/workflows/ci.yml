@@ -1,0 +1,31 @@
+name: CI
+
+# Thin self-caller: this repository's own pull requests run the reusable
+# pr-checks workflow with the inputs that reproduce its historical native
+# behavior (see ADR-0057 for why the workflow is pure-reusable).
+#
+# `secrets: inherit` forwards the repo-level OPENROUTER_API_KEY / GH_PAT used
+# by the judge review step.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  ci:
+    uses: ./.github/workflows/pr-checks.yml
+    secrets: inherit
+    permissions:
+      contents: read
+    with:
+      python-version: "3.12"
+      lint-paths: "orchestrator scripts"
+      cov-paths: "orchestrator scripts"
+      coverage-floor: 89
+      prefetch-tree-sitter: true
+      enable-secret-scan-script: true
+      enable-semgrep: true
+      enable-pip-audit: true
+      enable-gitleaks: false
+      enable-diff-gate: true
+      enable-llm-review: true

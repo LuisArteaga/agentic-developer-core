@@ -46,26 +46,39 @@ Contract:
 7. **Job identity is stable**: the job id stays `pr-checks` so required-status-check names survive for both trigger modes.
 8. The structural contract tests in `scripts/test_pr_checks_workflow.py` pin all of the above at `make verify` surface, including the defaults table.
 
-### Decision (2) — Input parity rule
+### Decision (2) — Pure-reusable architecture (revised on PR #174)
 
-First CI run on this ADR's PR surfaced a GitHub semantics trap, then a second
-one behind it. (a) The `inputs` context is EMPTY on native `pull_request`
-runs — declared defaults materialize only inside `workflow_call` — so bare
-`${{ inputs.x }}` degraded native ruff/mypy scope to the whole repository.
-(b) The seemingly obvious fix, typed comparisons like `inputs.x != false`,
-is worse: GitHub casts comparison operands to NUMBERS, and both `''` and
-`false` cast to 0, so on native runs `'' != false` is FALSE and every
-default-on step was silently skipped — judges included. Coercion-proof
-patterns adopted:
+Making the workflow dual-trigger (native `pull_request` + `workflow_call`)
+failed twice in CI before the final shape emerged:
 
-* strings/numbers: `${{ inputs.x || 'native-default' }}` in run/env/with;
-* default-on booleans: `github.event_name != 'workflow_call' || inputs.x`;
-* opt-in booleans: `github.event_name == 'workflow_call' && inputs.x`;
-* callers needing "no extra packages" pass the sentinel token `none`.
+1. Bare `${{ inputs.x }}` references: the `inputs` context is EMPTY outside
+   `workflow_call`, so native runs lost their lint scope and skipped
+   toggled steps entirely.
+2. Typed comparisons (`inputs.x != false`): GitHub casts comparison operands
+   to numbers, and both `''` and `false` cast to 0 — so native runs evaluated
+   `'' != false` as FALSE. Every default-on step, judges included, silently
+   skipped.
+3. Mode guards (`github.event_name != 'workflow_call' || ...`): inside a
+   called workflow the `github` context belongs to the CALLER, so
+   `event_name` is e.g. `pull_request`, never `'workflow_call'`. No built-in
+   expression distinguishes called from direct execution.
 
-The contract suite pins all three rules structurally
-(`test_every_inputs_reference_keeps_native_fallback` and per-step
-condition assertions).
+The robust resolution is architectural, not expression-level: **the workflow
+is pure reusable** — `workflow_call` is its only trigger, `inputs` is always
+fully materialized, and bare-truthiness conditions (`if: inputs.enable-x`)
+are exact. This repository's own pull requests run it through the thin
+self-caller `.github/workflows/ci.yml` (`secrets: inherit`, explicit inputs
+mirroring historical behavior: floor 89, tree-sitter prefetch, secret-scan
+script, semgrep, pip-audit, LLM review; gitleaks stays off in favor of the
+dedicated secret-scan.yml). String/number interpolations keep
+`${{ inputs.x || 'default' }}` fallbacks so callers may omit optional knobs;
+callers wanting no extra packages pass the sentinel token `none`.
+
+The contract suite pins all of this structurally: single-trigger invariant,
+bare-truthiness condition shapes, interpolation fallbacks, and the
+self-caller's explicit inputs (`test_self_caller_invokes_reusable_workflow_…
+`). Note the required-check name changes from `pr-checks` (direct) to
+`ci / pr-checks` (called) — branch protection must reference the latter.
 
 ## Consequences
 

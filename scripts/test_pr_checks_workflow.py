@@ -75,9 +75,15 @@ def _step_by_name(wf: dict[str, Any], name: str) -> dict[str, Any]:
     return matches[0]
 
 
-def test_triggers_on_pull_request() -> None:
+def test_has_no_direct_triggers() -> None:
+    # ADR-0057 (PR #174): the workflow is PURE reusable. Dual triggering made
+    # every conditional silently mode-dependent because `github.event_name`
+    # inside a called workflow mirrors the CALLER's event — there is no
+    # expression that detects being called. This repository's own PRs run it
+    # via the thin caller `.github/workflows/ci.yml` instead.
     on = _triggers(_load_workflow())
-    assert "pull_request" in on, "workflow must trigger on pull_request events"
+    # Single-line assert by design (ruff version skew, PR #151/#173).
+    assert list(on.keys()) == ["workflow_call"], "single trigger only"
 
 
 def test_exposes_workflow_call_trigger() -> None:
@@ -87,15 +93,15 @@ def test_exposes_workflow_call_trigger() -> None:
 
 
 def test_caller_secrets_are_optional_named_inputs() -> None:
-    # Native pull_request runs read repo-level secrets directly; callers wire
-    # the declared names instead. Optional declarations keep both modes valid.
+    # Callers wire the declared names (or pass `secrets: inherit` from a
+    # same-repo caller, as this repository's ci.yml does).
     call = _triggers(_load_workflow())["workflow_call"]
     secrets = call.get("secrets")
     assert isinstance(secrets, dict), "workflow_call must declare its secrets"
     has_judge_secret = "openrouter-api-key" in secrets and "gh-pat" in secrets
     assert has_judge_secret, "caller-side judge secret names must be declared"
     all_optional = all(not s.get("required", False) for s in secrets.values())
-    assert all_optional, "required secrets would break native runs without wiring"
+    assert all_optional, "optional secrets keep minimal callers valid"
 
 
 def test_reusable_input_defaults_preserve_local_behavior() -> None:
@@ -208,11 +214,10 @@ def test_gate_step_skip_conditions_are_scoped_to_reusability() -> None:
     gate_if = str(gate.get("if", ""))
     scoped_to_pr_events = "github.event_name == 'pull_request'" in gate_if
     assert scoped_to_pr_events, "gate must be scoped to pull_request events"
-    mode_guard = "github.event_name != 'workflow_call' || inputs.enable-diff-gate"
-    honors_opt_out = mode_guard in gate_if
+    honors_opt_out = "inputs.enable-diff-gate" in gate_if
     # Single-line assert by design: the pinned and latest ruff formatters
     # disagree on wrapping long assert messages (PR #151 / #173 skew).
-    assert honors_opt_out, "gate opt-out must use the mode guard"
+    assert honors_opt_out, "callers must be able to opt out via enable-diff-gate"
 
 
 def test_llm_review_skipped_when_deterministic_checks_fail() -> None:
@@ -228,11 +233,8 @@ def test_llm_review_skipped_when_deterministic_checks_fail() -> None:
     review = _step_by_name(_load_workflow(), REVIEW_STEP)
     # Boolean variables + short messages: stable across ruff formatter
     # versions (see PR #151).
-    mode_guarded_toggle = (
-        review.get("if")
-        == "github.event_name != 'workflow_call' || inputs.enable-llm-review"
-    )
-    assert mode_guarded_toggle, "review condition must be the mode-guarded toggle"
+    bare_input_toggle_only = review.get("if") == "inputs.enable-llm-review"
+    assert bare_input_toggle_only, "review condition must be the bare input toggle"
     assert not review.get("continue-on-error"), "a failed judge run fails the job"
 
 
@@ -241,11 +243,8 @@ def test_gitleaks_step_is_strictly_opt_in() -> None:
     # the in-workflow Gitleaks step exists purely for target repositories, so
     # its condition must be exactly the input toggle.
     gitleaks = _step_by_name(_load_workflow(), "Run Gitleaks")
-    opt_in_guard = (
-        gitleaks.get("if")
-        == "github.event_name == 'workflow_call' && inputs.enable-gitleaks"
-    )
-    assert opt_in_guard, "Gitleaks must be a called-mode-only opt-in"
+    opt_in_comparison = gitleaks.get("if") == "inputs.enable-gitleaks"
+    assert opt_in_comparison, "Gitleaks must gate on its bare enable-gitleaks input"
 
 
 def test_no_step_uses_always_gating() -> None:
@@ -263,32 +262,72 @@ def test_no_step_uses_always_gating() -> None:
     assert offenders == [], "steps with always() gating defeat the tiered gates"
 
 
-def test_every_inputs_reference_keeps_native_fallback() -> None:
-    # Native pull_request runs see an EMPTY inputs context (defaults only
-    # materialize for workflow_call). Observed twice on PR #173: a bare
-    # `${{ inputs.lint-paths }}` degraded the native ruff scope to the whole
-    # repository, and typed-comparison toggles (`!= false`) silently skipped
-    # the judges and the Diff Coverage Gate natively — GitHub casts operands
-    # to numbers, so `'' != false` is FALSE. The structural parity rules:
-    # conditions reference inputs only behind an explicit workflow_call mode
-    # guard; run/env/with interpolations carry an `|| 'native default'`.
+def test_boolean_conditions_are_bare_truthiness() -> None:
+    # ADR-0057 (PR #174): with workflow_call as the only trigger, `inputs` is
+    # always materialized and bare truthiness is exact. The two earlier guard
+    # styles were both broken in one execution mode or the other (PR #173):
+    # bare conditions under dual triggers skipped steps natively ('' is
+    # falsy), and typed comparisons like `!= false` skip called steps because
+    # GitHub compares numerically (`'' == false`). Allowed condition shapes
+    # are exactly the bare toggle and the bare toggle plus the gate's
+    # pull_request scope.
+    allowed_exact = {
+        "inputs.enable-gitleaks",
+        "inputs.enable-llm-review",
+        "inputs.prefetch-tree-sitter",
+        "inputs.enable-secret-scan-script",
+        "inputs.enable-semgrep",
+        "inputs.enable-pip-audit",
+        "inputs.enable-diff-gate && github.event_name == 'pull_request'",
+    }
+    offenders = []
+    for job_id, job in _load_workflow()["jobs"].items():
+        for step in job.get("steps", []):
+            step_if = str(step.get("if", ""))
+            if "inputs." in step_if and step_if not in allowed_exact:
+                offenders.append(f"{job_id}/{step.get('name')}: {step_if}")
+    assert offenders == [], "conditions must be pinned bare-truthiness forms"
+
+
+def test_string_interpolations_keep_fallbacks() -> None:
+    # Optional string/number inputs may be omitted by callers; every
+    # interpolation in run/env/with must therefore carry its `|| default`.
     wf = _load_workflow()
-    condition_offenders = []
-    run_offenders = []
+    offenders = []
     for job_id, job in wf["jobs"].items():
         for step in job.get("steps", []):
-            name = f"{job_id}/{step.get('name')}"
-            step_if = str(step.get("if", ""))
-            if "inputs." in step_if:
-                has_mode_guard = (
-                    "github.event_name != 'workflow_call'" in step_if
-                    or "github.event_name == 'workflow_call'" in step_if
-                )
-                if not has_mode_guard:
-                    condition_offenders.append(name)
             for key in ("run", "env", "with"):
                 block = str(step.get(key, ""))
                 if "inputs." in block and " || " not in block:
-                    run_offenders.append(f"{name} ({key})")
-    assert condition_offenders == [], "input conditions need a workflow_call mode guard"
-    assert run_offenders == [], "string/number inputs need || fallbacks"
+                    offenders.append(f"{job_id}/{step.get('name')} ({key})")
+    assert offenders == [], "string/number inputs need || fallbacks"
+
+
+CALLER_PATH = (
+    Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
+)
+
+
+def _load_caller() -> dict[str, Any]:
+    assert CALLER_PATH.exists(), f"missing caller workflow: {CALLER_PATH}"
+    with CALLER_PATH.open() as f:
+        return yaml.safe_load(f)
+
+
+def test_self_caller_invokes_reusable_workflow_with_inherited_secrets() -> None:
+    # ADR-0057: this repository's own PR coverage runs through the reusable
+    # workflow; the caller must forward secrets and mirror the historical
+    # behavior via explicit inputs.
+    caller = _load_caller()
+    job = caller["jobs"]["ci"]
+    calls_self = str(job.get("uses", "")).endswith("./.github/workflows/pr-checks.yml")
+    assert calls_self, "caller must invoke the local reusable pr-checks workflow"
+    inherits = job.get("secrets") == "inherit"
+    assert inherits, "caller must inherit repo-level judge secrets"
+    with_block = job.get("with", {})
+    floor_matches_history = with_block.get("coverage-floor") == 89
+    assert floor_matches_history, "self-caller must pin the historical 89% floor"
+    judges_on = with_block.get("enable-llm-review") is True
+    assert judges_on, "this repository keeps running the LLM judges on its PRs"
+    gitleaks_off = with_block.get("enable-gitleaks") is False
+    assert gitleaks_off, "dedicated secret-scan.yml already covers this repository"
