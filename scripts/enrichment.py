@@ -145,12 +145,14 @@ def _get_enclosing_function_for_line(
                     body_node = current
 
             # A decorated_definition wrapping neither a function nor a class
-            # carries no usable name — keep walking instead of crashing.
-            if named_node is None:
+            # carries no usable name — keep walking instead of crashing. The
+            # python grammar always names functions and classes today, so
+            # these guards only guard against parser-version drift.
+            if named_node is None:  # pragma: no cover
                 current = current.parent
                 continue
             name_node = named_node.child_by_field_name("name")
-            if name_node is None:
+            if name_node is None:  # pragma: no cover
                 current = current.parent
                 continue
             fn_name = source_bytes[name_node.start_byte : name_node.end_byte].decode(
