@@ -117,24 +117,26 @@ def _get_enclosing_function_for_line(
     )
 
     # Traverse ancestors to find enclosing function_definition or
-    # decorated_definition (which wraps decorated functions).
+    # decorated_definition (which wraps decorated functions or classes).
     current = deepest
     while current is not None and current != node:
         if current.type in ("function_definition", "decorated_definition"):
-            # For decorated_definition, the actual function node is the last child
+            # For decorated_definition, the named node is the wrapped
+            # function or class — a @dataclass-decorated class wraps a
+            # class_definition, not a function_definition.
             if current.type == "decorated_definition":
-                fn_node = next(
+                named_node = next(
                     (
                         child
                         for child in current.children
-                        if child.type == "function_definition"
+                        if child.type in ("function_definition", "class_definition")
                     ),
-                    current,
+                    None,
                 )
                 # Use the decorated_definition's byte range to include decorators
                 body_node = current
             else:
-                fn_node = current
+                named_node = current
                 # Check if this function_definition is inside a decorated_definition
                 candidate = current.parent
                 if candidate is not None and candidate.type == "decorated_definition":
@@ -142,9 +144,15 @@ def _get_enclosing_function_for_line(
                 else:
                     body_node = current
 
-            # Extract function name (function_definition always has a name field)
-            name_node = fn_node.child_by_field_name("name")
-            assert name_node is not None
+            # A decorated_definition wrapping neither a function nor a class
+            # carries no usable name — keep walking instead of crashing.
+            if named_node is None:
+                current = current.parent
+                continue
+            name_node = named_node.child_by_field_name("name")
+            if name_node is None:
+                current = current.parent
+                continue
             fn_name = source_bytes[name_node.start_byte : name_node.end_byte].decode(
                 "utf-8", errors="replace"
             )
