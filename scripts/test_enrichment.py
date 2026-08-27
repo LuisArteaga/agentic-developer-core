@@ -277,6 +277,55 @@ class TestEnrichDiffWithFunctionContext(unittest.TestCase):
         self.assertIn("--- decorated.py :: my_view ---", enriched)
         self.assertIn("@app.route('/test')", enriched)
 
+    def test_decorated_class_body_line(self):
+        """Regression: changed line inside a decorated class must not crash.
+
+        ``@dataclass``-decorated classes wrap a ``class_definition``, not a
+        ``function_definition``. The walker used to assume a function and
+        hit ``assert name_node is not None`` on the decorated node, killing
+        the judge run for any diff touching a dataclass field.
+        """
+        self._write_file(
+            "domain.py",
+            "from dataclasses import dataclass\n"
+            "\n"
+            "\n"
+            "@dataclass(frozen=True)\n"
+            "class Isa95Hierarchy:\n"
+            '    """Optional equipment hierarchy labels."""\n'
+            "\n"
+            "    enterprise: str | None = None\n"
+            "    site: str | None = None\n",
+        )
+        # Hunk line 8 = the ``enterprise`` field inside the class body.
+        diff = self._diff("domain.py", 8)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertIn("--- domain.py :: Isa95Hierarchy ---", enriched)
+        self.assertIn("@dataclass(frozen=True)", enriched)
+        self.assertIn("enterprise: str | None = None", enriched)
+
+    def test_decorated_class_hunk_at_decorator_line(self):
+        """Regression: decorator-line hunk on a class resolves the class name."""
+        self._write_file(
+            "domain.py",
+            "@dataclass(frozen=True)\nclass Point:\n    x: float\n    y: float\n",
+        )
+        # Hunk line 1 = the @dataclass decorator line.
+        diff = self._diff("domain.py", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertIn("--- domain.py :: Point ---", enriched)
+        self.assertIn("x: float", enriched)
+
+    def test_plain_class_body_line_has_no_function_context(self):
+        """Changed lines in undecorated classes keep producing no context."""
+        self._write_file(
+            "model.py",
+            "class Config:\n    name: str = 'x'\n",
+        )
+        diff = self._diff("model.py", 1)
+        enriched = enrich_diff_with_function_context(diff, str(self.workspace))
+        self.assertNotIn("=== ENCLOSING FUNCTION CONTEXT ===", enriched)
+
     def test_parse_diff_without_b_path(self):
         """Edge case: diff header with fewer than 4 tokens produces no hunks."""
         enriched = enrich_diff_with_function_context(
