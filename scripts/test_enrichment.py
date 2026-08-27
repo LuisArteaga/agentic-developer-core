@@ -308,10 +308,7 @@ class TestEnrichDiffWithFunctionContext(unittest.TestCase):
         """Regression: decorator-line hunk on a class resolves the class name."""
         self._write_file(
             "domain.py",
-            "@dataclass(frozen=True)\n"
-            "class Point:\n"
-            "    x: float\n"
-            "    y: float\n",
+            "@dataclass(frozen=True)\nclass Point:\n    x: float\n    y: float\n",
         )
         # Hunk line 1 = the @dataclass decorator line.
         diff = self._diff("domain.py", 1)
@@ -323,7 +320,7 @@ class TestEnrichDiffWithFunctionContext(unittest.TestCase):
         """Changed lines in undecorated classes keep producing no context."""
         self._write_file(
             "model.py",
-            "class Config:\n" "    name: str = 'x'\n",
+            "class Config:\n    name: str = 'x'\n",
         )
         diff = self._diff("model.py", 1)
         enriched = enrich_diff_with_function_context(diff, str(self.workspace))
