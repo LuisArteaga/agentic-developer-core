@@ -376,10 +376,7 @@ def _run_layered_retry(
         # empty-content nudge is pointless - go straight to the fallback.
         if not fallback_model:
             raise
-        log(
-            f"[WARN] Judge {judge_key}: primary model failed after "
-            f"API retries: {exc}"
-        )
+        log(f"[WARN] Judge {judge_key}: primary model failed after API retries: {exc}")
         response_body, attempt_count = _run_fallback(2)
         return response_body, True, fallback_model, attempt_count
 
