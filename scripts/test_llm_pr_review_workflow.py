@@ -91,6 +91,18 @@ def test_permissions_allow_review_posting() -> None:
     assert perms.get("contents") == "read"
 
 
+def test_job_has_timeout_guard() -> None:
+    """AC: the job carries an explicit timeout above the retry budget."""
+    wf = _load_workflow()
+    job = wf["jobs"]["llm-pr-review"]
+    timeout = job.get("timeout-minutes")
+    assert timeout is not None, "job must set an explicit timeout-minutes"
+    # The 429 retry budget alone can stretch a run to ~45 min; four judges
+    # over chunked diffs fit inside the 90-minute guard, and the guard still
+    # kills a hung transport instead of burning the 6-hour runner cap.
+    assert int(timeout) == 90
+
+
 def test_checks_out_orchestrator_repo_and_target_repo() -> None:
     wf = _load_workflow()
     steps = wf["jobs"]["llm-pr-review"]["steps"]

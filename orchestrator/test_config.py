@@ -697,6 +697,17 @@ class TestResolveLoopConfig(unittest.TestCase):
 class TestResolveJudgeConfigs(unittest.TestCase):
     """Tests for the 4 PR-review judge entries in config/factory.json (issue #37)."""
 
+    GLM_JUDGE_ROUTING = [
+        "Z.AI",
+        "Novita",
+        "DeepInfra",
+        "Modal",
+        "Fireworks",
+        "Friendli",
+        "Parasail",
+        "Phala",
+    ]
+
     def setUp(self):
         self.original_env = {}
         for var in [
@@ -719,23 +730,25 @@ class TestResolveJudgeConfigs(unittest.TestCase):
     def test_resolve_judge_configs(self):
         """Each judge resolves its model/routing/temperature from factory.json.
 
-        The GLM judges resolve routing=None (ADR-0021 amendment 2026-08-31:
-        OpenRouter default price-weighted routing with provider failover);
-        security keeps its pinned provider order.
+        All four judges carry a pinned provider order (ADR-0021 amendment
+        2026-09-01: the GLM judges re-pin from the price-weighted default to
+        a wide-curated fp8 list — quality control without the two-provider
+        death pool; security's kimi-k3 order is unchanged).
         """
         syntax = resolve_model_config("syntax_lint")
         self.assertEqual(syntax["model"], "z-ai/glm-5.3-flash")
-        self.assertIsNone(syntax["routing"])
+        self.assertEqual(syntax["routing"], self.GLM_JUDGE_ROUTING)
         self.assertEqual(syntax["temperature"], 0.0)
         self.assertIsNone(syntax["options"])
 
         test_cov = resolve_model_config("test_coverage")
         self.assertEqual(test_cov["model"], "z-ai/glm-5.3-flash")
+        self.assertEqual(test_cov["routing"], self.GLM_JUDGE_ROUTING)
         self.assertEqual(test_cov["temperature"], 0.0)
 
         arch = resolve_model_config("architecture")
         self.assertEqual(arch["model"], "z-ai/glm-5.3-flash")
-        self.assertIsNone(arch["routing"])
+        self.assertEqual(arch["routing"], self.GLM_JUDGE_ROUTING)
 
         sec = resolve_model_config("security")
         self.assertEqual(sec["model"], "moonshotai/kimi-k3")

@@ -21,6 +21,7 @@ dev = [
     "semgrep>=1.0.0",
     "pip-audit>=2.0.0",
     "pre-commit",
+    "types-PyYAML>=6.0",
 ]
 
 [build-system]
