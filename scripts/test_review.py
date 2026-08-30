@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for scripts/review.py findings and reasoning parsing."""
 
+import contextlib
 import io
 import json
 import os
@@ -1577,10 +1578,6 @@ class ApiRetryPolicyTests(unittest.TestCase):
     the wall-clock budget is spent (ADR-0021, amended 2026-08-31).
     """
 
-    def setUp(self):
-        # Step-summary header state is process-global; every test starts clean.
-        review._STEP_SUMMARY_READY = False
-
     def _good_body(self) -> tuple[int, str]:
         return 200, json.dumps(
             {"choices": [{"message": {"content": "<reasoning>r</reasoning>"}}]}
@@ -1590,10 +1587,6 @@ class ApiRetryPolicyTests(unittest.TestCase):
         return 200, json.dumps({"error": {"message": "rate limited"}})
 
     def _http_error(self, code: int, headers: dict | None = None):
-        from email.message import Message
-
-        import urllib.error
-
         hdrs = Message()
         for key, value in (headers or {}).items():
             hdrs[key] = str(value)
@@ -1735,23 +1728,25 @@ class ApiRetryPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "step-summary.md")
             with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": path}):
-                review._STEP_SUMMARY_READY = False
                 review.append_step_summary(["| m | 1 | 429 | retry |"])
                 review.append_step_summary(["| m | 2 | 429 | give up |"])
 
             content = Path(path).read_text()
-        self.assertEqual(content.count("## OpenRouter retry events"), 1)
+        self.assertEqual(content.count(review.STEP_SUMMARY_HEADER), 1)
         self.assertIn("| m | 1 | 429 | retry |", content)
         self.assertIn("| m | 2 | 429 | give up |", content)
 
     def test_append_step_summary_is_a_noop_outside_ci(self):
         """AC: without GITHUB_STEP_SUMMARY nothing is written anywhere."""
-        review._STEP_SUMMARY_READY = False
-        with patch.dict(os.environ, {}, clear=True):
-            review.append_step_summary(["| m | 1 | 429 | retry |"])
-
-    def tearDown(self):
-        review._STEP_SUMMARY_READY = False
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.chdir(tmp)
+                with patch.dict(os.environ, {}, clear=True):
+                    review.append_step_summary(["| m | 1 | 429 | retry |"])
+                self.assertEqual(os.listdir(tmp), [])
+            finally:
+                os.chdir(original_cwd)
 
     def test_transport_success_returns_status_and_body(self):
         """AC: the transport returns (status, body) on a 200 response."""
@@ -1809,47 +1804,53 @@ class ApiRetryPolicyTests(unittest.TestCase):
         """AC: non-numeric or missing headers parse as None."""
         hdrs = Message()
         hdrs["Retry-After"] = "soon"
-        self.assertIsNone(review._parse_retry_after(hdrs))
-        self.assertIsNone(review._parse_retry_after(None))
+        self.assertIsNone(review.parse_retry_after(hdrs))
+        self.assertIsNone(review.parse_retry_after(None))
 
-    def test_read_error_body_survives_a_raising_fp(self):
+    def test_error_body_snippet_survives_a_raising_stream(self):
         """AC: a body stream that explodes reads as an empty snippet."""
         error = urllib.error.HTTPError(
             "https://openrouter.ai", 500, "oops", Message(), None
         )
-        self.assertEqual(review._read_error_body(error), "")
+        self.assertEqual(review.OpenRouterHTTPError(error).body_snippet, "")
         exploding = MagicMock()
         exploding.read.side_effect = OSError("stream gone")
         broken = urllib.error.HTTPError(
             "https://openrouter.ai", 500, "oops", Message(), exploding
         )
-        self.assertEqual(review._read_error_body(broken), "")
+        self.assertEqual(review.OpenRouterHTTPError(broken).body_snippet, "")
 
     def test_connection_and_timeout_errors_are_retryable(self):
         """AC: bare socket-level failures join the retryable class."""
         self.assertEqual(
-            review._classify_api_error(ConnectionError("reset")), (True, None)
+            review.classify_api_error(ConnectionError("reset")), (True, None)
         )
         self.assertEqual(
-            review._classify_api_error(TimeoutError("timed out")), (True, None)
+            review.classify_api_error(TimeoutError("timed out")), (True, None)
         )
 
     def test_next_wait_variants(self):
         """AC: Retry-After wins; no-jitter returns the schedule; no schedule is zero."""
-        self.assertEqual(review._next_wait(5, 30, jitter=True), 30.0)
-        self.assertEqual(review._next_wait(5, None, jitter=False), 5.0)
-        self.assertEqual(review._next_wait(None, None, jitter=False), 0.0)
+        self.assertEqual(review.next_wait(5, 30, jitter=True), 30.0)
+        self.assertEqual(review.next_wait(5, None, jitter=False), 5.0)
+        self.assertEqual(review.next_wait(None, None, jitter=False), 0.0)
 
     def test_message_size_counts_content_chars(self):
         """AC: the debug helper measures the message content, tolerating absence."""
-        self.assertEqual(review._message_size({"content": "abcd"}), 4)
-        self.assertEqual(review._message_size({}), 0)
+        self.assertEqual(review.message_size({"content": "abcd"}), 4)
+        self.assertEqual(review.message_size({}), 0)
 
     @patch("review.REVIEW_DEBUG", True)
     @patch("review.time.sleep")
     @patch("review.call_openrouter_api")
     def test_debug_mode_logs_payload_shape_and_error_body(self, mock_call, mock_sleep):
-        """AC: REVIEW_DEBUG surfaces the payload shape and the error body."""
+        """AC: REVIEW_DEBUG surfaces the payload shape and the error body.
+
+        Asserts on the captured stdout of the debug logs themselves: the
+        request line must carry the payload shape (model, per-message
+        content sizes) and the failure line must carry the 429 body
+        snippet, so the test fails if the debug logging is removed.
+        """
         # An already-wrapped transport error (as the real flow produces it)
         # carries the body snippet the debug log prints.
         wrapped = review.OpenRouterHTTPError(
@@ -1865,10 +1866,41 @@ class ApiRetryPolicyTests(unittest.TestCase):
             wrapped,
             self._good_body(),
         ]
-        body = review._call_with_api_retry(
-            "m", [{"role": "user", "content": "diff"}], "key", None, 0.0, None
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            review._call_with_api_retry(
+                "m", [{"role": "user", "content": "diff"}], "key", None, 0.0, None
+            )
+        output = captured.getvalue()
+        self.assertIn("[DEBUG] OpenRouter request model=m", output)
+        self.assertIn("messages=[4]", output)
+        self.assertIn("[DEBUG] error body:", output)
+        self.assertIn('"code": 429', output)
+
+    @patch("review.REVIEW_DEBUG", False)
+    @patch("review.time.sleep")
+    @patch("review.call_openrouter_api")
+    def test_debug_logging_is_gated_off_by_default(self, mock_call, mock_sleep):
+        """AC: with REVIEW_DEBUG disabled no debug lines are printed."""
+        wrapped = review.OpenRouterHTTPError(
+            urllib.error.HTTPError(
+                "https://openrouter.ai/api/v1/chat/completions",
+                429,
+                "Too Many Requests",
+                Message(),
+                io.BytesIO(b'{"error": {"code": 429}}'),
+            )
         )
-        self.assertIn("choices", body)
+        mock_call.side_effect = [
+            wrapped,
+            self._good_body(),
+        ]
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            review._call_with_api_retry(
+                "m", [{"role": "user", "content": "diff"}], "key", None, 0.0, None
+            )
+        self.assertNotIn("[DEBUG]", captured.getvalue())
 
     @patch("review.time.sleep")
     @patch("review.call_openrouter_api")

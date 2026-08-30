@@ -299,7 +299,7 @@ class OpenRouterHTTPError(Exception):
 
     def __init__(self, http_error: urllib.error.HTTPError):
         self.status = http_error.code
-        self.retry_after = _parse_retry_after(http_error.headers)
+        self.retry_after = parse_retry_after(http_error.headers)
         self.body_snippet = _read_error_body(http_error)
         super().__init__(
             f"HTTP {self.status} from OpenRouter"
@@ -308,7 +308,7 @@ class OpenRouterHTTPError(Exception):
         )
 
 
-def _parse_retry_after(headers: Any) -> int | None:
+def parse_retry_after(headers: Any) -> int | None:
     """The ``Retry-After`` header in seconds, when present and numeric."""
     try:
         value = headers.get("Retry-After")
@@ -349,7 +349,7 @@ def _call_with_api_retry(model, messages, api_key, routing, temperature, options
             log(
                 f"[DEBUG] OpenRouter request model={model} attempt={attempt} "
                 f"routing={routing} temperature={temperature} "
-                f"messages={[_message_size(m) for m in messages]}"
+                f"messages={[message_size(m) for m in messages]}"
             )
         try:
             status, body = call_openrouter_api(
@@ -373,7 +373,7 @@ def _call_with_api_retry(model, messages, api_key, routing, temperature, options
             )
             return body
         except Exception as error:
-            retryable, retry_after = _classify_api_error(error)
+            retryable, retry_after = classify_api_error(error)
             label = (
                 f"HTTP {error.status}"
                 if isinstance(error, OpenRouterHTTPError)
@@ -392,7 +392,7 @@ def _call_with_api_retry(model, messages, api_key, routing, temperature, options
                 if attempt <= len(API_RETRY_DELAYS_SECONDS)
                 else None
             )
-            wait = _next_wait(scheduled, retry_after, jitter=True)
+            wait = next_wait(scheduled, retry_after, jitter=True)
             remaining = deadline - time.monotonic()
             if scheduled is None and retry_after is None:
                 raise Exception(
@@ -416,7 +416,7 @@ def _call_with_api_retry(model, messages, api_key, routing, temperature, options
             time.sleep(wait)
 
 
-def _classify_api_error(error: Exception) -> tuple[bool, int | None]:
+def classify_api_error(error: Exception) -> tuple[bool, int | None]:
     """Whether an API error is worth retrying, and the requested wait.
 
     Returns ``(retryable, retry_after_seconds)``. Retryable: HTTP 429
@@ -433,7 +433,7 @@ def _classify_api_error(error: Exception) -> tuple[bool, int | None]:
         if status in RETRYABLE_HTTP_STATUSES:
             retry_after = getattr(error, "retry_after", None)
             if retry_after is None:
-                retry_after = _parse_retry_after(getattr(error, "headers", None))
+                retry_after = parse_retry_after(getattr(error, "headers", None))
             return True, retry_after
         return False, None
     if isinstance(error, urllib.error.URLError):
@@ -445,7 +445,7 @@ def _classify_api_error(error: Exception) -> tuple[bool, int | None]:
     return True, None
 
 
-def _next_wait(scheduled: int | None, retry_after: int | None, jitter: bool) -> float:
+def next_wait(scheduled: int | None, retry_after: int | None, jitter: bool) -> float:
     """The next wait in seconds: Retry-After wins, else the scheduled
     delay with up to ±20% jitter so parallel chunks do not synchronize."""
     if retry_after is not None:
@@ -457,34 +457,38 @@ def _next_wait(scheduled: int | None, retry_after: int | None, jitter: bool) -> 
     return float(scheduled)
 
 
-def _message_size(message: dict) -> int:
+def message_size(message: dict) -> int:
     """Character count of one prompt message (debug logging helper)."""
     return len(message.get("content", ""))
 
 
-_STEP_SUMMARY_READY = False
+STEP_SUMMARY_HEADER = "## OpenRouter retry events"
 
 
 def append_step_summary(lines: list[str]) -> None:
     """Append rows to the GitHub step summary, best effort.
 
     The CI surface for debugging judge runs: retry events land in the
-    run's summary page even when the job log scrolls them away. A no-op
-    outside GitHub Actions.
+    run's summary page even when the job log scrolls them away. The
+    header is written once per summary file, detected from the file
+    content rather than module state, so repeated calls within one job
+    produce exactly one header. A no-op outside GitHub Actions.
     """
-    global _STEP_SUMMARY_READY
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return
     try:
+        existing = ""
+        if os.path.exists(path):
+            with open(path) as summary:
+                existing = summary.read()
         with open(path, "a") as summary:
-            if not _STEP_SUMMARY_READY:
+            if STEP_SUMMARY_HEADER not in existing:
                 summary.write(
-                    "\n## OpenRouter retry events\n\n"
+                    f"\n{STEP_SUMMARY_HEADER}\n\n"
                     "| Model | Attempt | Error | Action |\n"
                     "|---|---|---|---|\n"
                 )
-                _STEP_SUMMARY_READY = True
             summary.write("\n".join(lines) + "\n")
     except Exception:
         pass
