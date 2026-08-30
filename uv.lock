@@ -29,6 +29,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
     { name = "semgrep" },
+    { name = "types-pyyaml" },
 ]
 
 [package.metadata]
@@ -45,6 +46,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
     { name = "semgrep", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "tree-sitter-language-pack", specifier = ">=1.14.0" },
+    { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
 ]
 provides-extras = ["dev"]
 
@@ -2417,6 +2419,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/20/3dfb1e78dd0a5312dd53208cc88461acf0521f6f746eebb58805b68ce3d4/tree_sitter_language_pack-1.14.0-cp310-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:3c7fd0218028e6fd9b465e43e3dc5096ca3ff636e881184793af760752111fcd", size = 2357093, upload-time = "2026-08-01T23:33:16.249Z" },
     { url = "https://files.pythonhosted.org/packages/41/fc/e1dd01505a75fc22e5bf531259ce85698caa4e279a89f2ae8ae721cae689/tree_sitter_language_pack-1.14.0-cp310-abi3-win_amd64.whl", hash = "sha256:1f4654b5abb9ffc44c6dea92928515bcc72dddacc6e4c4df2c6f154f0ee8b04e", size = 2135181, upload-time = "2026-08-01T23:33:17.563Z" },
     { url = "https://files.pythonhosted.org/packages/39/78/9e20271d574e2671df7f470c3cd1af56077352c20a24cbcebfc217b38146/tree_sitter_language_pack-1.14.0-cp310-abi3-win_arm64.whl", hash = "sha256:3b1e7c9ec2dc994e84e6975ec6d034bc8f089f88540deada59ec2b4bea3a1dd0", size = 2043177, upload-time = "2026-08-01T23:33:18.655Z" },
+]
+
+[[package]]
+name = "types-pyyaml"
+version = "6.0.12.20260815"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9f/72/b56089aeee6c496d969bac42376bedb6e3eeab4682e1018fa3137122f94b/types_pyyaml-6.0.12.20260815.tar.gz", hash = "sha256:28764110c9cf35846e733da32d8d734df7473c5dde9ef67c3b7332ec0e819858", size = 18545, upload-time = "2026-08-15T02:41:51.532Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/52/eefeba09be4ef2a1eb989eb92934561e8e502a6ee3c32654996e4be7e399/types_pyyaml-6.0.12.20260815-py3-none-any.whl", hash = "sha256:6f332212b7e191f3afd5016a713c510b6340593b7ebec573c7d5d20aa5386d3b", size = 21148, upload-time = "2026-08-15T02:41:50.555Z" },
 ]
 
 [[package]]

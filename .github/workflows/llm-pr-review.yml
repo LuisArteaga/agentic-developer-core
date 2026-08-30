@@ -52,6 +52,11 @@ permissions:
 jobs:
   llm-pr-review:
     runs-on: ubuntu-latest
+    # The 429-aware retry budget (REVIEW_RETRY_BUDGET_SECONDS, default
+    # 45 min) plus four judges over chunked diffs can push a run past
+    # one hour; the timeout guards against a hung transport, not the
+    # retry policy.
+    timeout-minutes: 90
     env:
       AGENT_MODE: ci
       PR_NUMBER: ${{ github.event.pull_request.number }}

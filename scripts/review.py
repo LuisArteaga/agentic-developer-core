@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import py_compile
+import random
 import re
 import subprocess
 import sys
@@ -218,6 +219,15 @@ SYSTEM_PROMPT_SECURITY = (
 
 BATCH_BUDGET_CHARS = 200000
 
+# API-error retry policy (ADR-0021, amended 2026-08-31): recoverable
+# OpenRouter failures (429/408/5xx/timeouts) are retried with escalating
+# waits — quota exhaustion lasts minutes — capped by a total wall-clock
+# budget. Non-retryable HTTP 4xx fail fast.
+RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+API_RETRY_DELAYS_SECONDS = (5, 15, 45, 120, 300, 600, 900, 1200)
+API_RETRY_BUDGET_SECONDS = int(os.environ.get("REVIEW_RETRY_BUDGET_SECONDS", "2700"))
+REVIEW_DEBUG = os.environ.get("REVIEW_DEBUG", "") == "1"
+
 EMPTY_CONTENT_INSTRUCTION = (
     "\n\nYour previous response was empty. Please provide a verdict "
     "with <reasoning> and <findings> tags."
@@ -271,20 +281,76 @@ def call_openrouter_api(
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=300) as response:  # nosemgrep  # fmt: skip
-        return response.status, response.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=300) as response:  # nosemgrep  # fmt: skip
+            return response.status, response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        raise OpenRouterHTTPError(error) from error
+
+
+class OpenRouterHTTPError(Exception):
+    """HTTP-level failure from OpenRouter with retry-relevant context.
+
+    Carries the status code, the ``Retry-After`` header when the server
+    sent one, and a body snippet (OpenRouter encodes rate-limit details
+    in the 429 response body) so the retry policy and the CI log can
+    distinguish recoverable throttling from permanent request errors.
+    """
+
+    def __init__(self, http_error: urllib.error.HTTPError):
+        self.status = http_error.code
+        self.retry_after = _parse_retry_after(http_error.headers)
+        self.body_snippet = _read_error_body(http_error)
+        super().__init__(
+            f"HTTP {self.status} from OpenRouter"
+            + (f" (Retry-After: {self.retry_after}s)" if self.retry_after else "")
+            + (f": {self.body_snippet}" if self.body_snippet else "")
+        )
+
+
+def _parse_retry_after(headers: Any) -> int | None:
+    """The ``Retry-After`` header in seconds, when present and numeric."""
+    try:
+        value = headers.get("Retry-After")
+        return int(value) if value is not None else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _read_error_body(http_error: urllib.error.HTTPError) -> str:
+    """The first 500 bytes of an error response body, best effort."""
+    try:
+        return http_error.read(500).decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
 
 
 def _call_with_api_retry(model, messages, api_key, routing, temperature, options):
-    """Single OpenRouter call with 2-attempt API-error retry and structural
-    validation.
+    """Single OpenRouter call with a 429-aware API-error retry policy.
+
+    Retryable failures (HTTP 429/408/5xx, timeouts, connection errors,
+    in-band API errors) are retried with escalating waits — quota
+    exhaustion on OpenRouter lasts minutes, so the schedule rises from
+    seconds to ~20 minutes and is capped by a total wall-clock budget
+    (``REVIEW_RETRY_BUDGET_SECONDS``, default 45 min). A server-sent
+    ``Retry-After`` header overrides the scheduled delay. Non-retryable
+    HTTP 4xx errors (bad request, auth, unknown model) fail fast.
 
     Returns the raw response body string on success.
-    Raises Exception on API-level failure after retries.
+    Raises Exception on API-level failure after the budget is exhausted.
     Does NOT check for empty content — that is the caller's responsibility.
     """
-    last_error = ""
-    for attempt in range(2):
+    deadline = time.monotonic() + API_RETRY_BUDGET_SECONDS
+    attempt = 0
+    while True:
+        attempt += 1
+        started = time.monotonic()
+        if REVIEW_DEBUG:
+            log(
+                f"[DEBUG] OpenRouter request model={model} attempt={attempt} "
+                f"routing={routing} temperature={temperature} "
+                f"messages={[_message_size(m) for m in messages]}"
+            )
         try:
             status, body = call_openrouter_api(
                 model,
@@ -301,16 +367,127 @@ def _call_with_api_retry(model, messages, api_key, routing, temperature, options
                 raise Exception(f"OpenRouter API error: {msg}")
             elif "choices" not in parsed_body or not parsed_body["choices"]:
                 raise Exception("OpenRouter response missing choices block")
-            return body
-        except Exception as e:
-            last_error = str(e)
-            log(f"[WARN] OpenRouter attempt {attempt + 1} failed: {e}")
-            if attempt == 0:
-                time.sleep(3)
-                continue
-            raise Exception(
-                f"LLM review failed after retries. Last error: {last_error}"
+            log(
+                f"[OPENROUTER] ok model={model} attempt={attempt} "
+                f"latency={time.monotonic() - started:.1f}s"
             )
+            return body
+        except Exception as error:
+            retryable, retry_after = _classify_api_error(error)
+            label = (
+                f"HTTP {error.status}"
+                if isinstance(error, OpenRouterHTTPError)
+                else str(error)
+            )
+            log(f"[WARN] OpenRouter attempt {attempt} failed: {label}")
+            if REVIEW_DEBUG and isinstance(error, OpenRouterHTTPError):
+                log(f"[DEBUG] error body: {error.body_snippet}")
+            if not retryable:
+                raise Exception(
+                    f"LLM review failed: non-retryable API error: {error}"
+                ) from error
+            elapsed = time.monotonic() - (deadline - API_RETRY_BUDGET_SECONDS)
+            scheduled = (
+                API_RETRY_DELAYS_SECONDS[attempt - 1]
+                if attempt <= len(API_RETRY_DELAYS_SECONDS)
+                else None
+            )
+            wait = _next_wait(scheduled, retry_after, jitter=True)
+            remaining = deadline - time.monotonic()
+            if scheduled is None and retry_after is None:
+                raise Exception(
+                    f"LLM review failed after {attempt} attempts over "
+                    f"{elapsed:.0f}s. Last error: {error}"
+                ) from error
+            if wait > remaining or wait <= 0:
+                raise Exception(
+                    f"LLM review failed after {attempt} attempts over "
+                    f"{elapsed:.0f}s (retry budget "
+                    f"{API_RETRY_BUDGET_SECONDS}s exhausted; next wait would "
+                    f"be {wait:.0f}s). Last error: {error}"
+                ) from error
+            log(
+                f"[WARN] retrying model={model} in {wait:.0f}s "
+                f"(elapsed={elapsed:.0f}s, budget={API_RETRY_BUDGET_SECONDS}s)"
+            )
+            append_step_summary(
+                [f"| `{model}` | attempt {attempt} | {label} | retry in {wait:.0f}s |"]
+            )
+            time.sleep(wait)
+
+
+def _classify_api_error(error: Exception) -> tuple[bool, int | None]:
+    """Whether an API error is worth retrying, and the requested wait.
+
+    Returns ``(retryable, retry_after_seconds)``. Retryable: HTTP 429
+    (rate limited), 408 (request timeout), 5xx (provider-side), network
+    timeouts/connection errors, and in-band API error payloads. Every
+    other HTTP 4xx (bad request, auth, unknown model) is permanent.
+    """
+    status = getattr(error, "status", None)
+    if status is None:
+        # A raw ``urllib.error.HTTPError`` that bypassed the transport
+        # wrapper (e.g. injected by tests) still carries its code.
+        status = getattr(error, "code", None)
+    if status is not None:
+        if status in RETRYABLE_HTTP_STATUSES:
+            retry_after = getattr(error, "retry_after", None)
+            if retry_after is None:
+                retry_after = _parse_retry_after(getattr(error, "headers", None))
+            return True, retry_after
+        return False, None
+    if isinstance(error, urllib.error.URLError):
+        return True, None
+    if isinstance(error, (ConnectionError, TimeoutError, OSError)):
+        return True, None
+    # In-band API error / structural issues: conservatively retryable
+    # (the previous policy retried these too).
+    return True, None
+
+
+def _next_wait(scheduled: int | None, retry_after: int | None, jitter: bool) -> float:
+    """The next wait in seconds: Retry-After wins, else the scheduled
+    delay with up to ±20% jitter so parallel chunks do not synchronize."""
+    if retry_after is not None:
+        return float(retry_after)
+    if scheduled is None:
+        return 0.0
+    if jitter:
+        return scheduled * random.uniform(0.8, 1.2)
+    return float(scheduled)
+
+
+def _message_size(message: dict) -> int:
+    """Character count of one prompt message (debug logging helper)."""
+    return len(message.get("content", ""))
+
+
+_STEP_SUMMARY_READY = False
+
+
+def append_step_summary(lines: list[str]) -> None:
+    """Append rows to the GitHub step summary, best effort.
+
+    The CI surface for debugging judge runs: retry events land in the
+    run's summary page even when the job log scrolls them away. A no-op
+    outside GitHub Actions.
+    """
+    global _STEP_SUMMARY_READY
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a") as summary:
+            if not _STEP_SUMMARY_READY:
+                summary.write(
+                    "\n## OpenRouter retry events\n\n"
+                    "| Model | Attempt | Error | Action |\n"
+                    "|---|---|---|---|\n"
+                )
+                _STEP_SUMMARY_READY = True
+            summary.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
 
 
 def _is_empty_content(raw_response: str) -> bool:
@@ -333,8 +510,8 @@ def _run_layered_retry(
     its messages, and an optional fallback, drive the transport until a
     usable response is obtained or the progression is exhausted.
 
-    Retry progression (each attempt already carries its own 2-attempt API-error
-    retry inside ``_call_with_api_retry``):
+    Retry progression (each attempt already carries its own budgeted
+    API-error retry with escalating waits inside ``_call_with_api_retry``):
         1. Primary model, original prompt.
         2. Primary model, explicit-instruction nudge - only if (1) is empty.
         3. Fallback model, original prompt, routing=None, options=None,
