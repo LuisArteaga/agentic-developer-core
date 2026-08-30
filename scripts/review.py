@@ -323,23 +323,27 @@ def _is_empty_content(raw_response: str) -> bool:
 def _run_layered_retry(
     judge_key, model, messages, fallback_model, api_key, routing, temperature, options
 ):
-    """Execute the layered empty-content retry + model fallback policy (ADR-0021).
+    """Execute the layered API-error + empty-content retry/fallback policy
+    (ADR-0021, amended 2026-08-31).
 
     Wraps the single-call transport (``_call_with_api_retry``) with the
-    empty-content quality check and the fallback-model progression, kept
+    API-error fallback trigger and the empty-content quality check, kept
     separate from config resolution and telemetry so the policy is testable in
     isolation (issue #51). This function owns only one concern: given a model,
     its messages, and an optional fallback, drive the transport until a
-    non-empty response is obtained or the progression is exhausted.
+    usable response is obtained or the progression is exhausted.
 
     Retry progression (each attempt already carries its own 2-attempt API-error
     retry inside ``_call_with_api_retry``):
         1. Primary model, original prompt.
         2. Primary model, explicit-instruction nudge - only if (1) is empty.
         3. Fallback model, original prompt, routing=None, options=None,
-           temperature=0.0 - only if (2) is empty AND a fallback_model is set.
-        4. Give up: return the last (empty) body; ``run_judge``'s caller maps an
-           empty body to ``NEEDS REVIEW`` via ``evaluate_response``.
+           temperature=0.0 - fired when the primary exhausted its API-error
+           retries (429/5xx/timeouts, from (1) or (2)) OR when (2) is empty
+           AND a fallback_model is set.
+        4. Give up: an empty body is returned and mapped to ``NEEDS REVIEW``
+           by ``evaluate_response``; an API-error exhausted on the fallback
+           model too propagates to ``run_judge`` (also NEEDS REVIEW).
 
     Args:
         judge_key: judge identifier, used only for log messages.
@@ -353,13 +357,30 @@ def _run_layered_retry(
     Returns:
         ``(response_body, used_fallback, final_model, attempt_count)``.
     """
-    response_body = _call_with_api_retry(
-        model, messages, api_key, routing, temperature, options
-    )
-    attempt_count = 1
-    used_fallback = False
-    final_model = model
 
+    def _run_fallback(count):
+        """Fallback attempt on the original prompt (ADR-0021: routing=None,
+        options=None, temperature=0.0). Returns ``(body, attempt_count)``."""
+        log(f"[INFO] Judge {judge_key} fell back to model {fallback_model}")
+        return (
+            _call_with_api_retry(fallback_model, messages, api_key, None, 0.0, None),
+            count,
+        )
+
+    try:
+        response_body = _call_with_api_retry(
+            model, messages, api_key, routing, temperature, options
+        )
+    except Exception as exc:
+        # API-error exhaustion: the transport is unusable, so the
+        # empty-content nudge is pointless - go straight to the fallback.
+        if not fallback_model:
+            raise
+        log(f"[WARN] Judge {judge_key}: primary model failed after API retries: {exc}")
+        response_body, attempt_count = _run_fallback(2)
+        return response_body, True, fallback_model, attempt_count
+
+    attempt_count = 1
     if _is_empty_content(response_body):
         log(
             f"[WARN] Judge {judge_key}: empty content from primary model, "
@@ -370,23 +391,26 @@ def _run_layered_retry(
             {"role": m["role"], "content": m["content"]} for m in messages
         ]
         nudge_messages[-1]["content"] += EMPTY_CONTENT_INSTRUCTION
-        response_body = _call_with_api_retry(
-            model, nudge_messages, api_key, routing, temperature, options
-        )
+        try:
+            response_body = _call_with_api_retry(
+                model, nudge_messages, api_key, routing, temperature, options
+            )
+        except Exception as exc:
+            if not fallback_model:
+                raise
+            log(
+                f"[WARN] Judge {judge_key}: nudge attempt failed after "
+                f"API retries: {exc}"
+            )
+            response_body, attempt_count = _run_fallback(3)
+            return response_body, True, fallback_model, attempt_count
         attempt_count = 2
 
         if _is_empty_content(response_body) and fallback_model:
-            log(f"[INFO] Judge {judge_key} fell back to model {fallback_model}")
-            # Attempt 3: fallback model, original prompt,
-            # routing=None, options=None, temperature=0.0 (ADR-0021).
-            response_body = _call_with_api_retry(
-                fallback_model, messages, api_key, None, 0.0, None
-            )
-            attempt_count = 3
-            used_fallback = True
-            final_model = fallback_model
+            response_body, attempt_count = _run_fallback(3)
+            return response_body, True, fallback_model, attempt_count
 
-    return response_body, used_fallback, final_model, attempt_count
+    return response_body, False, model, attempt_count
 
 
 def call_llm_for_review(judge_key, system_prompt, diff, api_key):
@@ -1208,7 +1232,7 @@ def build_review_body(judges_data: dict) -> str:
             report_lines.append(
                 f"\n> ⚠️ **Fallback Model Used**: This verdict was produced by "
                 f"`{info.get('final_model', 'unknown')}` after the primary model "
-                f"returned empty responses."
+                f"failed or returned empty responses."
             )
 
         if info["findings"]:

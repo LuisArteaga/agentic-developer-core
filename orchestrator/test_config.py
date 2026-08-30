@@ -717,13 +717,15 @@ class TestResolveJudgeConfigs(unittest.TestCase):
                 os.environ.pop(var, None)
 
     def test_resolve_judge_configs(self):
-        """Each judge resolves its model/routing/temperature from factory.json; security has options."""
+        """Each judge resolves its model/routing/temperature from factory.json.
+
+        The GLM judges resolve routing=None (ADR-0021 amendment 2026-08-31:
+        OpenRouter default price-weighted routing with provider failover);
+        security keeps its pinned provider order.
+        """
         syntax = resolve_model_config("syntax_lint")
         self.assertEqual(syntax["model"], "z-ai/glm-5.3-flash")
-        self.assertEqual(
-            syntax["routing"],
-            ["Z.AI", "Novita"],
-        )
+        self.assertIsNone(syntax["routing"])
         self.assertEqual(syntax["temperature"], 0.0)
         self.assertIsNone(syntax["options"])
 
@@ -733,10 +735,7 @@ class TestResolveJudgeConfigs(unittest.TestCase):
 
         arch = resolve_model_config("architecture")
         self.assertEqual(arch["model"], "z-ai/glm-5.3-flash")
-        self.assertEqual(
-            arch["routing"],
-            ["Z.AI", "Novita"],
-        )
+        self.assertIsNone(arch["routing"])
 
         sec = resolve_model_config("security")
         self.assertEqual(sec["model"], "moonshotai/kimi-k3")
