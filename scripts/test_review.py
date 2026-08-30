@@ -1314,6 +1314,106 @@ class LayeredRetryPolicyTests(unittest.TestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(mock_retry.call_count, 2)
 
+    @patch("review._call_with_api_retry")
+    def test_primary_api_error_triggers_fallback(self, mock_retry):
+        """AC: attempt 1 exhausts API retries -> fallback, 2 attempts
+        (ADR-0021 amendment 2026-08-31: 429/5xx/timeouts reach the fallback)."""
+        good = self._build_response("<reasoning>r</reasoning><findings></findings>")
+        mock_retry.side_effect = [
+            Exception("LLM review failed after retries. Last error: HTTP 429"),
+            good,
+        ]
+
+        body, used_fb, final_m, attempts = review._run_layered_retry(
+            "syntax_lint",
+            "primary",
+            self._messages(),
+            "fallback",
+            "key",
+            ["Together"],
+            0.0,
+            None,
+        )
+        self.assertEqual(body, good)
+        self.assertTrue(used_fb)
+        self.assertEqual(final_m, "fallback")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(mock_retry.call_count, 2)
+        # ADR-0021: fallback call uses routing=None, options=None, temp=0.0.
+        fallback_call = mock_retry.call_args_list[1]
+        self.assertEqual(fallback_call.args[0], "fallback")
+        self.assertIsNone(fallback_call.args[3])
+        self.assertEqual(fallback_call.args[4], 0.0)
+        self.assertIsNone(fallback_call.args[5])
+        self.assertEqual(fallback_call.args[1][1]["content"], "diff")
+
+    @patch("review._call_with_api_retry")
+    def test_primary_api_error_no_fallback_reraises(self, mock_retry):
+        """AC: API-error exhaustion with no fallback_model -> propagates."""
+        mock_retry.side_effect = Exception("LLM review failed after retries")
+
+        with self.assertRaises(Exception):
+            review._run_layered_retry(
+                "syntax_lint",
+                "primary",
+                self._messages(),
+                None,
+                "key",
+                ["Together"],
+                0.0,
+                None,
+            )
+        self.assertEqual(mock_retry.call_count, 1)
+
+    @patch("review._call_with_api_retry")
+    def test_nudge_api_error_triggers_fallback(self, mock_retry):
+        """AC: empty first, nudge exhausts API retries -> fallback, 3 attempts."""
+        empty = self._build_response("")
+        good = self._build_response("<reasoning>r</reasoning><findings></findings>")
+        mock_retry.side_effect = [
+            empty,
+            Exception("LLM review failed after retries. Last error: HTTP 429"),
+            good,
+        ]
+
+        body, used_fb, final_m, attempts = review._run_layered_retry(
+            "architecture",
+            "primary",
+            self._messages(),
+            "fallback",
+            "key",
+            ["Together"],
+            0.0,
+            None,
+        )
+        self.assertEqual(body, good)
+        self.assertTrue(used_fb)
+        self.assertEqual(final_m, "fallback")
+        self.assertEqual(attempts, 3)
+        self.assertEqual(mock_retry.call_count, 3)
+
+    @patch("review._call_with_api_retry")
+    def test_fallback_api_error_propagates(self, mock_retry):
+        """AC: fallback also exhausts API retries -> propagates to run_judge
+        (which maps the error to NEEDS REVIEW)."""
+        mock_retry.side_effect = [
+            Exception("primary 429"),
+            Exception("fallback 429"),
+        ]
+
+        with self.assertRaises(Exception):
+            review._run_layered_retry(
+                "syntax_lint",
+                "primary",
+                self._messages(),
+                "fallback",
+                "key",
+                ["Together"],
+                0.0,
+                None,
+            )
+        self.assertEqual(mock_retry.call_count, 2)
+
 
 class EnrichChunkIntegrationTests(unittest.TestCase):
     """Integration tests verifying enrichment is wired into run_judge."""

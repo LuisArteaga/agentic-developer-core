@@ -19,19 +19,19 @@
   },
   "syntax_lint": {
     "model": "z-ai/glm-5.3-flash",
-    "routing": ["Z.AI", "Novita"],
+    "routing": null,
     "temperature": 0.0,
     "fallback_model": "z-ai/glm-5.2"
   },
   "test_coverage": {
     "model": "z-ai/glm-5.3-flash",
-    "routing": ["Z.AI", "Novita"],
+    "routing": null,
     "temperature": 0.0,
     "fallback_model": "z-ai/glm-5.2"
   },
   "architecture": {
     "model": "z-ai/glm-5.3-flash",
-    "routing": ["Z.AI", "Novita"],
+    "routing": null,
     "temperature": 0.0,
     "fallback_model": "moonshotai/kimi-k3"
   },

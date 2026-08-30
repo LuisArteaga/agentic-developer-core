@@ -1,6 +1,6 @@
 # ADR 0021: Layered Retry and Model Fallback for Empty LLM Judge Responses
 
-* **Status**: Accepted
+* **Status**: Accepted (amended 2026-08-31 — API-error exhaustion now also triggers the fallback; GLM judges moved to default price-weighted routing)
 * **Date**: 2026-07-12
 * **Deciders**: Luis Arteaga & The Architect
 
@@ -72,6 +72,12 @@ Two new span attributes on the `openrouter_chat_completion` span: `used_fallback
   * `call_llm_for_review`'s signature change (str → tuple) requires updating all callers and tests.
   * `call_llm_for_review` grows in responsibility (content-quality check, fallback logic). Mitigated by issue #51, which evaluates separating concerns in the LLM call path.
   * Fallback model options are dropped (`options=None`), which may produce lower-quality reasoning for judges that rely on model-specific features (e.g., `thinking: max`). Accepted: a verdict from a fallback model without special options is better than a structural `NEEDS REVIEW` block.
+
+## Amendment 2026-08-31: API-Error Fallback Trigger and Price-Weighted Judge Routing
+
+* **Trigger**: Recurring OpenRouter 429 failures on the GLM-5.3-flash judges. Two structural causes were identified beyond raw provider quota: (1) `allow_fallbacks: false` pinned these judges to exactly two providers (`Z.AI`, `Novita`) — when both rate-limited, OpenRouter tried no other provider; (2) this ADR's fallback fired only on empty `content`, never on API errors, so a provider-level 429 had no recovery path at all.
+* **Fallback trigger (amended)**: The fallback attempt now additionally fires when either primary attempt exhausts its 2-attempt API-error retry (HTTP 429/5xx/timeouts) — the empty-content nudge is skipped when the transport itself is unusable. `attempt_count` is 2 when attempt 1 fails over directly, 3 when the nudge attempt fails over. The fallback call configuration (`routing=None`, `options=None`, `temperature=0.0`) is unchanged. If the fallback model also exhausts its API-error retries, the exception propagates to `run_judge`, which maps it to `NEEDS REVIEW` with the error — the pre-existing last resort. The visible fallback indicator wording changed from "after the primary model returned empty responses" to "after the primary model failed or returned empty responses" (the hidden verdict block is untouched).
+* **Judge routing (amended)**: `syntax_lint`, `test_coverage`, and `architecture` switch from pinned `routing: ["Z.AI", "Novita"]` to `routing: null` — OpenRouter's default price-weighted load balancing with automatic provider failover. Since the GLM-5.3-flash open-weights release (2026-08-26), ~20 providers host the model, and the default strategy prioritizes the lowest-cost tier among providers without recent outages, keeping cost as the dominant factor. The `security` judge (kimi-k3, five pinned providers) keeps its routing. `get_chat_model_from_config` (worker nodes) is unchanged.
 
 ## Inspiration & References
 
