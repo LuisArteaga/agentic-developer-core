@@ -1366,6 +1366,28 @@ class LayeredRetryPolicyTests(unittest.TestCase):
         self.assertEqual(mock_retry.call_count, 1)
 
     @patch("review._call_with_api_retry")
+    def test_nudge_api_error_no_fallback_reraises(self, mock_retry):
+        """AC: nudge exhausts API retries with no fallback_model -> propagates."""
+        empty = self._build_response("")
+        mock_retry.side_effect = [
+            empty,
+            Exception("LLM review failed after retries. Last error: HTTP 429"),
+        ]
+
+        with self.assertRaises(Exception):
+            review._run_layered_retry(
+                "syntax_lint",
+                "primary",
+                self._messages(),
+                None,
+                "key",
+                ["Together"],
+                0.0,
+                None,
+            )
+        self.assertEqual(mock_retry.call_count, 2)
+
+    @patch("review._call_with_api_retry")
     def test_nudge_api_error_triggers_fallback(self, mock_retry):
         """AC: empty first, nudge exhausts API retries -> fallback, 3 attempts."""
         empty = self._build_response("")
