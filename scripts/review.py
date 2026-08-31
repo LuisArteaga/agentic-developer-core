@@ -10,7 +10,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Sequence
 
 # Add project root and scripts dir to sys.path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -248,11 +248,17 @@ def build_openrouter_provider(routing):
 
 
 def build_payload(model, messages, routing, temperature, options):
-    """Build the OpenRouter chat completions request payload dict."""
+    """Build the OpenRouter chat completions request payload dict.
+
+    Usage accounting (``usage.include``) is requested on every call so
+    each response carries its ``cost`` alongside the token counts; the
+    KPI reporting (review body, step summary, spans) is built from it.
+    """
     payload_dict: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "temperature": temperature if temperature is not None else 0.0,
+        "usage": {"include": True},
     }
     provider = build_openrouter_provider(routing)
     if provider:
@@ -260,6 +266,103 @@ def build_payload(model, messages, routing, temperature, options):
     if options:
         payload_dict.update(options)
     return payload_dict
+
+
+USAGE_FIELDS = (
+    "model",
+    "provider",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "reasoning_tokens",
+    "cached_tokens",
+    "cost",
+)
+
+USAGE_NUMERIC_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "reasoning_tokens",
+    "cached_tokens",
+    "cost",
+)
+
+
+def _as_number(value: Any, default: Any = None) -> Any:
+    """The value as int/float, or ``default`` for bools/non-numeric values."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return value
+
+
+def extract_usage(body: str) -> dict[str, Any]:
+    """Extract usage KPIs from a successful OpenRouter response body.
+
+    Reads the top-level ``model`` and ``provider`` (the actually-serving
+    endpoint) plus the ``usage`` block: token counts, the cached/reasoning
+    breakdowns, and ``cost`` (populated because ``build_payload`` requests
+    usage accounting). Pure and defensive: any structural surprise yields
+    ``None`` fields instead of raising, so KPI reporting can never break
+    the review itself.
+    """
+    usage: dict[str, Any] = dict.fromkeys(USAGE_FIELDS)
+    try:
+        data = json.loads(body, strict=False)
+    except (ValueError, TypeError):
+        return usage
+    if not isinstance(data, dict):
+        return usage
+    usage["model"] = data.get("model")
+    usage["provider"] = data.get("provider")
+    block = data.get("usage")
+    if not isinstance(block, dict):
+        return usage
+    usage["prompt_tokens"] = block.get("prompt_tokens")
+    usage["completion_tokens"] = block.get("completion_tokens")
+    usage["total_tokens"] = block.get("total_tokens")
+    usage["cost"] = block.get("cost")
+    prompt_details = block.get("prompt_tokens_details")
+    if isinstance(prompt_details, dict):
+        usage["cached_tokens"] = prompt_details.get("cached_tokens")
+    completion_details = block.get("completion_tokens_details")
+    if isinstance(completion_details, dict):
+        usage["reasoning_tokens"] = completion_details.get("reasoning_tokens")
+    return usage
+
+
+def merge_usages(records: Sequence[dict[str, Any] | None]) -> dict[str, Any]:
+    """Merge per-call usage records into one KPI dict.
+
+    Token and cost fields are summed. ``llm_calls`` counts the records,
+    defaulting to one call per record that does not carry an explicit
+    ``llm_calls`` value (raw per-chunk records vs. pre-merged per-judge
+    dicts). ``model`` and ``provider`` are joined as distinct values in
+    first-seen order, because multi-batch and fallback runs may
+    legitimately hit different endpoints.
+    """
+    merged: dict[str, Any] = dict.fromkeys(USAGE_FIELDS)
+    merged["llm_calls"] = 0
+    models: list[str] = []
+    providers: list[str] = []
+    for record in records:
+        if not record:
+            continue
+        calls = _as_number(record.get("llm_calls"), default=1)
+        merged["llm_calls"] += calls
+        for field in USAGE_NUMERIC_FIELDS:
+            value = _as_number(record.get(field))
+            if value is not None:
+                merged[field] = (merged[field] or 0) + value
+        for field, seen in (("model", models), ("provider", providers)):
+            value = record.get(field)
+            if value and value not in seen:
+                seen.append(value)
+    if models:
+        merged["model"] = ", ".join(models)
+    if providers:
+        merged["provider"] = ", ".join(providers)
+    return merged
 
 
 def call_openrouter_api(
@@ -367,9 +470,14 @@ def _call_with_api_retry(model, messages, api_key, routing, temperature, options
                 raise Exception(f"OpenRouter API error: {msg}")
             elif "choices" not in parsed_body or not parsed_body["choices"]:
                 raise Exception("OpenRouter response missing choices block")
+            usage = extract_usage(body)
             log(
                 f"[OPENROUTER] ok model={model} attempt={attempt} "
-                f"latency={time.monotonic() - started:.1f}s"
+                f"latency={time.monotonic() - started:.1f}s "
+                f"provider={usage['provider']} "
+                f"prompt_tokens={usage['prompt_tokens']} "
+                f"completion_tokens={usage['completion_tokens']} "
+                f"cost={usage['cost']}"
             )
             return body
         except Exception as error:
@@ -494,6 +602,97 @@ def append_step_summary(lines: list[str]) -> None:
         pass
 
 
+KPI_SUMMARY_HEADER = "## LLM Review KPIs"
+
+
+def _format_kpi_tokens(value: Any) -> str:
+    return f"{int(value):,}" if _as_number(value) is not None else "n/a"
+
+
+def _format_kpi_cost(value: Any) -> str:
+    return f"${value:.6f}" if _as_number(value) is not None else "n/a"
+
+
+def _format_kpi_duration(value: Any) -> str:
+    return f"{value:.1f}s" if _as_number(value) is not None else "n/a"
+
+
+def _format_kpi_label(value: Any) -> str:
+    return str(value) if value else "n/a"
+
+
+def render_kpi_table(judges_data: dict) -> list[str]:
+    """Render the judge usage KPI markdown table (pure helper, no I/O).
+
+    One row per judge with the actually-used model(s) and serving
+    provider(s), token counts, cost, LLM call count, and wall-clock
+    duration, plus a Total row merged across all judges. Judges without
+    usage data (legacy shapes, empty-diff short-circuits) render ``n/a``.
+    """
+    lines = [
+        "### 📊 Judge Usage & KPIs\n",
+        "| Judge | Model | Provider | Input Tokens | Output Tokens | "
+        "Reasoning Tokens | Cost (USD) | LLM Calls | Duration |",
+        "| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    infos = [
+        info if isinstance(info, dict) else {}
+        for info in (judges_data.get(key, {}) for key in JUDGE_KEYS)
+    ]
+    durations = [_as_number(info.get("duration_seconds")) for info in infos]
+    total_duration = sum(d for d in durations if d is not None)
+    for key, info in zip(JUDGE_KEYS, infos, strict=True):
+        usage = info.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        lines.append(
+            f"| {info.get('name', key)} (`{key}`) "
+            f"| {_format_kpi_label(usage.get('model'))} "
+            f"| {_format_kpi_label(usage.get('provider'))} "
+            f"| {_format_kpi_tokens(usage.get('prompt_tokens'))} "
+            f"| {_format_kpi_tokens(usage.get('completion_tokens'))} "
+            f"| {_format_kpi_tokens(usage.get('reasoning_tokens'))} "
+            f"| {_format_kpi_cost(usage.get('cost'))} "
+            f"| {_format_kpi_tokens(usage.get('llm_calls'))} "
+            f"| {_format_kpi_duration(info.get('duration_seconds'))} |"
+        )
+    total_usage = merge_usages([info.get("usage") for info in infos])
+    lines.append(
+        f"| **Total** "
+        f"| {_format_kpi_label(total_usage['model'])} "
+        f"| {_format_kpi_label(total_usage['provider'])} "
+        f"| {_format_kpi_tokens(total_usage['prompt_tokens'])} "
+        f"| {_format_kpi_tokens(total_usage['completion_tokens'])} "
+        f"| {_format_kpi_tokens(total_usage['reasoning_tokens'])} "
+        f"| {_format_kpi_cost(total_usage['cost'])} "
+        f"| {_format_kpi_tokens(total_usage['llm_calls'])} "
+        f"| {_format_kpi_duration(total_duration or None)} |"
+    )
+    return lines
+
+
+def append_kpi_summary(judges_data: dict) -> None:
+    """Append the judge KPI table to the GitHub step summary, best effort.
+
+    Stateless like :func:`append_step_summary`: the section header is
+    written once per summary file, detected from the file content rather
+    than module state. A no-op outside GitHub Actions.
+    """
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        existing = ""
+        if os.path.exists(path):
+            with open(path) as summary:
+                existing = summary.read()
+        with open(path, "a") as summary:
+            if KPI_SUMMARY_HEADER not in existing:
+                summary.write(f"\n{KPI_SUMMARY_HEADER}\n\n")
+            summary.write("\n".join(render_kpi_table(judges_data)) + "\n")
+    except Exception:
+        pass
+
+
 def _is_empty_content(raw_response: str) -> bool:
     """Check if the response content is empty or whitespace-only."""
     data = json.loads(raw_response, strict=False)
@@ -612,7 +811,10 @@ def call_llm_for_review(judge_key, system_prompt, diff, api_key):
 
     Returns:
         ``(response_body: str, metadata: dict)`` where metadata is
-        ``{"used_fallback": bool, "final_model": str, "attempt_count": int}``.
+        ``{"used_fallback": bool, "final_model": str, "attempt_count": int,
+        "usage": dict}`` — usage carries the response's actual model,
+        serving provider, token counts, and cost (``None`` fields when the
+        provider omits them).
     """
     cfg = resolve_model_config(judge_key)
     model = cfg["model"]
@@ -644,13 +846,25 @@ def call_llm_for_review(judge_key, system_prompt, diff, api_key):
             options,
         )
 
+        usage = extract_usage(response_body)
         span.set_attribute(OUTPUT_VALUE, response_body)
         span.set_attribute("used_fallback", used_fallback)
         span.set_attribute("final_model", final_model)
+        if usage.get("provider"):
+            span.set_attribute("llm.provider", usage["provider"])
+        if usage.get("prompt_tokens") is not None:
+            span.set_attribute("llm.usage.prompt_tokens", usage["prompt_tokens"])
+        if usage.get("completion_tokens") is not None:
+            span.set_attribute(
+                "llm.usage.completion_tokens", usage["completion_tokens"]
+            )
+        if usage.get("cost") is not None:
+            span.set_attribute("llm.usage.cost_usd", usage["cost"])
         return response_body, {
             "used_fallback": used_fallback,
             "final_model": final_model,
             "attempt_count": attempt_count,
+            "usage": usage,
         }
 
 
@@ -1209,7 +1423,14 @@ def _enrich_chunk(chunk_diff: str, workspace_dir: str) -> str:
     return enrich_diff_with_function_context(chunk_diff, workspace_dir)
 
 
-def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
+def run_judge(
+    judge_key,
+    prompt,
+    diff,
+    api_key,
+    llm_caller=call_llm_for_review,
+    usage_records=None,
+):
     """Runs a single judge evaluation, returning (status, reasoning, findings,
     error, used_fallback, final_model).
 
@@ -1227,6 +1448,11 @@ def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
     status is normalized to uppercase ('PASS', 'FAIL', 'NEEDS REVIEW').
     On an exception the judge returns 'NEEDS REVIEW' with the error captured.
     used_fallback and final_model are False/None on error paths.
+
+    When ``usage_records`` is a list, every successful LLM response's
+    usage KPI record (actual model, serving provider, tokens, cost) is
+    appended to it — one record per evaluated chunk — so ``main`` can
+    merge and report them. ``None`` (the default) collects nothing.
     """
     tracer = get_tracer()
     with tracer.start_as_current_span(f"{judge_key}_evaluation") as span:
@@ -1263,6 +1489,7 @@ def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
                     llm_caller,
                     span,
                     cfg["model"],
+                    usage_records,
                 )
             )
             _set_judge_span_attributes(
@@ -1293,6 +1520,7 @@ def run_judge(judge_key, prompt, diff, api_key, llm_caller=call_llm_for_review):
                 llm_caller,
                 span,
                 cfg["model"],
+                usage_records,
             )
             chunk_results.append(result)
 
@@ -1311,11 +1539,14 @@ def _run_single_chunk(
     llm_caller,
     span,
     default_model: str,
+    usage_records: list | None = None,
 ) -> tuple[str, str, list[str], str | None, bool, str]:
     """Evaluate a single diff chunk via ``llm_caller`` and return a result tuple.
 
     Catches exceptions and converts them to a NEEDS REVIEW verdict with the
     error captured, mirroring the original ``run_judge`` error handling.
+    On success, the response's usage record is appended to
+    ``usage_records`` when a collector list is provided.
     """
     reasoning = ""
     findings: list[str] = []
@@ -1328,6 +1559,9 @@ def _run_single_chunk(
         raw_resp, metadata = llm_caller(judge_key, prompt, chunk_diff, api_key)
         used_fallback = metadata.get("used_fallback", False)
         final_model = metadata.get("final_model", default_model)
+        usage = metadata.get("usage") or extract_usage(raw_resp)
+        if usage_records is not None:
+            usage_records.append(usage)
         verdict, reasoning, findings = evaluate_response(raw_resp)
         if verdict == "Pass":
             status = "PASS"
@@ -1395,6 +1629,8 @@ def build_review_body(judges_data: dict) -> str:
         report_lines.append(
             f"| **{info['name']} (`{key}`)** | {status_emoji} | {details} |"
         )
+
+    report_lines.extend(render_kpi_table(judges_data))
 
     report_lines.append("\n---\n")
 
@@ -1490,6 +1726,8 @@ def main():
                 "error": None,
                 "used_fallback": False,
                 "final_model": None,
+                "usage": None,
+                "duration_seconds": None,
             }
 
         workspace_dir = os.getenv("GITHUB_WORKSPACE", ".")
@@ -1516,9 +1754,17 @@ def main():
             )
 
             log(f"[INFO] Running judge: {judge_key}")
+            judge_started = time.monotonic()
+            usage_records: list[dict[str, Any]] = []
             status, reasoning, findings, error, used_fallback, final_model = run_judge(
-                judge_key, prompt, diff, openrouter_api_key
+                judge_key,
+                prompt,
+                diff,
+                openrouter_api_key,
+                usage_records=usage_records,
             )
+            judge_info["duration_seconds"] = round(time.monotonic() - judge_started, 1)
+            judge_info["usage"] = merge_usages(usage_records)
             judge_info["status"] = status
             judge_info["reasoning"] = reasoning
             judge_info["findings"] = findings
@@ -1527,6 +1773,7 @@ def main():
             judge_info["final_model"] = final_model
 
         body = build_review_body(judges_data)
+        append_kpi_summary(judges_data)
         review_action = (
             "approve"
             if all(judges_data[k]["status"] == "PASS" for k in JUDGE_KEYS)

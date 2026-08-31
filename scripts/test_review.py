@@ -1140,7 +1140,9 @@ class MainTests(unittest.TestCase):
             submit_calls.append((pr_number, action, body))
 
         def make_run_judge():
-            def fake_run_judge(judge_key, prompt, diff_arg, api_key):
+            def fake_run_judge(
+                judge_key, prompt, diff_arg, api_key, usage_records=None
+            ):
                 status = judge_statuses.get(judge_key, "PASS")
                 return (status, "reasoning", [], None, False, "model-x")
 
@@ -1923,6 +1925,432 @@ class ApiRetryPolicyTests(unittest.TestCase):
             os.environ, {"GITHUB_STEP_SUMMARY": "/nonexistent-dir-xyz/summary.md"}
         ):
             review.append_step_summary(["| m | a | e | retry |"])
+
+
+class UsageAccountingTests(unittest.TestCase):
+    """KPI reporting for judge runs (ADR-0058): model/provider/tokens/cost."""
+
+    def _usage_body(
+        self,
+        model="test-model",
+        provider="together",
+        prompt=12,
+        completion=34,
+        cost=0.0012,
+    ) -> str:
+        return json.dumps(
+            {
+                "model": model,
+                "provider": provider,
+                "choices": [
+                    {
+                        "message": {
+                            "content": "<reasoning>r</reasoning><findings></findings>"
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "total_tokens": prompt + completion,
+                    "prompt_tokens_details": {"cached_tokens": 3},
+                    "completion_tokens_details": {"reasoning_tokens": 5},
+                    "cost": cost,
+                },
+            }
+        )
+
+    def test_build_payload_requests_usage_accounting(self):
+        """AC: every payload opts into OpenRouter usage accounting."""
+        payload = review.build_payload(
+            "m", [{"role": "user", "content": "d"}], None, 0.0, None
+        )
+        self.assertEqual(payload["usage"], {"include": True})
+
+    def test_extract_usage_full_response(self):
+        """AC: model, provider, tokens, breakdowns, and cost are extracted."""
+        usage = review.extract_usage(self._usage_body())
+        self.assertEqual(usage["model"], "test-model")
+        self.assertEqual(usage["provider"], "together")
+        self.assertEqual(usage["prompt_tokens"], 12)
+        self.assertEqual(usage["completion_tokens"], 34)
+        self.assertEqual(usage["total_tokens"], 46)
+        self.assertEqual(usage["cached_tokens"], 3)
+        self.assertEqual(usage["reasoning_tokens"], 5)
+        self.assertEqual(usage["cost"], 0.0012)
+
+    def test_extract_usage_without_usage_block(self):
+        """AC: missing usage block -> model/provider kept, numeric fields None."""
+        body = json.dumps(
+            {"model": "m", "provider": "p", "choices": [{"message": {"content": "x"}}]}
+        )
+        usage = review.extract_usage(body)
+        self.assertEqual(usage["model"], "m")
+        self.assertEqual(usage["provider"], "p")
+        self.assertIsNone(usage["prompt_tokens"])
+        self.assertIsNone(usage["cost"])
+
+    def test_extract_usage_invalid_json_returns_all_none(self):
+        """AC: unparseable body -> all-None dict, never raises."""
+        usage = review.extract_usage("not json at all")
+        for field in review.USAGE_FIELDS:
+            self.assertIsNone(usage[field])
+
+    def test_extract_usage_non_dict_json_returns_all_none(self):
+        """AC: valid JSON that is not an object (list/str/number) -> all Nones."""
+        for body in ('["not", "an", "object"]', '"a string"', "42"):
+            usage = review.extract_usage(body)
+            for field in review.USAGE_FIELDS:
+                self.assertIsNone(usage[field])
+
+    def test_extract_usage_non_dict_details_is_defensive(self):
+        """AC: malformed detail blocks -> Nones instead of a crash."""
+        body = json.dumps(
+            {
+                "model": "m",
+                "usage": {
+                    "prompt_tokens": 1,
+                    "prompt_tokens_details": "oops",
+                    "completion_tokens_details": 42,
+                },
+            }
+        )
+        usage = review.extract_usage(body)
+        self.assertEqual(usage["prompt_tokens"], 1)
+        self.assertIsNone(usage["cached_tokens"])
+        self.assertIsNone(usage["reasoning_tokens"])
+
+    def test_merge_usages_sums_and_joins_distinct_endpoints(self):
+        """AC: tokens/cost summed; distinct models/providers joined in order."""
+        first = review.extract_usage(self._usage_body(model="m1", provider="p1"))
+        second = review.extract_usage(
+            self._usage_body(model="m2", provider="p2", prompt=8, completion=16)
+        )
+        merged = review.merge_usages([first, second])
+        self.assertEqual(merged["prompt_tokens"], 20)
+        self.assertEqual(merged["completion_tokens"], 50)
+        self.assertEqual(merged["total_tokens"], 70)
+        self.assertEqual(merged["cost"], 0.0024)
+        self.assertEqual(merged["model"], "m1, m2")
+        self.assertEqual(merged["provider"], "p1, p2")
+        self.assertEqual(merged["llm_calls"], 2)
+
+    def test_merge_usages_sums_explicit_call_counts(self):
+        """AC: pre-merged per-judge dicts carry llm_calls explicitly."""
+        pre_merged = {"prompt_tokens": 5, "llm_calls": 3}
+        other = {"prompt_tokens": 7, "llm_calls": 2}
+        merged = review.merge_usages([pre_merged, other])
+        self.assertEqual(merged["prompt_tokens"], 12)
+        self.assertEqual(merged["llm_calls"], 5)
+
+    def test_merge_usages_empty_or_none_records(self):
+        """AC: no records -> all-None usage with zero calls; Nones skipped."""
+        for records in ([], [None]):
+            merged = review.merge_usages(records)
+            self.assertEqual(merged["llm_calls"], 0)
+            self.assertIsNone(merged["prompt_tokens"])
+            self.assertIsNone(merged["cost"])
+
+    def test_merge_usages_ignores_non_numeric_and_boolean_values(self):
+        """AC: strings and bools are not summed as numbers."""
+        merged = review.merge_usages(
+            [{"prompt_tokens": True, "cost": "0.5", "model": "m"}]
+        )
+        self.assertIsNone(merged["prompt_tokens"])
+        self.assertIsNone(merged["cost"])
+        self.assertEqual(merged["model"], "m")
+
+    def test_render_kpi_table_rows_and_total(self):
+        """AC: per-judge rows with formatted values plus a merged Total row."""
+        judges_data = {
+            key: {"name": key, "status": "PASS"} for key in review.JUDGE_KEYS
+        }
+        judges_data["syntax_lint"]["usage"] = {
+            "model": "z-ai/glm-5.3-flash",
+            "provider": "Z.AI",
+            "prompt_tokens": 1234,
+            "completion_tokens": 432,
+            "reasoning_tokens": 77,
+            "cost": 0.0045,
+            "llm_calls": 1,
+        }
+        judges_data["syntax_lint"]["duration_seconds"] = 12.34
+        judges_data["security"]["usage"] = {
+            "model": "moonshotai/kimi-k3",
+            "provider": "Together",
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "reasoning_tokens": 5,
+            "cost": 0.002,
+            "llm_calls": 2,
+        }
+        judges_data["security"]["duration_seconds"] = 8.0
+
+        rows = review.render_kpi_table(judges_data)
+        table = "\n".join(rows)
+        self.assertIn("### 📊 Judge Usage & KPIs", table)
+        self.assertIn("| Judge | Model | Provider | Input Tokens |", table)
+        self.assertIn("| syntax_lint (`syntax_lint`) | z-ai/glm-5.3-flash |", table)
+        self.assertIn("| 1,234 | 432 | 77 | $0.004500 | 1 | 12.3s |", table)
+        self.assertIn("| moonshotai/kimi-k3 | Together |", table)
+        self.assertIn("| 100 | 50 | 5 | $0.002000 | 2 | 8.0s |", table)
+        self.assertIn("| **Total** | z-ai/glm-5.3-flash, moonshotai/kimi-k3 |", table)
+        self.assertIn("| 1,334 | 482 | 82 | $0.006500 | 3 | 20.3s |", table)
+
+    def test_render_kpi_table_renders_na_without_usage(self):
+        """AC: legacy judges_data shape renders n/a cells instead of crashing."""
+        statuses = {k: "PASS" for k in review.JUDGE_KEYS}
+        table = "\n".join(review.render_kpi_table(_build_judges_data(statuses)))
+        self.assertIn("### 📊 Judge Usage & KPIs", table)
+        for key in review.JUDGE_KEYS:
+            self.assertIn(
+                f"(`{key}`) | n/a | n/a | n/a | n/a | n/a | n/a | n/a |", table
+            )
+
+    def test_build_review_body_includes_kpi_table(self):
+        """AC: KPI table in the review body; hidden verdict block unaffected."""
+        statuses = {k: "PASS" for k in review.JUDGE_KEYS}
+        data = _build_judges_data(statuses)
+        data["syntax_lint"]["usage"] = {
+            "model": "z-ai/glm-5.3-flash",
+            "provider": "Z.AI",
+            "prompt_tokens": 10,
+            "llm_calls": 1,
+        }
+        body = review.build_review_body(data)
+        self.assertIn("### 📊 Judge Usage & KPIs", body)
+        self.assertIn("z-ai/glm-5.3-flash", body)
+        self.assertIn("<!-- llm-pr-review-verdicts", body)
+        self.assertLess(
+            body.index("### 📊 Judge Usage & KPIs"),
+            body.index("<!-- llm-pr-review-verdicts"),
+        )
+
+    def test_run_judge_collects_usage_from_metadata(self):
+        """AC: fast path -> the llm_caller's usage record lands in the collector."""
+
+        def caller(judge_key, prompt, diff, api_key):
+            return self._usage_body(), {
+                "used_fallback": False,
+                "final_model": "m",
+                "attempt_count": 1,
+                "usage": {"provider": "explicit", "prompt_tokens": 9},
+            }
+
+        records: list[dict] = []
+        review.run_judge(
+            "syntax_lint",
+            review.SYSTEM_PROMPT_SYNTAX_LINT,
+            "diff",
+            "key",
+            llm_caller=caller,
+            usage_records=records,
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["provider"], "explicit")
+        self.assertEqual(records[0]["prompt_tokens"], 9)
+
+    def test_run_judge_falls_back_to_body_extraction_without_metadata_usage(self):
+        """AC: metadata without usage -> usage extracted from the response body."""
+        records: list[dict] = []
+
+        def legacy_caller(judge_key, prompt, diff, api_key):
+            return self._usage_body(provider="novita"), {
+                "used_fallback": False,
+                "final_model": "m",
+                "attempt_count": 1,
+            }
+
+        review.run_judge(
+            "syntax_lint",
+            review.SYSTEM_PROMPT_SYNTAX_LINT,
+            "diff",
+            "key",
+            llm_caller=legacy_caller,
+            usage_records=records,
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["provider"], "novita")
+        self.assertEqual(records[0]["prompt_tokens"], 12)
+
+    def test_run_judge_collects_usage_across_batches(self):
+        """AC: multi-batch -> one usage record per evaluated chunk."""
+        with patch.dict(os.environ, {"REVIEW_BATCH_BUDGET_CHARS": "50"}):
+            diff = (
+                "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+                "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n-x\n+y\n"
+            )
+            providers = ["novita", "together"]
+            call_idx = [0]
+
+            def caller(judge_key, prompt, diff, api_key):
+                provider = providers[min(call_idx[0], len(providers) - 1)]
+                call_idx[0] += 1
+                return self._usage_body(provider=provider), {
+                    "used_fallback": False,
+                    "final_model": "m",
+                    "attempt_count": 1,
+                    "usage": {"provider": provider, "prompt_tokens": 5},
+                }
+
+            records: list[dict] = []
+            review.run_judge(
+                "syntax_lint",
+                review.SYSTEM_PROMPT_SYNTAX_LINT,
+                diff,
+                "key",
+                llm_caller=caller,
+                usage_records=records,
+            )
+            self.assertEqual(len(records), 2)
+            self.assertEqual(
+                {record["provider"] for record in records}, {"novita", "together"}
+            )
+
+    def test_run_judge_appends_no_record_on_exception(self):
+        """AC: a failed chunk records no usage, and the judge still completes."""
+
+        def raising_caller(judge_key, prompt, diff, api_key):
+            raise RuntimeError("LLM down")
+
+        records: list[dict] = []
+        status, _, _, error, _, _ = review.run_judge(
+            "syntax_lint",
+            review.SYSTEM_PROMPT_SYNTAX_LINT,
+            "diff",
+            "key",
+            llm_caller=raising_caller,
+            usage_records=records,
+        )
+        self.assertEqual(status, "NEEDS REVIEW")
+        self.assertEqual(records, [])
+
+    def test_run_judge_without_collector_is_unchanged(self):
+        """AC: default usage_records=None -> old callers unaffected."""
+        call_count = [0]
+
+        def passing_caller(judge_key, prompt, diff, api_key):
+            call_count[0] += 1
+            return self._usage_body(), {
+                "used_fallback": False,
+                "final_model": "m",
+                "attempt_count": 1,
+            }
+
+        status, _, _, error, _, _ = review.run_judge(
+            "syntax_lint",
+            review.SYSTEM_PROMPT_SYNTAX_LINT,
+            "diff",
+            "key",
+            llm_caller=passing_caller,
+        )
+        self.assertEqual(status, "PASS")
+        self.assertEqual(call_count[0], 1)
+
+    @patch("review._call_with_api_retry")
+    @patch("review.resolve_model_config")
+    @patch("review.get_tracer")
+    def test_call_llm_for_review_returns_usage_metadata(
+        self, mock_tracer, mock_cfg, mock_retry
+    ):
+        """AC: usage extracted from the final body lands in the metadata."""
+        from telemetry import DummyTracer
+
+        mock_tracer.return_value = DummyTracer()
+        mock_cfg.return_value = {
+            "model": "primary-model",
+            "routing": ["Together"],
+            "temperature": 0.0,
+            "options": None,
+            "fallback_model": "fallback-model",
+        }
+        mock_retry.return_value = self._usage_body()
+
+        _, metadata = review.call_llm_for_review("syntax_lint", "sys", "diff", "key")
+        self.assertEqual(metadata["usage"]["provider"], "together")
+        self.assertEqual(metadata["usage"]["prompt_tokens"], 12)
+        self.assertEqual(metadata["usage"]["completion_tokens"], 34)
+        self.assertEqual(metadata["usage"]["cost"], 0.0012)
+
+    @patch("review._call_with_api_retry")
+    @patch("review.resolve_model_config")
+    def test_call_llm_for_review_sets_usage_span_attributes(self, mock_cfg, mock_retry):
+        """AC: provider and usage tokens/cost are emitted on the LLM span."""
+        mock_cfg.return_value = {
+            "model": "primary-model",
+            "routing": None,
+            "temperature": 0.0,
+            "options": None,
+            "fallback_model": None,
+        }
+        mock_retry.return_value = self._usage_body(provider="novita", cost=0.5)
+
+        mock_span = MagicMock()
+        mock_tracer = MagicMock()
+        mock_tracer.return_value.start_as_current_span.return_value.__enter__.return_value = mock_span
+        with patch("review.get_tracer", mock_tracer):
+            review.call_llm_for_review("syntax_lint", "sys", "diff", "key")
+
+        attributes = {
+            call.args[0]: call.args[1]
+            for call in mock_span.set_attribute.call_args_list
+        }
+        self.assertEqual(attributes.get("llm.provider"), "novita")
+        self.assertEqual(attributes.get("llm.usage.prompt_tokens"), 12)
+        self.assertEqual(attributes.get("llm.usage.completion_tokens"), 34)
+        self.assertEqual(attributes.get("llm.usage.cost_usd"), 0.5)
+
+    @patch("review.call_openrouter_api")
+    def test_transport_success_log_reports_usage(self, mock_call):
+        """AC: the per-attempt log line carries provider, tokens, and cost."""
+        mock_call.return_value = (200, self._usage_body())
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            review._call_with_api_retry(
+                "m", [{"role": "user", "content": "d"}], "key", None, 0.0, None
+            )
+        ok_line = next(
+            line
+            for line in captured.getvalue().splitlines()
+            if "[OPENROUTER] ok" in line
+        )
+        self.assertIn("provider=together", ok_line)
+        self.assertIn("prompt_tokens=12", ok_line)
+        self.assertIn("completion_tokens=34", ok_line)
+        self.assertIn("cost=0.0012", ok_line)
+
+    def test_append_kpi_summary_writes_header_once_then_table(self):
+        """AC: repeated appends grow exactly one KPI section header."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "step-summary.md")
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": path}):
+                statuses = {k: "PASS" for k in review.JUDGE_KEYS}
+                review.append_kpi_summary(_build_judges_data(statuses))
+                review.append_kpi_summary(_build_judges_data(statuses))
+
+            content = Path(path).read_text()
+        self.assertEqual(content.count(review.KPI_SUMMARY_HEADER), 1)
+        self.assertIn("### 📊 Judge Usage & KPIs", content)
+        self.assertIn("| **Total** |", content)
+
+    def test_append_kpi_summary_is_a_noop_outside_ci(self):
+        """AC: without GITHUB_STEP_SUMMARY nothing is written anywhere."""
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.chdir(tmp)
+                with patch.dict(os.environ, {}, clear=True):
+                    review.append_kpi_summary({})
+                self.assertEqual(os.listdir(tmp), [])
+            finally:
+                os.chdir(original_cwd)
+
+    def test_append_kpi_summary_silently_ignores_write_errors(self):
+        """AC: an unwritable summary path is a no-op, never a crash."""
+        with patch.dict(
+            os.environ, {"GITHUB_STEP_SUMMARY": "/nonexistent-dir-xyz/summary.md"}
+        ):
+            review.append_kpi_summary({})
 
 
 if __name__ == "__main__":
