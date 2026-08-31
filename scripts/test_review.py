@@ -1996,6 +1996,13 @@ class UsageAccountingTests(unittest.TestCase):
         for field in review.USAGE_FIELDS:
             self.assertIsNone(usage[field])
 
+    def test_extract_usage_non_dict_json_returns_all_none(self):
+        """AC: valid JSON that is not an object (list/str/number) -> all Nones."""
+        for body in ('["not", "an", "object"]', '"a string"', "42"):
+            usage = review.extract_usage(body)
+            for field in review.USAGE_FIELDS:
+                self.assertIsNone(usage[field])
+
     def test_extract_usage_non_dict_details_is_defensive(self):
         """AC: malformed detail blocks -> Nones instead of a crash."""
         body = json.dumps(
