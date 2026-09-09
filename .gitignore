@@ -227,3 +227,6 @@ __marimo__/
 # Agent logs (otel_traces, debug logs, etc.)
 agent_logs/
 .agent_logs/
+
+# Machine-local agent working memory; never committed.
+.deepagents/
