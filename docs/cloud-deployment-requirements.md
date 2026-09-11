@@ -1,7 +1,7 @@
 # Cloud Deployment Requirements — Split-Plane Execution Sandboxing
 
 Technical requirements for running the Orchestrator Repository in the cloud
-(netcup RS) with hardened isolation of untrusted code execution. This document
+(a single cloud VPS) with hardened isolation of untrusted code execution. This document
 is the traceability anchor for the issue breakdown; decisions are recorded in
 [ADR-0056](./adr/0056-split-plane-execution-sandbox-on-cloud-vps.md).
 
@@ -22,8 +22,8 @@ A compromised/prompt-injected Worker must be unable to reach:
 - **Split-plane**: trusted control plane (Orchestrator, holds all secrets) vs.
   ephemeral credential-free Execution Sandbox(es) where Worker command execution
   and Verification run. Commits/pushes remain control-plane operations (PR-Node).
-- **Hosting**: single netcup Root Server (KVM guest, dedicated cores/RAM). No
-  nested KVM exists on netcup (verified — see references), therefore Firecracker/
+- **Hosting**: single cloud VPS (KVM guest, dedicated cores/RAM). The
+  provider offers no nested KVM (verified — see references), therefore Firecracker/
   self-hosted E2B/Daytona are excluded by constraint, not preference.
 - **Sandbox runtime**: Docker + gVisor (`runsc`) from day one — user-space kernel,
   no `/dev/kvm` required, runs inside a KVM guest.
@@ -90,8 +90,8 @@ A compromised/prompt-injected Worker must be unable to reach:
 
 ### FR-8 Deployment stack & operations
 
-- Ubuntu LTS on netcup RS; minimum RS 1000 G12 (4 dedicated EPYC cores, 8 GB),
-  recommended RS 2000 G12 (8 cores, 16 GB) for parallel verify workloads.
+- Ubuntu LTS on the VPS; minimum 4 dedicated cores / 8 GB RAM,
+  recommended 8 cores / 16 GB for parallel verify workloads.
 - Control plane runs via existing Docker image + Process Supervisor (ADR-0015)
   under systemd; restart/backoff behavior preserved.
 - `.agent_logs/` (state.json, traces, metrics) included in host backup routine;
@@ -146,10 +146,14 @@ The instance maintains two repository classes with distinct lifecycles:
 
 | Fact | Source | Tier |
 | --- | --- | --- |
-| netcup: no nested virtualization, "not even on root servers" | [forum.netcup.de thread 22070](https://forum.netcup.de/thread/22070-can-you-virtualise-on-a-root-server) (Apr 2026) | T2 |
 | Firecracker/E2B self-host requires `/dev/kvm`; Nomad+Consul+Terraform ops weight | [e2b-dev/E2B](https://github.com/e2b-dev/e2b), [temps.sh analysis](https://temps.sh/blog/best-e2b-alternatives-ai-sandboxes-2026) | T1/T3 |
 | Daytona no longer self-hostable | [awesome-sandbox §Daytona](https://github.com/restyler/awesome-sandbox) (Jun 2026) | T3 |
 | gVisor install/runtime registration, Linux ≥5.6, no hardware virt needed | [gvisor.dev install](https://gvisor.dev/docs/user_guide/install), [Docker quick start](https://gvisor.dev/docs/user_guide/quick_start/docker) | T1 |
 | Default-deny egress + proxy/nftables allowlist pattern; block metadata IP/RFC1918 | [INNOQ blog](https://www.innoq.com/en/blog/2026/03/dev-sandbox-network), [Augment guide](https://www.augmentcode.com/guides/agent-execution-sandbox) | T2/T3 |
 | Fine-grained PAT scopes; workflow-scope push requirement | [GitHub docs](https://docs.github.com/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens), [community discussion #26254](https://github.com/orgs/community/discussions/26254) | T1/T2 |
-| netcup RS G12 specs/pricing (RS 1000: 4c/8GB/256GB €12.79) | [netcup.com](https://www.netcup.com/en/server/root-server) | T2 |
+
+Provider-specific references (hosting provider's forum thread on nested
+virtualization and its SKU/pricing page) were removed during public-release
+preparation (2026-09); the underlying facts — no nested virtualization on the
+selected VPS (verified April 2026) and the stated core/RAM tiers — are stated
+in §2 and FR-8.

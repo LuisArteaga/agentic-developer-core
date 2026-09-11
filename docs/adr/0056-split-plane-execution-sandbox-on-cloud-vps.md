@@ -7,9 +7,14 @@ requirements FR-1…FR-10 live in
 [cloud-deployment-requirements.md](../cloud-deployment-requirements.md),
 implementation slices in issues #159–#169)
 
+Amended 2026-09 (public-release preparation): provider-specific hosting
+details (provider name, SKU tiers, pricing, provider-forum citations) were
+genericized. The architectural constraint (no nested virtualization on the
+selected VPS) and every decision on this page are unchanged.
+
 ## Context
 
-When moving the Orchestrator to always-on cloud hosting (a single netcup RS),
+When moving the Orchestrator to always-on cloud hosting (a single cloud VPS),
 the primary driver was security: an untrusted, prompt-injectable Worker must
 not reach host resources, secrets, or unscoped credentials. On a developer
 workstation the blast radius of a compromised Worker was the user's own
@@ -18,9 +23,10 @@ machine; on a shared cloud VPS it becomes the whole deployment.
 Two provider-level constraints bound the solution space before any option
 comparison:
 
-- netcup provides **no nested virtualization** ("not even on root servers",
-  official forum thread 22070, April 2026) — Firecracker-class microVM
-  isolation is physically impossible there, not merely unfavored.
+- The selected VPS provider offers **no nested virtualization** on its
+  root-server line (verified against provider documentation/forum, April
+  2026) — Firecracker-class microVM isolation is physically impossible
+  there, not merely unfavored.
 - Daytona self-hosting no longer exists (closed-source since June 2026),
   removing the turnkey self-hosted sandbox option.
 
@@ -41,7 +47,7 @@ comparison:
 Adopt the **split-plane architecture** (Option B): a trusted control plane
 (the Orchestrator holding all secrets) and ephemeral, credential-free
 **Execution Sandboxes** (Worker command execution + Verification) behind a
-swappable runner interface — hosted on a single netcup Root Server with
+swappable runner interface — hosted on a single cloud VPS (KVM guest) with
 Docker + gVisor (`runsc`) as the initial sandbox runtime and default-deny
 egress with an allowlist (PyPI/npm/GitHub/mirrors) enforced outside the
 sandbox's reach. Commits/pushes remain control-plane operations (PR-Node).

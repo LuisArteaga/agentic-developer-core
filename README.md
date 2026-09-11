@@ -20,6 +20,7 @@ An autonomous software engineer agent — the **Orchestrator** — implemented i
 - [Get Started](#get-started)
 - [Development & verification](#development--verification)
 - [Architecture & guidelines](#architecture--guidelines)
+- [License](#license)
 
 ---
 
@@ -244,3 +245,9 @@ For terminology, agent roles, and design specifications, refer to the authoritat
   - [ADR-0034](docs/adr/0034-hybrid-retry-hard-rollback-on-final-attempt.md) — Hybrid Retry (hard rollback)
   - [ADR-0036](docs/adr/0036-closed-post-pr-judge-feedback-loop.md) — Closed Post-PR Judge-Feedback Loop
   - [ADR-0037](docs/adr/0037-worker-tool-trust-boundary-hardening.md) — Worker Tool Trust Boundary Hardening
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).
