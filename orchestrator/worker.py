@@ -70,7 +70,7 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
 
 @tool
 def run_command(command: str) -> str:
-    """Execute a shell command safely in a subprocess with shell=False.
+    """Execute a shell command inside the Execution Sandbox.
 
     Use this tool to run tests (e.g., `make verify` or python test runner) to verify that your changes
     are correct and do not break the build.

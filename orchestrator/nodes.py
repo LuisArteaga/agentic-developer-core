@@ -5,7 +5,6 @@ import logging
 import os
 import re
 import shlex
-import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -3170,17 +3169,53 @@ def test_writer_node(state: AgentState) -> AgentState:
                     matched,
                 )
 
-            # Run programmatic pre-verification check
+            # Run programmatic pre-verification check. The discovery runs
+            # INSIDE the Execution Sandbox (ADR-0056, FR-3): the tests it
+            # imports were just written by an LLM agent, so executing them on
+            # the host is exactly the untrusted-execution surface this slice
+            # removes. Sandbox infrastructure failures are recorded-and-returned
+            # (ADR-0038) WITHOUT consuming a Test-Writer attempt — they are
+            # infrastructure, not test-quality failures.
             logger.info("Running pre-verification check on generated tests...")
-            result = subprocess.run(
-                ["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"],
-                cwd=str(workspace_path),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            runner: SandboxRunner | None = None
+            try:
+                runner = get_sandbox_runner()
+                runner.create(workspace_path)
+                logger.info("Running unittest discovery in Execution Sandbox.")
+                exec_result = runner.exec(
+                    [
+                        "python3",
+                        "-m",
+                        "unittest",
+                        "discover",
+                        "-s",
+                        ".",
+                        "-p",
+                        "test_*.py",
+                    ],
+                    timeout=300,
+                )
+            except SandboxError as e:
+                # Distinct infra-failure log line only: the outer except
+                # Exception handler performs the ADR-0038 record-and-return
+                # (identical state outcome), so re-raise instead of
+                # duplicating it.
+                logger.error(
+                    "Execution Sandbox infrastructure failure in Test-Writer "
+                    "pre-verification (fail closed, no host fallback): %s",
+                    e,
+                )
+                raise
+            finally:
+                if runner is not None:
+                    runner.destroy()
 
-            output = result.stdout + "\n" + result.stderr
+            # The runner returns stdout+stderr combined (decoded); the
+            # substring scan below is unaffected by the merge. A discovery
+            # that hits the 300 s timeout is treated like any other
+            # completion on its partial output — the Verify gate still runs
+            # the real suite, so nothing green-lights on a timeout.
+            output = exec_result.output
             bad_errors = [
                 "SyntaxError:",
                 "IndentationError:",

@@ -6,6 +6,11 @@ import unittest.mock
 from pathlib import Path
 
 from orchestrator import state, tools
+from orchestrator.sandbox import (
+    SandboxConfigError,
+    SandboxExecResult,
+    SandboxUnavailableError,
+)
 from orchestrator.tools import (
     grep_search,
     list_directory,
@@ -692,43 +697,106 @@ class TestCodebaseTools(unittest.TestCase):
         res = patch_file("/etc/passwd", "root", "toot")
         self.assertIn("Access denied", res)
 
+    def _sandbox_stub(self, outcomes, create_error=None):
+        """Build a SandboxRunner stand-in driving run_command's sandbox seam.
+
+        ``outcomes`` is consumed per exec call (entries: SandboxExecResult or
+        Exception instances); ``create_error`` makes create() raise (sandbox
+        unavailable at spawn). Records the create workspace, exec
+        ``(args, timeout)`` and destroy count so tests can assert the runner
+        contract without touching Docker. Patch target:
+        ``orchestrator.tools.get_sandbox_runner``.
+        """
+
+        class _StubSandboxRunner:
+            def __init__(self):
+                self.created = None
+                self.exec_calls = []
+                self.destroy_count = 0
+
+            def create(self, workspace):
+                if create_error is not None:
+                    raise create_error
+                self.created = workspace
+
+            def exec(self, args, timeout):
+                self.exec_calls.append((list(args), timeout))
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+            def destroy(self):
+                self.destroy_count += 1
+
+        return _StubSandboxRunner()
+
+    def _patched_runner(self, stub):
+        return unittest.mock.patch(
+            "orchestrator.tools.get_sandbox_runner", return_value=stub
+        )
+
     def test_run_command_success(self):
-        """Test that run_command executes a simple python command successfully."""
-        res = run_command("python3 -c \"print('hello')\"")
+        """An allowlisted command dispatches to the sandbox and returns its output."""
+        stub = self._sandbox_stub([SandboxExecResult(exit_code=0, output="hello\n")])
+        with self._patched_runner(stub):
+            res = run_command("python3 -c \"print('hello')\"")
         self.assertEqual(res.strip(), "hello")
+        # The runner contract: workspace bind at create, parsed args + the
+        # tool-level 300 s timeout at exec, exactly one lifecycle destroy.
+        self.assertEqual(stub.created, self.temp_dir_path)
+        self.assertEqual(stub.exec_calls, [(["python3", "-c", "print('hello')"], 300)])
+        self.assertEqual(stub.destroy_count, 1)
 
     def test_run_command_empty_output(self):
-        """Test that run_command handles commands with empty output correctly."""
-        res = run_command('python3 -c "pass"')
+        """Sandbox success with no output keeps the no-output message."""
+        stub = self._sandbox_stub([SandboxExecResult(exit_code=0, output="")])
+        with self._patched_runner(stub):
+            res = run_command('python3 -c "pass"')
         self.assertEqual(res, "(Command completed successfully with no output.)")
 
-    def test_run_command_parse_error(self):
-        """Test that run_command handles malformed command strings gracefully."""
-        res = run_command("echo 'unmatched quote")
+    @unittest.mock.patch("subprocess.run")
+    def test_run_command_parse_error_never_touches_sandbox_or_host(self, mock_run):
+        """A malformed command string is refused with no sandbox and no host subprocess."""
+        stub = self._sandbox_stub([])
+        with self._patched_runner(stub):
+            res = run_command("echo 'unmatched quote")
         self.assertIn("Failed to parse command string", res)
+        self.assertIsNone(stub.created)
+        self.assertEqual(stub.exec_calls, [])
+        mock_run.assert_not_called()
 
     @unittest.mock.patch("subprocess.run")
-    def test_run_command_timeout(self, mock_run):
-        """Test that run_command catches subprocess.TimeoutExpired and returns partial output."""
-        import subprocess
+    def test_run_command_empty_string_never_touches_sandbox_or_host(self, mock_run):
+        """An empty command is refused with no sandbox and no host subprocess."""
+        stub = self._sandbox_stub([])
+        with self._patched_runner(stub):
+            res = run_command("")
+        self.assertIn("Empty command", res)
+        self.assertIsNone(stub.created)
+        mock_run.assert_not_called()
 
-        mock_run.side_effect = subprocess.TimeoutExpired(
-            cmd=["echo", "hi"], timeout=300, output=b"partial execution output"
+    def test_run_command_timeout(self):
+        """A sandbox-reported timeout keeps the partial-output timeout error."""
+        stub = self._sandbox_stub(
+            [
+                SandboxExecResult(
+                    exit_code=-1, output="partial execution output", timed_out=True
+                )
+            ]
         )
-        res = run_command("echo hi")
+        with self._patched_runner(stub):
+            res = run_command("echo hi")
         self.assertIn("timed out after 300 seconds", res)
         self.assertIn("partial execution output", res)
+        self.assertEqual(stub.destroy_count, 1)
 
-    @unittest.mock.patch("subprocess.run")
-    def test_run_command_truncation_lines(self, mock_run):
-        """Test that run_command truncates output exceeding 150 lines (first 30 + last 100)."""
-        import subprocess
-
-        mock_stdout = b"\n".join([f"line {i}".encode() for i in range(1, 201)])
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=["echo"], returncode=0, stdout=mock_stdout
-        )
-        res = run_command("echo hi")
+    def test_run_command_truncation_lines(self):
+        """Sandbox output exceeding 150 lines is truncated (first 30 + last 100)."""
+        long_output = "\n".join(f"line {i}" for i in range(1, 202))
+        stub = self._sandbox_stub([SandboxExecResult(exit_code=0, output=long_output)])
+        with self._patched_runner(stub):
+            res = run_command("echo hi")
         # Unified truncation: 150-line cap with a first-30 +
         # last-100 window. The old "<= 130 lines" special case is gone.
         self.assertIn("Output truncated", res)
@@ -736,22 +804,18 @@ class TestCodebaseTools(unittest.TestCase):
         lines = res.splitlines()
         self.assertEqual(lines[0], "line 1")
         self.assertEqual(lines[29], "line 30")
-        self.assertEqual(lines[-1], "line 200")
-        self.assertEqual(lines[-100], "line 101")
+        self.assertEqual(lines[-1], "line 201")
+        self.assertEqual(lines[-100], "line 102")
 
-    @unittest.mock.patch("subprocess.run")
-    def test_run_command_truncation_bytes(self, mock_run):
-        """Test that run_command truncates output exceeding 10 KB via the byte cap."""
-        import subprocess
-
+    def test_run_command_truncation_bytes(self):
+        """Sandbox output exceeding 10 KB is byte-capped."""
         # 50 lines of 300 bytes each = 15000 bytes (> 10 KB, but <= 150 lines).
         # Under the unified rule the byte cap applies regardless of line count.
-        long_line = b"a" * 300
-        mock_stdout = b"\n".join([long_line for _ in range(50)])
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=["echo"], returncode=0, stdout=mock_stdout
-        )
-        res = run_command("echo hi")
+        long_line = "a" * 300
+        long_output = "\n".join(long_line for _ in range(50))
+        stub = self._sandbox_stub([SandboxExecResult(exit_code=0, output=long_output)])
+        with self._patched_runner(stub):
+            res = run_command("echo hi")
         self.assertIn("Output truncated", res)
         self.assertIn("exceeded 10 KB limit", res)
         lines = res.splitlines()
@@ -760,19 +824,18 @@ class TestCodebaseTools(unittest.TestCase):
         # Result is bounded well below the original 15000 bytes.
         self.assertLess(len(res), 15000)
 
-    @unittest.mock.patch("subprocess.run")
-    def test_run_command_non_utf8(self, mock_run):
-        """Test that run_command gracefully decodes non-UTF-8 outputs using errors='replace'."""
-        import subprocess
-
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=["echo"], returncode=0, stdout=b"hello \xff world"
+    def test_run_command_non_utf8(self):
+        """Non-UTF-8 sandbox output is decoded with errors='replace' (runner-side)."""
+        stub = self._sandbox_stub(
+            [SandboxExecResult(exit_code=0, output="hello \ufffd world")]
         )
-        res = run_command("echo hi")
+        with self._patched_runner(stub):
+            res = run_command("echo hi")
         self.assertEqual(res, "hello \ufffd world")
 
     # ------------------------------------------------------------------
-    # ADR-0037 layer 1: run_command allowlist + secret-stripped env
+    # ADR-0037 layer 1: run_command allowlist (tool surface; env construction
+    # delegated to the sandbox runner per issue #160 / ADR-0056)
     # ------------------------------------------------------------------
 
     def test_run_command_rejects_disallowed_binary(self):
@@ -816,76 +879,39 @@ class TestCodebaseTools(unittest.TestCase):
                 os.environ.pop("GITHUB_WORKSPACE", None)
 
     def test_run_command_allowlist_accepts_curated_binary(self):
-        """An allowlisted binary actually executes."""
-        res = run_command("echo allowed")
+        """An allowlisted binary dispatches to the sandbox."""
+        stub = self._sandbox_stub([SandboxExecResult(exit_code=0, output="allowed\n")])
+        with self._patched_runner(stub):
+            res = run_command("echo allowed")
         self.assertEqual(res.strip(), "allowed")
 
     def test_run_command_allowlist_override(self):
         """AGENT_RUN_COMMAND_ALLOWLIST overrides the default set."""
+        stub = self._sandbox_stub(
+            [SandboxExecResult(exit_code=0, output="via-override\n")]
+        )
         os.environ["AGENT_RUN_COMMAND_ALLOWLIST"] = "echo,cat"
         try:
-            res = run_command("echo via-override")
+            with self._patched_runner(stub):
+                res = run_command("echo via-override")
             self.assertEqual(res.strip(), "via-override")
         finally:
             del os.environ["AGENT_RUN_COMMAND_ALLOWLIST"]
 
-    @unittest.mock.patch("subprocess.run")
-    def test_run_command_env_allowlist(self, mock_run):
-        """The child env contains only allowlisted vars; secrets are absent
-        regardless of naming (ADR-0043: denylist replaced with allowlist)."""
-        mock_run.return_value = unittest.mock.MagicMock(stdout=b"", returncode=0)
-        # Secret-bearing vars that the old denylist missed (no KEY/TOKEN/
-        # SECRET/PASSWORD suffix) must now be absent.
-        os.environ["DATABASE_URL"] = "postgres://user:pw@host/db"
-        os.environ["FOO_CREDENTIAL"] = "leak"
-        os.environ["MY_CONN"] = "conn-string"
-        # Named orchestrator secrets must still be absent.
-        os.environ["GH_PAT"] = "ghp_" + "a" * 36
-        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-" + "b" * 24
-        # A non-secret var not in the allowlist must also be absent.
-        os.environ["KEEP_ME"] = "kept"
-        try:
+    def test_run_command_env_construction_delegated_to_runner(self):
+        """Env construction is delegated to the runner (issue #160): the tool
+        passes only (args, timeout) — the sandbox env is built inside the
+        runner (build_sandbox_env, ADR-0043 semantics; covered in
+        test_sandbox.py). The runner Protocol has no env parameter, so any
+        tool-side env construction would have to leak in as an extra
+        kwarg — its absence is the delegation proof."""
+        stub = self._sandbox_stub([SandboxExecResult(exit_code=0, output="ok\n")])
+        with self._patched_runner(stub):
             run_command("echo hi")
-        finally:
-            for k in (
-                "DATABASE_URL",
-                "FOO_CREDENTIAL",
-                "MY_CONN",
-                "GH_PAT",
-                "OPENROUTER_API_KEY",
-                "KEEP_ME",
-            ):
-                os.environ.pop(k, None)
-        _, kwargs = mock_run.call_args
-        child_env = kwargs["env"]
-        # Secrets absent regardless of naming.
-        self.assertNotIn("DATABASE_URL", child_env)
-        self.assertNotIn("FOO_CREDENTIAL", child_env)
-        self.assertNotIn("MY_CONN", child_env)
-        self.assertNotIn("GH_PAT", child_env)
-        self.assertNotIn("OPENROUTER_API_KEY", child_env)
-        # Non-allowlisted non-secret vars are also absent (fail-closed).
-        self.assertNotIn("KEEP_ME", child_env)
-        # Allowlisted essentials are present.
-        self.assertIn("PATH", child_env)
-        self.assertIn("HOME", child_env)
-        self.assertIn("LANG", child_env)
-
-    @unittest.mock.patch("subprocess.run")
-    def test_run_command_env_allowlist_override(self, mock_run):
-        """AGENT_SUBPROCESS_ENV_ALLOWLIST adds project-specific vars to the
-        child env (ADR-0043)."""
-        mock_run.return_value = unittest.mock.MagicMock(stdout=b"", returncode=0)
-        os.environ["DB_URL"] = "postgres://user:pw@host/db"
-        os.environ["AGENT_SUBPROCESS_ENV_ALLOWLIST"] = "DB_URL"
-        try:
-            run_command("echo hi")
-        finally:
-            os.environ.pop("DB_URL", None)
-            os.environ.pop("AGENT_SUBPROCESS_ENV_ALLOWLIST", None)
-        _, kwargs = mock_run.call_args
-        child_env = kwargs["env"]
-        self.assertIn("DB_URL", child_env)
+        self.assertEqual(len(stub.exec_calls), 1)
+        args, timeout = stub.exec_calls[0]
+        self.assertEqual(args, ["echo", "hi"])
+        self.assertEqual(timeout, 300)
 
     # ------------------------------------------------------------------
     # ADR-0037 layer 2: is_safe_path on grep_search / list_directory
@@ -930,29 +956,98 @@ class TestCodebaseTools(unittest.TestCase):
     # ADR-0037 run_command edge cases (coverage gaps cited by test_coverage judge)
     # ------------------------------------------------------------------
 
-    def test_run_command_empty_string(self):
-        """An empty command string yields the empty-command error."""
-        res = run_command("")
-        self.assertIn("Empty command", res)
-
     @unittest.mock.patch("subprocess.run")
     def test_run_command_generic_exception(self, mock_run):
-        """A non-timeout exception from subprocess.run is caught and reported."""
-        mock_run.side_effect = OSError("spawn failed")
-        res = run_command("echo hi")
+        """A non-sandbox exception from the runner is caught and reported."""
+        stub = self._sandbox_stub([RuntimeError("spawn failed")])
+        with self._patched_runner(stub):
+            res = run_command("echo hi")
         self.assertIn("Failed to run command", res)
         self.assertIn("spawn failed", res)
+        # The lifecycle still completed on the failure path.
+        self.assertEqual(stub.destroy_count, 1)
+
+    def test_run_command_timeout_with_no_output(self):
+        """A sandbox timeout with no captured output returns the no-output timeout error."""
+        stub = self._sandbox_stub(
+            [SandboxExecResult(exit_code=-1, output="", timed_out=True)]
+        )
+        with self._patched_runner(stub):
+            res = run_command("echo hi")
+        self.assertIn("timed out after 300 seconds with no output", res)
+
+    # ------------------------------------------------------------------
+    # Execution Sandbox containment (issue #160, FR-3): fail closed, no host
+    # execution path, trace parity.
+    # ------------------------------------------------------------------
 
     @unittest.mock.patch("subprocess.run")
-    def test_run_command_timeout_with_no_output(self, mock_run):
-        """A timeout with no captured output returns the no-output timeout error."""
-        import subprocess
-
-        mock_run.side_effect = subprocess.TimeoutExpired(
-            cmd=["echo", "hi"], timeout=300, output=b""
+    def test_run_command_success_never_executes_on_host(self, mock_run):
+        """Fail closed (AC2): with a working sandbox, no host subprocess.run
+        is ever invoked — the sentinel raises if a host path survived."""
+        mock_run.side_effect = AssertionError("host subprocess execution attempted")
+        stub = self._sandbox_stub(
+            [SandboxExecResult(exit_code=0, output="in sandbox\n")]
         )
-        res = run_command("echo hi")
-        self.assertIn("timed out after 300 seconds with no output", res)
+        with self._patched_runner(stub):
+            res = run_command("make verify")
+        self.assertEqual(res.strip(), "in sandbox")
+
+    def test_run_command_sandbox_unavailable_fails_closed(self):
+        """A sandbox infrastructure failure returns a tool-level error string
+        (never a host fallback, never a crash) and still destroys the runner."""
+        failing = self._sandbox_stub(
+            [], create_error=SandboxUnavailableError("docker daemon unreachable")
+        )
+        with unittest.mock.patch(
+            "orchestrator.tools.get_sandbox_runner", return_value=failing
+        ):
+            with unittest.mock.patch(
+                "subprocess.run",
+                side_effect=AssertionError("host subprocess execution attempted"),
+            ):
+                res = run_command("make verify")
+        self.assertIn("Error: Execution Sandbox unavailable:", res)
+        self.assertIn("docker daemon unreachable", res)
+        self.assertEqual(failing.destroy_count, 1)
+
+    def test_run_command_sandbox_misconfiguration_fails_loudly(self):
+        """A runner misconfiguration (SandboxConfigError, e.g. unsupported
+        backend or credential env override) surfaces as the fail-closed error."""
+        with unittest.mock.patch(
+            "orchestrator.tools.get_sandbox_runner",
+            side_effect=SandboxConfigError(
+                "Unsupported AGENT_SANDBOX_BACKEND 'host': only 'docker' is "
+                "implemented and there is no host-side fallback"
+            ),
+        ):
+            with unittest.mock.patch(
+                "subprocess.run",
+                side_effect=AssertionError("host subprocess execution attempted"),
+            ):
+                res = run_command("make verify")
+        self.assertIn("Error: Execution Sandbox unavailable:", res)
+        self.assertIn("no host-side fallback", res)
+
+    def test_run_command_trace_record_parity(self):
+        """Trace parity (AC4): a sandboxed run_command result serializes into
+        the Worker Trace JSONL with the same record structure as the
+        host-execution era (role/tool_name/content; serializer unchanged)."""
+        from langchain_core.messages import ToolMessage
+
+        from orchestrator.worker import _serialize_message
+
+        stub = self._sandbox_stub(
+            [SandboxExecResult(exit_code=0, output="fixture output\n")]
+        )
+        with self._patched_runner(stub):
+            res = run_command("echo fixture")
+        msg = ToolMessage(content=res, name="run_command", tool_call_id="c1")
+        record = _serialize_message(msg)
+        self.assertEqual(record["role"], "tool")
+        self.assertEqual(record["tool_name"], "run_command")
+        self.assertEqual(record["content"], "fixture output\n")
+        self.assertEqual(record["tool_call_id"], "c1")
 
     # ------------------------------------------------------------------
     # grep_search directory-walk edge cases (is_safe_path + match cap)

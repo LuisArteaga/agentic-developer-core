@@ -3,6 +3,8 @@
 ## Status
 Accepted (amends ADR-0037 layer 1's environment strategy; the command allowlist, `is_safe_path`, DNS pinning, and redaction layers of ADR-0037 are unchanged).
 
+Amended 2026-09 (issue #160, ADR-0056 slice 2): with Worker command execution moved inside the Execution Sandbox, the allowlist mechanism itself migrated from the tool surface to the runner — `orchestrator.tools._build_subprocess_env` and `AGENT_SUBPROCESS_ENV_ALLOWLIST` are removed; `orchestrator.sandbox.build_sandbox_env` is authoritative (empty by default, opt-in `AGENT_SANDBOX_ENV_ALLOWLIST`). The allowlist-over-denylist decision and its fail-closed invariant are unchanged, and now hold for every untrusted execution path.
+
 ## Context
 ADR-0037 layer 1 hardens `run_command` by passing a **denylist** environment to the child: it strips named secrets (`GH_PAT`, `OPENROUTER_API_KEY`, …) and any var matching `.*(KEY|TOKEN|SECRET|PASSWORD)$`. The command allowlist and `shell=False` are correct and stay; the env sanitization is the weak link.
 

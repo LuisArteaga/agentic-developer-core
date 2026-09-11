@@ -3,6 +3,8 @@
 ## Status
 Accepted (extends [ADR-0035](./0035-runtime-path-safety-validation-in-worker-tools.md) and [ADR-0028](./0028-url-fetch-ssrf-validation-strategy.md); addresses findings from the 2026 forensic review)
 
+Amended 2026-09 (issue #160, [ADR-0056](./0056-split-plane-execution-sandbox-on-cloud-vps.md) slice 2): the transport of `run_command` moved from host `subprocess.run` to the Execution Sandbox (spawn-per-exec container, no host fallback). Layer 1's binary allowlist remains authoritative at the tool surface; the layer-1 environment control now lives in the runner (`build_sandbox_env`, ADR-0043 semantics extended to sandboxes) — stricter than the former host-side allowlist, since no orchestrator env var crosses by default.
+
 ## Context
 The Worker agent runs unattended against a **Target Repository** whose primary input — the GitHub issue body — is attacker-controllable. The issue body is concatenated verbatim into the Worker `user` message (`nodes.py` execute path → `worker.py:158-165`) with only an advisory, planner-side "CRITICAL SECURITY INSTRUCTION" (`nodes.py:619-624`) and **no untrusted-input framing in the Worker system prompt**. The Worker holds the full tool suite, including `run_command` and `fetch_url`.
 
