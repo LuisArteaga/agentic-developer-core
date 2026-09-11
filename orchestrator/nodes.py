@@ -5,7 +5,6 @@ import logging
 import os
 import re
 import shlex
-import subprocess  # noqa: F401  # patch seam for tests (shared stdlib module)
 import time
 import urllib.parse
 import urllib.request
@@ -3197,17 +3196,16 @@ def test_writer_node(state: AgentState) -> AgentState:
                     timeout=300,
                 )
             except SandboxError as e:
+                # Distinct infra-failure log line only: the outer except
+                # Exception handler performs the ADR-0038 record-and-return
+                # (identical state outcome), so re-raise instead of
+                # duplicating it.
                 logger.error(
                     "Execution Sandbox infrastructure failure in Test-Writer "
                     "pre-verification (fail closed, no host fallback): %s",
                     e,
                 )
-                state["status"] = "failed"
-                state["phase"] = "test_writing"
-                state["error"] = f"test_writer: {e}"
-                state_module.save(state)
-                _safe_telemetry(end_orchestrator_phase, exit_code=1)
-                return state
+                raise
             finally:
                 if runner is not None:
                     runner.destroy()
