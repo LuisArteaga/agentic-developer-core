@@ -6,6 +6,7 @@ from pathlib import Path
 
 from orchestrator import state
 from orchestrator.path_safety import is_safe_path
+from orchestrator.sandbox import SandboxError, SandboxRunner, get_sandbox_runner
 from scripts.telemetry import record_security_block
 
 _logger = logging.getLogger("orchestrator.tools")
@@ -33,8 +34,10 @@ def _record_runtime_security_block(rel_str: str) -> None:
 _PROJECT_ROOT: Path | None = None
 
 # ---------------------------------------------------------------------------
-# ADR-0037 layer 1: run_command command allowlist + minimal allowlist env
-# (ADR-0043: denylist replaced with an explicit env-var allowlist).
+# ADR-0037 layer 1: run_command command allowlist (the authoritative tool-
+# surface control; transport is the Execution Sandbox, ADR-0056 — env
+# construction is delegated to the runner's allowlist mechanism, ADR-0043
+# semantics via sandbox.build_sandbox_env).
 # ---------------------------------------------------------------------------
 
 # Curated set of binaries the Worker may execute via run_command. Network
@@ -62,31 +65,6 @@ DEFAULT_RUN_COMMAND_ALLOWLIST = frozenset(
     }
 )
 
-# Minimal allowlist of env vars the Worker subprocess may inherit (ADR-0043).
-# Replaces the former denylist (_SECRET_ENV_NAME_RE) which was name-based and
-# leaked any secret not ending in KEY/TOKEN/SECRET/PASSWORD (e.g. DATABASE_URL,
-# *_CREDENTIAL, *_CONN). An allowlist fails closed: a new secret var is absent
-# from the child by default unless explicitly added here or via
-# AGENT_SUBPROCESS_ENV_ALLOWLIST.
-_DEFAULT_SUBPROCESS_ENV_ALLOWLIST = frozenset(
-    {
-        "PATH",
-        "HOME",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "TZ",
-        "PYTHONDONTWRITEBYTECODE",
-        "PYTHONPYCACHEPREFIX",
-        "PYTHONPATH",
-        "VIRTUAL_ENV",
-        "AGENT_LABEL_READY",
-        "AGENT_LABEL_IN_PROGRESS",
-        "AGENT_LABEL_BLOCKED",
-        "AGENT_POLL_INTERVAL",
-    }
-)
-
 # ---------------------------------------------------------------------------
 # ADR-0037 layer 6: bounded reads — prevent a planted oversized file from
 # exhausting Worker context / memory (CWE-400).
@@ -106,21 +84,6 @@ def _resolve_run_command_allowlist() -> frozenset[str]:
     if not override:
         return DEFAULT_RUN_COMMAND_ALLOWLIST
     return frozenset(name.strip() for name in override.split(",") if name.strip())
-
-
-def _build_subprocess_env() -> dict[str, str]:
-    """Return a minimal allowlisted environment for a Worker subprocess.
-
-    Only vars in ``_DEFAULT_SUBPROCESS_ENV_ALLOWLIST`` (plus any names added via
-    the ``AGENT_SUBPROCESS_ENV_ALLOWLIST`` override) are passed to the child.
-    Every other ``os.environ`` var — including any secret regardless of naming
-    — is absent, so a prompt-injected Worker cannot exfiltrate credentials via
-    ``printenv``/``env`` or inherit them into a child process (ADR-0043).
-    """
-    allow = set(_DEFAULT_SUBPROCESS_ENV_ALLOWLIST)
-    extra = os.getenv("AGENT_SUBPROCESS_ENV_ALLOWLIST", "")
-    allow.update(x.strip() for x in extra.split(",") if x.strip())
-    return {k: v for k, v in os.environ.items() if k in allow}
 
 
 def _truncate_output(output: str) -> str:
@@ -665,19 +628,19 @@ def patch_file(path: str, old_string: str, new_string: str) -> str:
 
 
 def run_command(command: str) -> str:
-    """Execute a shell command safely in a subprocess with shell=False.
+    """Execute a shell command inside the Execution Sandbox (ADR-0056, FR-3).
 
-    Captures stdout and stderr together. If the output exceeds 150 lines or 10 KB,
-    it is truncated (first 30 + last 100 lines, then a 10 KB byte cap).
-    A timeout of 300 seconds is enforced.
-
-    Security (ADR-0037 layer 1): only a curated allowlist of binaries may run
-    (network binaries are excluded — outbound research must use fetch_url),
-    and the child receives a minimal allowlist environment (ADR-0043) so a
-    prompt-injected Worker cannot exfiltrate credentials via `printenv`/`env`.
+    The ADR-0037 binary allowlist is enforced first at the tool surface
+    (identical refusal semantics as before the sandbox migration), then the
+    parsed args dispatch to the sandbox runner: a spawn-per-exec container
+    bound to the workspace, with secret-free environment construction delegated
+    to the runner's allowlist mechanism (``build_sandbox_env``, ADR-0043
+    semantics). There is NO host-side execution path: if the sandbox is
+    unavailable or misconfigured the tool fails closed with an error string
+    (never a host subprocess, never a crash). Output bounds and timeout
+    semantics are unchanged (150 lines / 10 KB truncation, 300 s timeout).
     """
     import shlex
-    import subprocess
 
     project_root = get_workspace_root()
 
@@ -689,8 +652,9 @@ def run_command(command: str) -> str:
     if not args:
         return "Error: Empty command provided."
 
-    # ADR-0037 layer 1: command allowlist. Only a curated set of binaries may
-    # run; network binaries are excluded so exfiltration must go through
+    # ADR-0037 layer 1: command allowlist at the tool surface, BEFORE any
+    # sandbox interaction (a refusal must not spend a docker round-trip).
+    # Network binaries are excluded so exfiltration must go through
     # fetch_url (SSRF-protected). PATH tricks are neutralized by matching on
     # the basename of args[0].
     allowlist = _resolve_run_command_allowlist()
@@ -703,42 +667,41 @@ def run_command(command: str) -> str:
             f"outbound requests."
         )
 
+    # Run the command inside the Execution Sandbox (ADR-0056, FR-3): lazily
+    # create → exec → destroy per call. Sandbox infrastructure failures fail
+    # closed with a tool-level error string — never a host subprocess fallback
+    # and never a node crash. Non-zero command exits are data (returned as
+    # output), matching the pre-sandbox tool semantics.
+    runner: SandboxRunner | None = None
     try:
-        # Run the command with a 300 second timeout, capturing stdout and
-        # stderr together. The child receives a minimal allowlist env
-        # (ADR-0043): only explicitly permitted vars are present, so no
-        # os.environ secret reaches the subprocess regardless of naming.
-        result = subprocess.run(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=project_root,
-            timeout=300,
-            env=_build_subprocess_env(),
+        runner = get_sandbox_runner()
+        runner.create(project_root)
+        exec_result = runner.exec(args, timeout=300)
+    except SandboxError as e:
+        _logger.error(
+            "Execution Sandbox failure in run_command (fail closed, no host "
+            "fallback): %s",
+            e,
         )
-        output_bytes = result.stdout
-        timed_out = False
-    except subprocess.TimeoutExpired as e:
-        output_bytes = e.stdout or b""
-        timed_out = True
+        return f"Error: Execution Sandbox unavailable: {e}"
     except Exception as e:
         return f"Error: Failed to run command: {e}"
+    finally:
+        if runner is not None:
+            runner.destroy()
 
-    # Decode gracefully
-    output = output_bytes.decode("utf-8", errors="replace")
+    output = exec_result.output
 
-    # Handle empty output
-    if not output and not timed_out:
+    if exec_result.timed_out:
+        if not output:
+            return "Error: Command timed out after 300 seconds with no output."
+        truncated = _truncate_output(output)
+        return (
+            f"Error: Command '{command}' timed out after 300 seconds.\n"
+            f"Output captured before timeout:\n{truncated}"
+        )
+
+    if not output:
         return "(Command completed successfully with no output.)"
-    elif not output and timed_out:
-        return "Error: Command timed out after 300 seconds with no output."
 
-    # Unified truncation: 150-line + 10 KB byte cap, shared with
-    # verify_node via _truncate_output. The prior `<= 130` special case (which
-    # let oversized-but-short output pass untruncated) is removed.
-    output = _truncate_output(output)
-
-    if timed_out:
-        return f"Error: Command '{command}' timed out after 300 seconds.\nOutput captured before timeout:\n{output}"
-
-    return output
+    return _truncate_output(output)

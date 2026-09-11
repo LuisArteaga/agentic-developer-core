@@ -34,40 +34,6 @@ def _raw_structured_response(parsed, finish_reason="stop", parsing_error=None):
     return {"raw": raw_msg, "parsed": parsed, "parsing_error": parsing_error}
 
 
-def _routed_subprocess_run(discovery_results, real_run=None):
-    """Build a subprocess.run stand-in that scripts only the Test-Writer
-    pre-verification discovery call.
-
-    Patching ``orchestrator.nodes.subprocess.run`` replaces the ``run``
-    attribute on the shared stdlib module, so orchestrator.git's repo probes
-    (``is_git_repository``, ``diff_cached``) would be mocked too. This router
-    forwards any non-discovery command to the real subprocess and serves the
-    queued ``(stdout, stderr)`` tuples only for the unittest-discovery call.
-    """
-    if real_run is None:
-        real_run = subprocess.run
-    queue = list(discovery_results)
-
-    def _run(cmd, **kwargs):
-        if cmd[:3] == ["python3", "-m", "unittest"]:
-            res = MagicMock()
-            res.stdout, res.stderr = queue.pop(0)
-            res.returncode = 0
-            return res
-        return real_run(cmd, **kwargs)
-
-    return _run
-
-
-def _discovery_calls(mock_run):
-    """Filter a subprocess.run mock's calls down to unittest-discovery ones."""
-    return [
-        c
-        for c in mock_run.call_args_list
-        if c.args and c.args[0][:3] == ["python3", "-m", "unittest"]
-    ]
-
-
 def _verify_exec_result(exit_code=0, output="All tests passed.", timed_out=False):
     """Build a SandboxExecResult for verify_node tests (sandbox seam)."""
     return SandboxExecResult(
@@ -4605,19 +4571,20 @@ class TestTestWriterNode(unittest.TestCase):
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
 
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_success(
-        self, mock_github_api, mock_execute_worker, mock_run
+        self, mock_github_api, mock_execute_worker, mock_get_runner
     ):
         # Setup mock GitHub API response
         mock_github_api.return_value = {
             "title": "Fix a bug",
             "body": "There is a bug in main.py.",
         }
-        # Setup mock subprocess output (success, no bad errors)
-        mock_run.side_effect = _routed_subprocess_run([("Ran 5 tests in 0.1s\nOK", "")])
+        # Setup sandbox stub output (success, no bad errors)
+        stub = _verify_runner_stub([_verify_exec_result(0, "Ran 5 tests in 0.1s\nOK")])
+        mock_get_runner.return_value = stub
 
         # Setup initial state
         state = DEFAULT_STATE.copy()
@@ -4636,13 +4603,20 @@ class TestTestWriterNode(unittest.TestCase):
 
         # Verify execute_worker was called
         mock_execute_worker.assert_called_once()
-        self.assertEqual(len(_discovery_calls(mock_run)), 1)
+        # Discovery executed exactly once inside the sandbox, with the
+        # workspace bind and the 300 s exec timeout; lifecycle completed.
+        self.assertEqual(len(stub.exec_calls), 1)
+        args, timeout = stub.exec_calls[0]
+        self.assertEqual(args[:3], ["python3", "-m", "unittest"])
+        self.assertEqual(timeout, 300)
+        self.assertEqual(stub.created, self.workspace_dir)
+        self.assertEqual(stub.destroy_count, 1)
 
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_includes_behavior_not_structure_constraint(
-        self, mock_github_api, mock_execute_worker, mock_run
+        self, mock_github_api, mock_execute_worker, mock_get_runner
     ):
         """The Test-Writer instructions must carry the Behavior-Not-Structure
         constraint (issue #58) so generated tests specify behavior and do not
@@ -4652,10 +4626,9 @@ class TestTestWriterNode(unittest.TestCase):
             "title": "Fix a bug",
             "body": "There is a bug in main.py.",
         }
-        mock_res = unittest.mock.MagicMock()
-        mock_res.stdout = "Ran 5 tests in 0.1s\nOK"
-        mock_res.stderr = ""
-        mock_run.return_value = mock_res
+        mock_get_runner.return_value = _verify_runner_stub(
+            [_verify_exec_result(0, "Ran 5 tests in 0.1s\nOK")]
+        )
 
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -4673,20 +4646,24 @@ class TestTestWriterNode(unittest.TestCase):
         self.assertIn("public", instructions.lower())
         self.assertIn("tautological", instructions.lower())
 
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_retry_and_success(
-        self, mock_github_api, mock_execute_worker, mock_run
+        self, mock_github_api, mock_execute_worker, mock_get_runner
     ):
         mock_github_api.return_value = {
             "title": "Fix a bug",
             "body": "There is a bug in main.py.",
         }
         # First discovery check fails with SyntaxError, second succeeds
-        mock_run.side_effect = _routed_subprocess_run(
-            [("", "SyntaxError: invalid syntax"), ("Ran 5 tests\nOK", "")]
+        stub = _verify_runner_stub(
+            [
+                _verify_exec_result(0, "\nSyntaxError: invalid syntax"),
+                _verify_exec_result(0, "Ran 5 tests\nOK"),
+            ]
         )
+        mock_get_runner.return_value = stub
 
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -4700,18 +4677,21 @@ class TestTestWriterNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "test_writing")
         self.assertEqual(mock_execute_worker.call_count, 2)
+        # One sandbox lifecycle per pre-verification attempt.
+        self.assertEqual(len(stub.exec_calls), 2)
+        self.assertEqual(stub.destroy_count, 2)
 
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_all_attempts_fail(
-        self, mock_github_api, mock_execute_worker, mock_run
+        self, mock_github_api, mock_execute_worker, mock_get_runner
     ):
         mock_github_api.return_value = {"title": "Fix a bug", "body": "There is a bug."}
-        res_fail = unittest.mock.MagicMock()
-        res_fail.stdout = ""
-        res_fail.stderr = "ModuleNotFoundError: No module named foo"
-        mock_run.return_value = res_fail
+        stub = _verify_runner_stub(
+            [_verify_exec_result(0, "\nModuleNotFoundError: No module named foo")] * 3
+        )
+        mock_get_runner.return_value = stub
 
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -4730,6 +4710,76 @@ class TestTestWriterNode(unittest.TestCase):
         self.assertIn("Test-Writer failed pre-verification", result["error"] or "")
 
         self.assertEqual(mock_execute_worker.call_count, 3)
+
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_test_writer_node_sandbox_failure_records_and_returns(
+        self, mock_github_api, mock_execute_worker, mock_get_runner
+    ):
+        """A sandbox infrastructure failure in pre-verification is an
+        ADR-0038 record-and-return: state failed WITHOUT burning a
+        Test-Writer attempt (no retry loop), lifecycle still destroyed."""
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py.",
+        }
+        stub = _verify_runner_stub([SandboxUnavailableError("docker daemon down")])
+        mock_get_runner.return_value = stub
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+
+        from orchestrator.nodes import test_writer_node
+
+        result = test_writer_node(state)
+
+        self.assertIs(result, state)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["phase"], "test_writing")
+        self.assertIn("test_writer: ", result["error"] or "")
+        self.assertIn("docker daemon down", result["error"] or "")
+        # Infrastructure is NOT a test-quality failure: no retry, budget
+        # untouched, and the runner lifecycle completed.
+        self.assertEqual(mock_execute_worker.call_count, 1)
+        self.assertEqual(result["attempts"], {})
+        self.assertEqual(stub.destroy_count, 1)
+
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_test_writer_node_discovery_never_executes_on_host(
+        self, mock_github_api, mock_execute_worker, mock_get_runner
+    ):
+        """Fail closed (issue #160): with a working sandbox, no host
+        subprocess.run is ever invoked for pre-verification — the sentinel
+        raises if a host path survived the migration."""
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py.",
+        }
+        stub = _verify_runner_stub([_verify_exec_result(0, "Ran 5 tests\nOK")])
+        mock_get_runner.return_value = stub
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+
+        from orchestrator.nodes import test_writer_node
+
+        with patch(
+            "subprocess.run",
+            side_effect=AssertionError("host subprocess execution attempted"),
+        ):
+            # The no-op guard fails open outside a git repository (no
+            # subprocess needed there), so the sentinel only guards the
+            # pre-verification discovery.
+            result = test_writer_node(state)
+
+        self.assertEqual(result["status"], "executing")
 
 
 class TestTestWriterNoOpGuard(unittest.TestCase):
@@ -4798,13 +4848,6 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         state["plan"] = plan_json
         return state
 
-    # Real subprocess.run captured at import time. patching
-    # "orchestrator.nodes.subprocess.run" replaces the attribute on the shared
-    # stdlib module, which would also mock orchestrator.git's subprocess calls
-    # (repo init, diff_cached) — so the mock delegates non-discovery commands
-    # to this real reference.
-    _REAL_SUBPROCESS_RUN = staticmethod(subprocess.run)
-
     def _git(self, *args: str) -> None:
         subprocess.run(
             ["git", *args],
@@ -4814,27 +4857,22 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         )
 
     def _make_node_mocks(
-        self, mock_github_api, mock_run, stdout="Ran 5 tests\nOK", stderr=""
+        self, mock_github_api, mock_get_runner, stdout="Ran 5 tests\nOK", stderr=""
     ):
+        """Install the GitHub API mock and the pre-verification sandbox stub.
+
+        Since issue #160 the unittest discovery runs inside the Execution
+        Sandbox, so the seam is ``orchestrator.nodes.get_sandbox_runner``: the
+        stub returns a single green discovery result (output composed as the
+        former ``stdout + "\\n" + stderr``); git traffic runs unmocked.
+        """
         mock_github_api.return_value = {
             "title": "Fix a bug",
             "body": "There is a bug in main.py.",
         }
-
-        real_run = self._REAL_SUBPROCESS_RUN
-
-        def _delegate(cmd, **kwargs):
-            # Intercept only the pre-verification unittest discovery; real git
-            # traffic (is_git_repository, diff_cached) passes through.
-            if cmd[:3] == ["python3", "-m", "unittest"]:
-                res = MagicMock()
-                res.stdout = stdout
-                res.stderr = stderr
-                res.returncode = 0
-                return res
-            return real_run(cmd, **kwargs)
-
-        mock_run.side_effect = _delegate
+        stub = _verify_runner_stub([_verify_exec_result(0, stdout + "\n" + stderr)])
+        mock_get_runner.return_value = stub
+        return stub
 
     # --- pure helper: _is_test_path ---------------------------------------
 
@@ -4989,7 +5027,7 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
     def test_node_without_plan_records_failure(self):
         """A missing development plan transitions to recovery via failed state."""
         with (
-            patch("orchestrator.nodes.subprocess.run"),
+            patch("orchestrator.nodes.get_sandbox_runner"),
             patch("orchestrator.worker.execute_worker"),
             patch("orchestrator.nodes._github_api_request") as mock_github_api,
         ):
@@ -5010,16 +5048,14 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
 
     # --- node-level behavior -------------------------------------------------
 
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_noop_test_phase_fails_all_attempts(
-        self, mock_github_api, mock_execute_worker, mock_run
+        self, mock_github_api, mock_execute_worker, mock_get_runner
     ):
         """A clean workspace (no diff at all) is a no-op: every attempt fails."""
-        # Install the delegating subprocess mock BEFORE git setup so real git
-        # commands pass through from the very first call.
-        self._make_node_mocks(mock_github_api, mock_run)
+        self._make_node_mocks(mock_github_api, mock_get_runner)
         self._init_repo()
 
         state = self._state_with_plan()
@@ -5043,11 +5079,11 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         plan_json = json.dumps({"rationale": "r", "tasks": []})
 
         with (
-            patch("orchestrator.nodes.subprocess.run") as mock_run,
+            patch("orchestrator.nodes.get_sandbox_runner") as mock_get_runner,
             patch("orchestrator.worker.execute_worker") as mock_execute_worker,
             patch("orchestrator.nodes._github_api_request") as mock_github_api,
         ):
-            self._make_node_mocks(mock_github_api, mock_run)
+            self._make_node_mocks(mock_github_api, mock_get_runner)
 
             state = self._state_with_plan(plan_json)
             state_module.save(state)
@@ -5061,13 +5097,13 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         self.assertIn("No test files were added or modified", second_instructions)
         self.assertIn("Write the tests before implementation", second_instructions)
 
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_added_test_file_passes_guard(
-        self, mock_github_api, mock_execute_worker, mock_run
+        self, mock_github_api, mock_execute_worker, mock_get_runner
     ):
-        self._make_node_mocks(mock_github_api, mock_run)
+        self._make_node_mocks(mock_github_api, mock_get_runner)
         self._init_repo()
         new_test = self.workspace_dir / "tests" / "test_feature.py"
         new_test.parent.mkdir(parents=True)
@@ -5083,14 +5119,14 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         self.assertEqual(result["status"], "executing")
         self.assertEqual(mock_execute_worker.call_count, 1)
 
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_modified_test_file_passes_guard(
-        self, mock_github_api, mock_execute_worker, mock_run
+        self, mock_github_api, mock_execute_worker, mock_get_runner
     ):
         """Extending an existing tracked test file counts as productive."""
-        self._make_node_mocks(mock_github_api, mock_run)
+        self._make_node_mocks(mock_github_api, mock_get_runner)
         self._init_repo()
         existing_test = self.workspace_dir / "tests" / "test_existing.py"
         existing_test.parent.mkdir(parents=True)
@@ -5113,14 +5149,14 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         self.assertEqual(result["status"], "executing")
         self.assertEqual(mock_execute_worker.call_count, 1)
 
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_plan_designated_test_target_passes_guard(
-        self, mock_github_api, mock_execute_worker, mock_run
+        self, mock_github_api, mock_execute_worker, mock_get_runner
     ):
         """A nonstandard test location named by the Plan Localization passes."""
-        self._make_node_mocks(mock_github_api, mock_run)
+        self._make_node_mocks(mock_github_api, mock_get_runner)
         self._init_repo()
         planned = self.workspace_dir / "spec" / "models" / "user_spec.rb"
         planned.parent.mkdir(parents=True)
@@ -5149,15 +5185,15 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         self.assertEqual(result["status"], "executing")
         self.assertEqual(mock_execute_worker.call_count, 1)
 
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_indeterminate_diff_fails_open(
-        self, mock_github_api, mock_execute_worker, mock_run
+        self, mock_github_api, mock_execute_worker, mock_get_runner
     ):
         """Outside a git repository the guard cannot judge: fail open."""
         # Workspace stays a plain temp dir (no git init).
-        self._make_node_mocks(mock_github_api, mock_run)
+        self._make_node_mocks(mock_github_api, mock_get_runner)
 
         with self.assertLogs("orchestrator.nodes", level="WARNING") as logs:
             state = self._state_with_plan()
