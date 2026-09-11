@@ -16,6 +16,10 @@ from orchestrator.nodes import (
     plan_node,
     verify_node,
 )
+from orchestrator.sandbox import (
+    SandboxExecResult,
+    SandboxUnavailableError,
+)
 from orchestrator.state import DEFAULT_STATE, AgentState
 
 
@@ -62,6 +66,51 @@ def _discovery_calls(mock_run):
         for c in mock_run.call_args_list
         if c.args and c.args[0][:3] == ["python3", "-m", "unittest"]
     ]
+
+
+def _verify_exec_result(exit_code=0, output="All tests passed.", timed_out=False):
+    """Build a SandboxExecResult for verify_node tests (sandbox seam)."""
+    return SandboxExecResult(
+        exit_code=exit_code, output=output, timed_out=timed_out, duration_seconds=0.1
+    )
+
+
+def _verify_runner_stub(results):
+    """Build a SandboxRunner stand-in driving verify_node's sandbox seam.
+
+    ``results`` is consumed per exec call (entries: SandboxExecResult or
+    Exception). Records create/exec/destroy lifecycle calls so tests can
+    assert the runner contract without touching Docker. patch target:
+    ``orchestrator.nodes.get_sandbox_runner``.
+    """
+
+    class _StubSandboxRunner:
+        def __init__(self):
+            self.created = None
+            self.exec_calls = []
+            self.destroy_count = 0
+
+        def create(self, workspace):
+            self.created = workspace
+
+        def exec(self, args, timeout):
+            self.exec_calls.append((list(args), timeout))
+            if not results:
+                raise AssertionError("unexpected extra exec call on stub runner")
+            outcome = results.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        def destroy(self):
+            self.destroy_count += 1
+
+    return _StubSandboxRunner()
+
+
+def _make_verify_pass_runner():
+    """A stub runner whose single exec call reports a green verify."""
+    return _verify_runner_stub([_verify_exec_result(0, "All tests passed.")])
 
 
 class TestClaimNode(unittest.TestCase):
@@ -1280,14 +1329,12 @@ class TestVerifyNode(unittest.TestCase):
         self.logs_temp.cleanup()
 
     @patch("orchestrator.nodes._get_workspace_diff", return_value="")
-    @patch("orchestrator.nodes.subprocess.run")
-    def test_verify_node_success(self, mock_subprocess_run, _mock_diff):
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_verify_node_success(self, mock_get_runner, _mock_diff):
         """Test successful verification: exit code 0, clears feedback and resets attempts."""
-        # Mock subprocess run to return success
-        mock_res = unittest.mock.MagicMock()
-        mock_res.returncode = 0
-        mock_res.stdout = b"All 10 tests passed."
-        mock_subprocess_run.return_value = mock_res
+        # The sandbox runner stub reports a green make-verify execution.
+        runner = _make_verify_pass_runner()
+        mock_get_runner.return_value = runner
 
         # Setup initial state with existing attempts and feedback
         state = DEFAULT_STATE.copy()
@@ -1305,23 +1352,19 @@ class TestVerifyNode(unittest.TestCase):
         self.assertEqual(new_state["attempts"]["verify_cmd"], 0)
         self.assertIsNone(new_state["feedback"])
 
-        # Verify subprocess was called correctly (default command: 'make verify')
-        mock_subprocess_run.assert_called_once_with(
-            ["make", "verify"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=self.workspace_dir,
-            timeout=300,
-            shell=False,
-        )
+        # The gate ran inside the Execution Sandbox with the resolved default
+        # command and timeout (AGENT_VERIFY_COMMAND unset in setUp), against
+        # the resolved workspace, and the runner lifecycle was completed.
+        self.assertEqual(runner.exec_calls, [(["make", "verify"], 300)])
+        self.assertEqual(runner.created, self.workspace_dir)
+        self.assertEqual(runner.destroy_count, 1)
 
-    @patch("orchestrator.nodes.subprocess.run")
-    def test_verify_node_failure_retry(self, mock_subprocess_run):
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_verify_node_failure_retry(self, mock_get_runner):
         """Test verification failure with retry: increments attempts, saves feedback, transitions to executing."""
-        mock_res = unittest.mock.MagicMock()
-        mock_res.returncode = 1
-        mock_res.stdout = b"AssertionError: 1 != 2"
-        mock_subprocess_run.return_value = mock_res
+        mock_get_runner.return_value = _verify_runner_stub(
+            [_verify_exec_result(1, "AssertionError: 1 != 2")]
+        )
 
         # Setup initial state
         state = DEFAULT_STATE.copy()
@@ -1338,13 +1381,12 @@ class TestVerifyNode(unittest.TestCase):
         self.assertEqual(new_state["attempts"]["verify_cmd"], 2)
         self.assertEqual(new_state["feedback"], "AssertionError: 1 != 2")
 
-    @patch("orchestrator.nodes.subprocess.run")
-    def test_verify_node_failure_max_retries(self, mock_subprocess_run):
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_verify_node_failure_max_retries(self, mock_get_runner):
         """Test verification failure exceeding max retries: status transitions to failed."""
-        mock_res = unittest.mock.MagicMock()
-        mock_res.returncode = 1
-        mock_res.stdout = b"AssertionError: 1 != 2"
-        mock_subprocess_run.return_value = mock_res
+        mock_get_runner.return_value = _verify_runner_stub(
+            [_verify_exec_result(1, "AssertionError: 1 != 2")]
+        )
 
         # Setup initial state at 2 attempts
         state = DEFAULT_STATE.copy()
@@ -1361,13 +1403,18 @@ class TestVerifyNode(unittest.TestCase):
         self.assertEqual(new_state["attempts"]["verify_cmd"], 3)
         self.assertEqual(new_state["feedback"], "AssertionError: 1 != 2")
 
-    @patch("orchestrator.nodes.subprocess.run")
-    def test_verify_node_timeout(self, mock_subprocess_run):
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_verify_node_timeout(self, mock_get_runner):
         """Test verification command timing out: captures timeout error, increments attempts."""
-        import subprocess
-
-        mock_subprocess_run.side_effect = subprocess.TimeoutExpired(
-            cmd=["make", "verify"], timeout=300, output=b"Starting tests...\n"
+        mock_get_runner.return_value = _verify_runner_stub(
+            [
+                SandboxExecResult(
+                    exit_code=-1,
+                    output="Starting tests...\n",
+                    timed_out=True,
+                    duration_seconds=300.0,
+                )
+            ]
         )
 
         # Setup initial state
@@ -1384,15 +1431,14 @@ class TestVerifyNode(unittest.TestCase):
         self.assertIn("timed out after 300 seconds", new_state["feedback"])
         self.assertIn("Starting tests...", new_state["feedback"])
 
-    @patch("orchestrator.nodes.subprocess.run")
-    def test_verify_node_large_output_under_line_limit(self, mock_subprocess_run):
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_verify_node_large_output_under_line_limit(self, mock_get_runner):
         """Test that verify_node correctly truncates output exceeding 10 KB even if it is under the line limit."""
         # Create a single extremely long line of 12 KB
         large_content = "A" * 12000
-        mock_res = unittest.mock.MagicMock()
-        mock_res.returncode = 1
-        mock_res.stdout = large_content.encode("utf-8")
-        mock_subprocess_run.return_value = mock_res
+        mock_get_runner.return_value = _verify_runner_stub(
+            [_verify_exec_result(1, large_content)]
+        )
 
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -1405,6 +1451,98 @@ class TestVerifyNode(unittest.TestCase):
         feedback_bytes = new_state["feedback"].encode("utf-8")
         self.assertTrue(len(feedback_bytes) <= 10240)
         self.assertIn("exceeded 10 KB limit", new_state["feedback"])
+
+
+class TestVerifyNodeSandboxFailClosed(unittest.TestCase):
+    """Issue #159: the Verify phase runs inside the Execution Sandbox and
+    fails closed. Sandbox infrastructure failures route to Recovery
+    (ADR-0038) WITHOUT consuming the make-verify retry budget — they are not
+    verification failures — and there is NO host-side execution path.
+    """
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+            "AGENT_VERIFY_COMMAND": None,
+            "AGENT_SANDBOX_BACKEND": None,
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def tearDown(self):
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    def _state(self):
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 11
+        state_module.save(state)
+        return state
+
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_sandbox_infra_failure_records_and_returns_without_retry_budget(
+        self, mock_get_runner
+    ):
+        runner = _verify_runner_stub(
+            [SandboxUnavailableError("docker daemon unreachable")]
+        )
+        mock_get_runner.return_value = runner
+
+        new_state = verify_node(self._state())
+
+        # ADR-0038 record-and-return into Recovery.
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(new_state["phase"], "verifying")
+        self.assertIn("verify: ", new_state["error"] or "")
+        # Infrastructure is NOT a verification failure: the retry budget is
+        # untouched, so Recovery doesn't burn a make-verify attempt.
+        self.assertNotIn("verify_cmd", new_state["attempts"])
+        self.assertIsNone(new_state["feedback"])
+        # The runner lifecycle completed even on the failure path.
+        self.assertEqual(runner.destroy_count, 1)
+
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_unexpected_node_error_still_records_and_returns(self, mock_get_runner):
+        runner = _verify_runner_stub([RuntimeError("unexpected runner bug")])
+        mock_get_runner.return_value = runner
+
+        new_state = verify_node(self._state())
+
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("verify: unexpected runner bug", new_state["error"] or "")
+        self.assertNotIn("verify_cmd", new_state["attempts"])
+
+    def test_unsupported_backend_fails_closed_without_any_execution(self):
+        # AGENT_SANDBOX_BACKEND=host is not implemented in this slice: the
+        # real factory must reject it BEFORE any execution, and neither the
+        # docker CLI nor a host-side subprocess may be invoked (fail closed).
+        os.environ["AGENT_SANDBOX_BACKEND"] = "host"
+        with patch("orchestrator.sandbox.subprocess.run") as mock_docker_run:
+            new_state = verify_node(self._state())
+
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIn("verify: ", new_state["error"] or "")
+        self.assertIn("no host-side fallback", new_state["error"] or "")
+        self.assertNotIn("verify_cmd", new_state["attempts"])
+        # No sandbox runtime call and no host-side verify execution happened.
+        mock_docker_run.assert_not_called()
 
 
 def _make_bineval_check(check_id, dimension, description, passed, reasoning="ok"):
@@ -1489,11 +1627,9 @@ class TestBinEvalPhase(unittest.TestCase):
         state_module.save(state)
         return state
 
-    def _mock_make_verify_pass(self):
-        mock_res = unittest.mock.MagicMock()
-        mock_res.returncode = 0
-        mock_res.stdout = b"All tests passed."
-        return mock_res
+    def _make_verify_pass_runner(self):
+        """A stub sandbox runner whose exec reports a green make-verify."""
+        return _make_verify_pass_runner()
 
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
@@ -1501,11 +1637,11 @@ class TestBinEvalPhase(unittest.TestCase):
         "orchestrator.nodes._get_workspace_diff",
         return_value="diff --git a/f.py b/f.py\n+pass",
     )
-    @patch("orchestrator.nodes.subprocess.run")
-    def test_bineval_pass_resets_attempts(self, mock_run, _diff, mock_gh, _adrs):
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_bineval_pass_resets_attempts(self, mock_get_runner, _diff, mock_gh, _adrs):
         from orchestrator.nodes import verify_node
 
-        mock_run.return_value = self._mock_make_verify_pass()
+        mock_get_runner.return_value = self._make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
         with patch("orchestrator.nodes._run_bineval", return_value=_all_pass_result()):
             state = self._state(bineval=2)
@@ -1518,13 +1654,13 @@ class TestBinEvalPhase(unittest.TestCase):
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     def test_bineval_fail_retries_with_structured_feedback(
-        self, mock_run, _diff, mock_gh, _adrs
+        self, mock_get_runner, _diff, mock_gh, _adrs
     ):
         from orchestrator.nodes import verify_node
 
-        mock_run.return_value = self._mock_make_verify_pass()
+        mock_get_runner.return_value = self._make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
         fail = _result_with_fail(
             "2.1",
@@ -1545,13 +1681,13 @@ class TestBinEvalPhase(unittest.TestCase):
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     def test_bineval_fail_exhaustion_transitions_failed(
-        self, mock_run, _diff, mock_gh, _adrs
+        self, mock_get_runner, _diff, mock_gh, _adrs
     ):
         from orchestrator.nodes import verify_node
 
-        mock_run.return_value = self._mock_make_verify_pass()
+        mock_get_runner.return_value = self._make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
         fail = _result_with_fail(
             "4.2", "Robustness", "No regression risk", "removes safety check"
@@ -1567,11 +1703,13 @@ class TestBinEvalPhase(unittest.TestCase):
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
-    @patch("orchestrator.nodes.subprocess.run")
-    def test_bineval_llm_failure_treated_as_pass(self, mock_run, _diff, mock_gh, _adrs):
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_bineval_llm_failure_treated_as_pass(
+        self, mock_get_runner, _diff, mock_gh, _adrs
+    ):
         from orchestrator.nodes import verify_node
 
-        mock_run.return_value = self._mock_make_verify_pass()
+        mock_get_runner.return_value = self._make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
         with patch("orchestrator.nodes._run_bineval", return_value=None):
             state = self._state(bineval=1)
@@ -1582,11 +1720,11 @@ class TestBinEvalPhase(unittest.TestCase):
 
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="")
-    @patch("orchestrator.nodes.subprocess.run")
-    def test_bineval_skipped_on_empty_diff(self, mock_run, _diff, mock_gh):
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_bineval_skipped_on_empty_diff(self, mock_get_runner, _diff, mock_gh):
         from orchestrator.nodes import verify_node
 
-        mock_run.return_value = self._mock_make_verify_pass()
+        mock_get_runner.return_value = self._make_verify_pass_runner()
         state = self._state(bineval=2)
         new_state = verify_node(state)
         # Empty diff -> skip BinEval -> PASS path -> reset + PR transition.
@@ -1598,8 +1736,10 @@ class TestBinEvalPhase(unittest.TestCase):
 
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
-    @patch("orchestrator.nodes.subprocess.run")
-    def test_bineval_phase_enriches_diff_before_grading(self, mock_run, mock_gh, _adrs):
+    @patch("orchestrator.nodes.get_sandbox_runner")
+    def test_bineval_phase_enriches_diff_before_grading(
+        self, mock_get_runner, mock_gh, _adrs
+    ):
         """AC: _run_bineval_phase enriches the diff with function context."""
         from orchestrator.nodes import verify_node
 
@@ -1608,7 +1748,7 @@ class TestBinEvalPhase(unittest.TestCase):
             "def my_func():\n    return 42\n", encoding="utf-8"
         )
 
-        mock_run.return_value = self._mock_make_verify_pass()
+        mock_get_runner.return_value = self._make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
 
         # Return a diff that references the workspace file
@@ -1654,9 +1794,9 @@ class TestBinEvalPhase(unittest.TestCase):
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     def test_bineval_not_starved_by_make_verify_failures(
-        self, mock_run, _diff, mock_gh, _adrs
+        self, mock_get_runner, _diff, mock_gh, _adrs
     ):
         """AC1 (issue #123): a BinEval FAIL after >=1 prior make-verify failures
         leaves at least one retry that injects BinEval structured feedback.
@@ -1669,9 +1809,15 @@ class TestBinEvalPhase(unittest.TestCase):
         """
         from orchestrator.nodes import verify_node
 
-        fail_res = unittest.mock.MagicMock(returncode=1, stdout=b"make: *** No rule")
-        pass_res = self._mock_make_verify_pass()
-        mock_run.side_effect = [fail_res, fail_res, pass_res]
+        fail_res = SandboxExecResult(
+            exit_code=1, output="make: *** No rule", duration_seconds=0.1
+        )
+        pass_res = SandboxExecResult(
+            exit_code=0, output="All tests passed.", duration_seconds=0.1
+        )
+        mock_get_runner.return_value = _verify_runner_stub(
+            [fail_res, fail_res, pass_res]
+        )
         mock_gh.return_value = {"body": "issue body"}
         fail = _result_with_fail(
             "2.1", "Simplicity", "No unnecessary abstraction", "speculative iface"
@@ -1702,9 +1848,9 @@ class TestBinEvalPhase(unittest.TestCase):
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     def test_mixed_sequence_counters_independent_and_bounded(
-        self, mock_run, _diff, mock_gh, _adrs
+        self, mock_get_runner, _diff, mock_gh, _adrs
     ):
         """Edge case (issue #123): a mixed verify-fail / bineval-fail sequence
         increments each gate's counter independently, and the total stays
@@ -1713,10 +1859,16 @@ class TestBinEvalPhase(unittest.TestCase):
         """
         from orchestrator.nodes import verify_node
 
-        fail_res = unittest.mock.MagicMock(returncode=1, stdout=b"AssertionError")
-        pass_res = self._mock_make_verify_pass()
+        fail_res = SandboxExecResult(
+            exit_code=1, output="AssertionError", duration_seconds=0.1
+        )
+        pass_res = SandboxExecResult(
+            exit_code=0, output="All tests passed.", duration_seconds=0.1
+        )
         # Sequence: vf, vp(bf), vf, vf  -> verify_cmd 1,2,3 (failed); bineval 1.
-        mock_run.side_effect = [fail_res, pass_res, fail_res, fail_res]
+        mock_get_runner.return_value = _verify_runner_stub(
+            [fail_res, pass_res, fail_res, fail_res]
+        )
         mock_gh.return_value = {"body": "issue body"}
         bineval_fail = _result_with_fail(
             "4.2", "Robustness", "No regression risk", "removes safety check"
@@ -2414,16 +2566,20 @@ class TestBinEvalLengthErrorRetryPhase(unittest.TestCase):
         "orchestrator.nodes._get_workspace_diff",
         return_value="diff --git a/f.py b/f.py\n+pass",
     )
-    @patch("orchestrator.nodes.subprocess.run")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     def test_persistent_length_error_degrades_pass_without_semantic_attempt(
-        self, mock_run, _diff, mock_gh, mock_get_llm, mock_resolve, _adrs, _rubric
+        self,
+        mock_get_runner,
+        _diff,
+        mock_gh,
+        mock_get_llm,
+        mock_resolve,
+        _adrs,
+        _rubric,
     ):
         from orchestrator.nodes import verify_node
 
-        mock_res = unittest.mock.MagicMock()
-        mock_res.returncode = 0
-        mock_res.stdout = b"All tests passed."
-        mock_run.return_value = mock_res
+        mock_get_runner.return_value = _make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
         mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
         llm = unittest.mock.MagicMock()
@@ -5900,7 +6056,6 @@ class TestRecoveryOnException(unittest.TestCase):
             "GITHUB_WORKSPACE": str(self.workspace_dir),
             "AGENT_LOG_PATH": str(self.logs_dir),
             "GITHUB_REPOSITORY": "owner/repo",
-            "AGENT_VERIFY_COMMAND": "definitely-not-a-real-binary-xyz",
         }.items():
             self.original_env[k] = os.environ.get(k)
             os.environ[k] = v
@@ -5942,8 +6097,9 @@ class TestRecoveryOnException(unittest.TestCase):
 
     @patch("orchestrator.nodes._remove_label")
     @patch("orchestrator.nodes._add_label")
+    @patch("orchestrator.nodes.get_sandbox_runner")
     def test_verify_exception_routes_to_recovery(
-        self, mock_add_label, mock_remove_label
+        self, mock_get_runner, mock_add_label, mock_remove_label
     ):
         from orchestrator.nodes import recovery_node, verify_node
 
@@ -5953,10 +6109,13 @@ class TestRecoveryOnException(unittest.TestCase):
         mock_remove_label.side_effect = lambda repo, num, label: (
             self.labels_removed.append(label)
         )
-        # Inject an exception inside verify_node's try block: a nonexistent
-        # verify command makes subprocess.run raise FileNotFoundError (a genuine
-        # exception, not a non-zero exit), taking the ADR-0038 recovery path.
-        # (AGENT_VERIFY_COMMAND is set in setUp and restored in tearDown.)
+        # Inject an exception inside verify_node's try block: an unreachable
+        # sandbox runtime makes the runner raise SandboxUnavailableError (a
+        # genuine infrastructure exception, not a non-zero exit), taking the
+        # ADR-0038 recovery path.
+        mock_get_runner.return_value = _verify_runner_stub(
+            [SandboxUnavailableError("docker daemon unreachable (test injection)")]
+        )
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 42
         state["branch"] = "feat/issue-42"
@@ -5970,6 +6129,9 @@ class TestRecoveryOnException(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["phase"], "verifying")
         self.assertIn("verify: ", failed["error"] or "")
+        # Sandbox infrastructure is NOT a verification failure: the make-verify
+        # retry budget is untouched (issue #159 edge case).
+        self.assertNotIn("verify_cmd", failed["attempts"])
 
         # 2. Hand the failed state to recovery_node (the failed->recovery edge
         #    is wired in graph.py); assert cleanup + label restoration.

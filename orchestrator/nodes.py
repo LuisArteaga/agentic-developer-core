@@ -38,6 +38,7 @@ from orchestrator.outline import (
     build_outlines_for_files,
 )
 from orchestrator.path_safety import is_safe_path
+from orchestrator.sandbox import SandboxError, SandboxRunner, get_sandbox_runner
 from orchestrator.snapshot import build_directory_tree
 from orchestrator.state import AgentState
 from orchestrator.tools import _truncate_output
@@ -1415,13 +1416,17 @@ def _bineval_failed_feedback(result: BinEvalResult) -> str:
 
 
 def verify_node(state: AgentState) -> AgentState:
-    """Runs verification tests in a subprocess and manages the retry/feedback loop.
+    """Runs verification inside the Execution Sandbox and manages the retry/feedback loop.
 
-    Tracks make-verify retries in the state's 'attempts' dictionary under the
-    'verify_cmd' key (maximum VERIFY_MAX_ATTEMPTS retries, ADR-0047). The BinEval
-    soft gate, run after make-verify passes, tracks its own independent budget
-    under 'bineval'. If verification fails, captures the truncated test output and
-    transitions back to executing. If retries are exhausted, transitions to failed.
+    The deterministic gate (``AGENT_VERIFY_COMMAND``, default ``make verify``)
+    executes inside the Execution Sandbox (ADR-0056, FR-1/FR-2) — never on the
+    host (fail closed; runner failures route to Recovery per ADR-0038 without
+    consuming the make-verify retry budget). Tracks make-verify retries in the
+    state's 'attempts' dictionary under the 'verify_cmd' key (maximum
+    VERIFY_MAX_ATTEMPTS retries, ADR-0047). The BinEval soft gate, run after
+    verification passes, tracks its own independent budget under 'bineval'. If
+    verification fails, captures the truncated test output and transitions
+    back to executing. If retries are exhausted, transitions to failed.
     """
     issue_num = state.get("issue_number")
     if issue_num is None:
@@ -1449,23 +1454,29 @@ def verify_node(state: AgentState) -> AgentState:
 
     _safe_telemetry(start_orchestrator_phase, "verify")
 
+    # Execute the deterministic gate inside the Execution Sandbox (ADR-0056,
+    # FR-1/FR-2). There is no host-side path: runner infrastructure failures
+    # are recorded-and-returned (ADR-0038) into Recovery WITHOUT consuming
+    # the make-verify retry budget — they are infrastructure, not verification
+    # failures.
+    runner: SandboxRunner | None = None
     try:
-        logger.info("Running verification command: %s", verify_cmd)
-        result = subprocess.run(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=workspace_path,
-            timeout=timeout,
-            shell=False,
+        runner = get_sandbox_runner()
+        runner.create(workspace_path)
+        logger.info("Running verification command in Execution Sandbox: %s", verify_cmd)
+        exec_result = runner.exec(args, timeout=timeout)
+    except SandboxError as e:
+        logger.error(
+            "Execution Sandbox infrastructure failure (routing to Recovery; "
+            "NOT counted as a make-verify retry): %s",
+            e,
         )
-        output_bytes = result.stdout
-        exit_code = result.returncode
-        timed_out = False
-    except subprocess.TimeoutExpired as e:
-        output_bytes = e.stdout or b""
-        exit_code = -1
-        timed_out = True
+        state["status"] = "failed"
+        state["phase"] = "verifying"
+        state["error"] = f"verify: {e}"
+        state_module.save(state)
+        _safe_telemetry(end_orchestrator_phase, exit_code=1)
+        return state
     except Exception as e:
         logger.exception("Failed to execute verification command '%s'", verify_cmd)
         state["status"] = "failed"
@@ -1474,8 +1485,13 @@ def verify_node(state: AgentState) -> AgentState:
         state_module.save(state)
         _safe_telemetry(end_orchestrator_phase, exit_code=1)
         return state
+    finally:
+        if runner is not None:
+            runner.destroy()
 
-    raw_output = output_bytes.decode("utf-8", errors="replace")
+    exit_code = exec_result.exit_code
+    timed_out = exec_result.timed_out
+    raw_output = exec_result.output
     if timed_out:
         raw_output = f"Error: Command '{verify_cmd}' timed out after {timeout} seconds.\nOutput captured before timeout:\n{raw_output}"
     output = _truncate_output(raw_output)
