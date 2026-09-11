@@ -1,8 +1,12 @@
 [project]
 name = "agentic-developer-core"
 version = "0.1.0"
-description = "Add your description here"
+description = "Autonomous software engineer agent — a pure-Python LangGraph Orchestrator that turns GitHub issues into merged PRs with test-first execution, stateful resume, and LLM quality gates"
 readme = "README.md"
+license = {text = "MIT"}
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+]
 requires-python = ">=3.12"
 dependencies = [
     "langchain>=1.0.0",
