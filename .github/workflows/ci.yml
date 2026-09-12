@@ -1,11 +1,13 @@
 name: CI
 
-# Thin self-caller: this repository's own pull requests run the reusable
-# pr-checks workflow with the inputs that reproduce its historical native
-# behavior (see ADR-0057 for why the workflow is pure-reusable).
-#
-# `secrets: inherit` forwards the repo-level OPENROUTER_API_KEY / GH_PAT used
-# by the judge review step.
+# This repository dogfoods its own extracted quality-gates-toolkit
+# (ADR-0059): a single caller job delegates every deterministic gate and the
+# LLM judges to the toolkit's per-language Python composite (toolkit D-0020)
+# pinned to the immutable release tag (toolkit D-0007) — a Python-only
+# caller has no Skipped check entries by construction. The toolkit ships no
+# ruff hook / no ruff gate by design (toolkit D-0016) — the ruff version
+# lives in .pre-commit-config.yaml, whose toolkit `rev` must equal this
+# file's tag (contract test: scripts/test_ci_workflow_contract.py).
 
 on:
   pull_request:
@@ -13,19 +15,37 @@ on:
 
 jobs:
   ci:
-    uses: ./.github/workflows/pr-checks.yml
-    secrets: inherit
+    uses: LuisArteaga/quality-gates-toolkit/.github/workflows/python-checks.yml@v1.7.0
     permissions:
       contents: read
+      # Required: the composite declares an llmreview job requesting
+      # pull-requests: write; without the grant the run dies as
+      # startup_failure (permission escalation is validated statically,
+      # observed on ot-telemetry-engine PR #62).
+      pull-requests: write
     with:
       python-version: "3.12"
       lint-paths: "orchestrator scripts"
       cov-paths: "orchestrator scripts"
       coverage-floor: 89
+      extra-pip-packages: opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp openinference-semantic-conventions
       prefetch-tree-sitter: true
-      enable-secret-scan-script: true
+      enable-lint: true
+      enable-test: true
+      enable-security: true
+      enable-secret-scan: true
       enable-semgrep: true
       enable-pip-audit: true
-      enable-gitleaks: false
       enable-diff-gate: true
       enable-llm-review: true
+      config-path: "config/factory.json"
+      diff-exclude: "uv.lock"
+    secrets:
+      # Explicit name mapping — `secrets: inherit` does NOT map the repo
+      # secret GH_PAT onto the composite's judge-token input (secrets are
+      # matched by name). A judge-token left empty falls back to
+      # github.token, posts reviews as github-actions[bot], and the
+      # merge gate's trusted-identity check (ADR-0014) silently ignores
+      # every verdict.
+      openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+      judge-token: ${{ secrets.GH_PAT }}

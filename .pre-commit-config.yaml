@@ -1,34 +1,22 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.3.0
+    # Lockstep with the toolkit lint.yml RUFF_VERSION pin.
+    rev: v0.16.6
     hooks:
       - id: ruff
-        args: [ --fix ]
+        args: [--fix]
       - id: ruff-format
 
-  - repo: local
+  - repo: https://github.com/LuisArteaga/quality-gates-toolkit
+    # Immutable release tag (toolkit D-0007) — never a floating ref. Lockstep
+    # with the ci.yml composite tag (contract test: single source of truth).
+    rev: v1.7.0
     hooks:
       - id: secret-scan
-        name: Secret Scan (Local)
-        entry: python3 scripts/secret_scan.py --staged
-        language: system
-        pass_filenames: false
       - id: mypy
-        name: Mypy (Local)
-        entry: .venv/bin/mypy orchestrator scripts
-        language: script
-        pass_filenames: false
-
-  - repo: https://github.com/semgrep/semgrep
-    rev: v1.65.0
-    hooks:
+        args: ["orchestrator", "scripts"]
       - id: semgrep
-        name: Semgrep (Fast Local Scan)
         args: ['--config=p/security-audit', '--jobs=0', '--skip-unknown-extensions', '--quiet']
         types_or: [python, json, yaml]
-
-  - repo: https://github.com/pypa/pip-audit
-    rev: v2.10.1
-    hooks:
       - id: pip-audit
         args: ["."]

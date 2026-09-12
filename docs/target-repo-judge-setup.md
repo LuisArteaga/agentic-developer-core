@@ -8,6 +8,16 @@ target-repo PRs never receive a verdict and the Merge-Node times out. This
 guide wires the judges into a target repository via the **reusable workflow**
 defined at `.github/workflows/llm-pr-review.yml` ([ADR-0050](./adr/0050-reusable-workflow-for-target-repo-pr-review-judges.md))).
 
+> **Note (2026-09-12, ADR-0059):** the canonical judge and deterministic-gate
+> provider is now the public
+> [quality-gates-toolkit](https://github.com/LuisArteaga/quality-gates-toolkit)
+> — new target repositories should call
+> `LuisArteaga/quality-gates-toolkit/.github/workflows/pr-checks.yml@<tag>`
+> with `enable-llm-review: true` instead of the orchestrator's retired local
+> workflow. The verdict-block protocol (ADR-0019) and trusted-identity
+> semantics (ADR-0014) are unchanged. The instructions below remain as the
+> historical orchestrator-workflow setup.
+
 ## How it works
 
 1. The target repository adds a small *caller* workflow that triggers on

@@ -1,6 +1,11 @@
 # ADR 0050: Reusable GitHub Actions Workflow for Target-Repository PR Review Judges
 
-* **Status**: Accepted
+* **Status**: Accepted — Superseded for the origin repository by
+  [ADR-0059](./0059-adopt-quality-gates-toolkit-canonical-quality-gates.md)
+  (amendment dated 2026-09-12): the reusable judge workflow remains the
+  delivery mechanism, but it is now provided and consumed via the
+  quality-gates-toolkit; the origin-repo copy
+  `.github/workflows/llm-pr-review.yml` was retired.
 * **Date**: 2026-07-14
 * **Deciders**: Luis Arteaga & The Architect
 

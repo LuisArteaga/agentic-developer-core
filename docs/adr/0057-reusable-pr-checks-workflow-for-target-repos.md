@@ -1,6 +1,9 @@
 # ADR 0057: Reusable PR Checks Workflow for Target Repositories
 
-* **Status**: Proposed
+* **Status**: Superseded by
+  [ADR-0059](./0059-adopt-quality-gates-toolkit-canonical-quality-gates.md)
+  (amendment dated 2026-09-12): `.github/workflows/pr-checks.yml` was
+  retired in favor of the quality-gates-toolkit composite.
 * **Date**: 2026-08-26
 * **Deciders**: Luis Arteaga & The Architect
 

@@ -6069,6 +6069,92 @@ class TestMergeNodeCheckRunFailFast(unittest.TestCase):
 
             self.assertEqual(new_state["status"], "failed")
 
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_toolkit_composite_judge_check_escalates_without_budget(
+        self, mock_api, mock_commit_time
+    ):
+        """The toolkit composite's judge check name routes to escalation.
+
+        After ADR-0059 the judge check renders from the toolkit composite
+        as a nested-workflow name (``ci / llmreview / llm-pr-review``); the
+        default fragment must still classify it as judge infrastructure —
+        observed through the merge node: failed status, zero merge-fix
+        budget consumed.
+        """
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}}
+        ]
+        check_pages = [
+            {
+                "total_count": 1,
+                "check_runs": [
+                    self._check_run(
+                        "ci / llmreview / llm-pr-review",
+                        "timed_out",
+                        title="Judge workflow timed out",
+                        summary="Judge infrastructure failure.",
+                    )
+                ],
+            }
+        ]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+        )
+
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIsNone(new_state["attempts"].get("merge"))
+        assert new_state["feedback"] is not None
+        self.assertIn("escalated without consuming", new_state["feedback"])
+        self.assertIn("llm-pr-review", new_state["feedback"])
+
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_toolkit_per_gate_check_failure_routes_to_merge_fix(
+        self, mock_api, mock_commit_time
+    ):
+        """A failed toolkit per-gate check (e.g. ``ci / lint``) is fixable.
+
+        The per-gate deterministic check names introduced by the toolkit
+        composite must NOT match the judge fragment: a failing
+        ``ci / lint`` breaks the poll into the Merge-Fix Loop with
+        structured check feedback.
+        """
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}}
+        ]
+        check_pages = [
+            {
+                "total_count": 1,
+                "check_runs": [
+                    self._check_run(
+                        "ci / lint",
+                        "failure",
+                        title="ruff failed",
+                        summary="Lint gate failed.",
+                    )
+                ],
+            }
+        ]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+        )
+
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        self.assertEqual(new_state["attempts"].get("merge"), 1)
+        assert new_state["feedback"] is not None
+        self.assertIn("merge-fix attempt 1/", new_state["feedback"])
+        self.assertIn("ci / lint", new_state["feedback"])
+
 
 class TestRecoveryOnException(unittest.TestCase):
     """ADR-0038: a node exception is recorded (status=failed, return state) so
