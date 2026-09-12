@@ -2,6 +2,7 @@
 """Unit tests for the scripts/entrypoint.py process supervisor."""
 
 import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -427,6 +428,75 @@ class RunIterationSecurityBlockTests(unittest.TestCase):
         self.assertFalse(should_exit)
         self.assertIsNone(code)
         mock_sleep.assert_called_once_with(1.0)  # backoff, not poll_interval
+
+
+class PreflightSandboxRuntimeTests(unittest.TestCase):
+    """The supervisor's startup preflight (ADR-0056 FR-4, issue #161)."""
+
+    def setUp(self):
+        self.original_env = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.original_env)
+
+    def _completed(self, returncode, stderr=b""):
+        proc = MagicMock()
+        proc.returncode = returncode
+        proc.stderr = stderr
+        proc.stdout = b""
+        return proc
+
+    @patch("entrypoint.sys.exit")
+    @patch("entrypoint.subprocess.run")
+    def test_preflight_success_continues_startup(self, mock_run, mock_exit):
+        """Exit code 0 from the preflight module → startup proceeds."""
+        mock_run.return_value = self._completed(0)
+        entrypoint.preflight_sandbox_runtime()
+        mock_exit.assert_not_called()
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[-2:], ["-m", "orchestrator.preflight"])
+
+    @patch("entrypoint.sys.exit")
+    @patch("entrypoint.subprocess.run")
+    def test_preflight_failure_refuses_to_start(self, mock_run, mock_exit):
+        """Non-zero preflight exit → sys.exit(1) with the stderr surfaced."""
+        mock_exit.side_effect = SystemExit
+        mock_run.return_value = self._completed(
+            1, stderr=b"runsc is not registered with the Docker daemon"
+        )
+        with self.assertRaises(SystemExit):
+            entrypoint.preflight_sandbox_runtime()
+        mock_exit.assert_called_once_with(1)
+
+    @patch("entrypoint.sys.exit")
+    @patch("entrypoint.subprocess.run")
+    def test_preflight_subprocess_error_refuses_to_start(self, mock_run, mock_exit):
+        """A spawn/timeout failure also refuses to start (fail closed)."""
+        mock_exit.side_effect = SystemExit
+        mock_run.side_effect = subprocess.SubprocessError("timeout")
+        with self.assertRaises(SystemExit):
+            entrypoint.preflight_sandbox_runtime()
+        mock_exit.assert_called_once_with(1)
+
+    @patch("entrypoint.validate_environment")
+    @patch("entrypoint.verify_reachability")
+    @patch("entrypoint.preflight_sandbox_runtime")
+    @patch("entrypoint.run_iteration")
+    @patch("entrypoint.sys.exit")
+    def test_main_runs_preflight_at_startup(
+        self, mock_exit, mock_iteration, mock_preflight, mock_reach, mock_env
+    ):
+        """main() runs the sandbox preflight alongside the other startup
+        validations (issue constraint), before the supervisor loop."""
+        mock_exit.side_effect = SystemExit
+        mock_iteration.return_value = (0, True, 0)
+        with self.assertRaises(SystemExit):
+            entrypoint.main()
+        mock_env.assert_called_once()
+        mock_reach.assert_called_once()
+        mock_preflight.assert_called_once()
+        mock_iteration.assert_called_once()
 
 
 if __name__ == "__main__":

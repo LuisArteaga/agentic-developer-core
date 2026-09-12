@@ -43,6 +43,15 @@ unsupported ``AGENT_SANDBOX_BACKEND`` value raises ``SandboxConfigError``
 (the dev-only host backend of FR-9 is a separate follow-up slice). Runner
 infrastructure failures are caught by ``verify_node`` and routed into
 Recovery per ADR-0038 without consuming the make-verify retry budget.
+
+Runtime hardening (FR-4, issue #161): every sandbox container starts with
+an explicit ``--runtime`` flag (default ``runsc`` — the gVisor user-space
+kernel). The configured runtime is resolved by ``resolve_sandbox_runtime``;
+``AGENT_SANDBOX_RUNTIME=runc`` is the explicit, loudly-warned dev-only
+override that trades gVisor isolation for shared-kernel containers. Startup
+preflight lives in ``orchestrator.preflight`` (verifies daemon, kernel,
+binary and daemon-side runtime registration before the first cycle and is
+wired into the Process Supervisor's validation phase — fail closed).
 """
 
 import json
@@ -64,6 +73,14 @@ DEFAULT_SANDBOX_IMAGE = "python:3.12"
 DEFAULT_SANDBOX_CPUS = "2"
 DEFAULT_SANDBOX_MEMORY = "4g"
 DEFAULT_SANDBOX_PIDS_LIMIT = "512"
+
+# Container runtime for sandbox containers (FR-4, issue #161). The default
+# ``runsc`` (gVisor user-space kernel) is a hard requirement: when it is not
+# available the preflight refuses to start the orchestrator instead of
+# silently degrading to shared-kernel containers. ``runc`` is the explicit
+# dev-only override (loud warning, documented trade-off) — never a default.
+DEFAULT_SANDBOX_RUNTIME = "runsc"
+SANDBOX_RUNTIME_OVERRIDE = "runc"
 
 # Credential env var names that must NEVER be requested into a sandbox
 # environment (FR-6). This is not an env-construction mechanism (ADR-0043's
@@ -179,6 +196,39 @@ def _resolve_sandbox_caps() -> tuple[str, str, str]:
     return cpus, memory, pids_limit
 
 
+def resolve_sandbox_runtime() -> str:
+    """Resolve the container runtime for sandbox containers (FR-4, #161).
+
+    Default is ``runsc`` (gVisor): FR-4 requires every sandbox to start with
+    ``--runtime=runsc``, and an unavailable runtime must fail closed (the
+    startup preflight in ``orchestrator.preflight`` refuses to start the
+    orchestrator rather than silently degrading to shared-kernel isolation).
+
+    ``AGENT_SANDBOX_RUNTIME=runc`` is the explicit, loudly-warned dev-only
+    override for environments without gVisor (e.g. WSL2 development) — a
+    documented trade-off, never a default. Any other value (including a
+    blank one) is a loud ``SandboxConfigError``: ambiguity around the
+    isolation runtime is never resolved silently.
+    """
+    raw = os.getenv("AGENT_SANDBOX_RUNTIME", DEFAULT_SANDBOX_RUNTIME)
+    value = raw.strip().lower() if raw else ""
+    if value == DEFAULT_SANDBOX_RUNTIME:
+        return DEFAULT_SANDBOX_RUNTIME
+    if value == SANDBOX_RUNTIME_OVERRIDE:
+        logger.warning(
+            "SANDBOX RUNTIME OVERRIDE ACTIVE: AGENT_SANDBOX_RUNTIME=runc runs "
+            "sandboxes as shared-kernel containers WITHOUT gVisor isolation "
+            "(dev-only documented trade-off, ADR-0056 FR-4); never set this "
+            "in production"
+        )
+        return SANDBOX_RUNTIME_OVERRIDE
+    raise SandboxConfigError(
+        f"Unsupported AGENT_SANDBOX_RUNTIME {raw!r}: expected "
+        f"{DEFAULT_SANDBOX_RUNTIME!r} (default, gVisor isolation) or "
+        f"{SANDBOX_RUNTIME_OVERRIDE!r} (explicit dev-only override)"
+    )
+
+
 def get_sandbox_runner() -> SandboxRunner:
     """Return the configured sandbox backend (default: docker).
 
@@ -198,7 +248,11 @@ def get_sandbox_runner() -> SandboxRunner:
         image = DEFAULT_SANDBOX_IMAGE
     cpus, memory, pids_limit = _resolve_sandbox_caps()
     return DockerSandboxRunner(
-        image=image, cpus=cpus, memory=memory, pids_limit=pids_limit
+        image=image,
+        cpus=cpus,
+        memory=memory,
+        pids_limit=pids_limit,
+        runtime=resolve_sandbox_runtime(),
     )
 
 
@@ -215,11 +269,19 @@ class DockerSandboxRunner:
     _INSPECT_TIMEOUT = 30
     _REMOVE_TIMEOUT = 30
 
-    def __init__(self, image: str, cpus: str, memory: str, pids_limit: str):
+    def __init__(
+        self,
+        image: str,
+        cpus: str,
+        memory: str,
+        pids_limit: str,
+        runtime: str = DEFAULT_SANDBOX_RUNTIME,
+    ):
         self._image = image
         self._cpus = cpus
         self._memory = memory
         self._pids_limit = pids_limit
+        self._runtime = runtime
         self._workspace: Path | None = None
         self._containers: list[str] = []
 
@@ -273,6 +335,8 @@ class DockerSandboxRunner:
             self._memory,
             "--pids-limit",
             self._pids_limit,
+            "--runtime",
+            self._runtime,
             "-v",
             f"{self._workspace}:{SANDBOX_WORKSPACE_MOUNT}",
             "-w",

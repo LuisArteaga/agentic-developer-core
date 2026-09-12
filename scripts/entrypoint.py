@@ -150,6 +150,38 @@ def verify_reachability():
     log("All reachability checks passed successfully.")
 
 
+def preflight_sandbox_runtime():
+    """Verify the sandbox runtime before the first cycle (ADR-0056 FR-4, #161).
+
+    Runs ``python -m orchestrator.preflight`` as a subprocess — NOT an import:
+    the supervisor stays a zero-dependency process that never imports the
+    orchestrator package (ADR-0015); it merely spawns it, exactly like
+    ``run_iteration`` does. A non-zero exit (runtime missing, kernel too
+    old, runsc not registered with the daemon) refuses to start the
+    orchestrator: fail closed, never a silent degradation to shared-kernel
+    containers. ``AGENT_SANDBOX_RUNTIME=runc`` is honored as the explicit,
+    loudly-warned dev-only override.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "orchestrator.preflight"],
+            capture_output=True,
+            timeout=90,
+        )
+    except subprocess.SubprocessError as e:
+        log(f"Sandbox runtime preflight could not run: {e}", "ERROR")
+        sys.exit(1)
+    if proc.returncode != 0:
+        detail = (
+            (proc.stderr or proc.stdout or b"")
+            .decode("utf-8", errors="replace")
+            .strip()
+        )
+        log(f"Sandbox runtime preflight failed; refusing to start:\n{detail}", "ERROR")
+        sys.exit(1)
+    log("Sandbox runtime preflight passed (ADR-0056 FR-4).")
+
+
 def run_iteration(
     consecutive_crashes,
     run_once,
@@ -261,6 +293,7 @@ def run_iteration(
 def main():
     validate_environment()
     verify_reachability()
+    preflight_sandbox_runtime()
 
     initial_delay = 1.0
     max_delay = 60.0

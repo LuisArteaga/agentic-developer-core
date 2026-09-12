@@ -63,6 +63,11 @@ A compromised/prompt-injected Worker must be unable to reach:
 - Documented fallback posture if `runsc` is unavailable at startup: refuse to run
   (fail closed) rather than silently degrading to shared-kernel containers.
 
+Implemented by `orchestrator/preflight.py` (startup preflight, wired into the
+Process Supervisor's validation phase alongside reachability checks) and the
+`AGENT_SANDBOX_RUNTIME` selection in `orchestrator/sandbox.py` (issue #161);
+operational procedures: [runbook-sandbox-runtime.md](runbook-sandbox-runtime.md).
+
 ### FR-5 Egress lockdown
 
 - Default-deny network egress from sandboxes; explicit allowlist only:
