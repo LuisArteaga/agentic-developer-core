@@ -2,11 +2,12 @@ name: CI
 
 # This repository dogfoods its own extracted quality-gates-toolkit
 # (ADR-0059): a single caller job delegates every deterministic gate and the
-# LLM judges to the toolkit composite pinned to the immutable release tag
-# (toolkit D-0007). The toolkit ships no ruff hook / no ruff gate by design
-# (toolkit D-0016) — the ruff version lives in .pre-commit-config.yaml, whose
-# toolkit `rev` must equal this file's tag (contract test:
-# scripts/test_ci_workflow_contract.py).
+# LLM judges to the toolkit's per-language Python composite (toolkit D-0020)
+# pinned to the immutable release tag (toolkit D-0007) — a Python-only
+# caller has no Skipped check entries by construction. The toolkit ships no
+# ruff hook / no ruff gate by design (toolkit D-0016) — the ruff version
+# lives in .pre-commit-config.yaml, whose toolkit `rev` must equal this
+# file's tag (contract test: scripts/test_ci_workflow_contract.py).
 
 on:
   pull_request:
@@ -14,7 +15,7 @@ on:
 
 jobs:
   ci:
-    uses: LuisArteaga/quality-gates-toolkit/.github/workflows/pr-checks.yml@v1.6.0
+    uses: LuisArteaga/quality-gates-toolkit/.github/workflows/python-checks.yml@v1.7.0
     permissions:
       contents: read
       # Required: the composite declares an llmreview job requesting

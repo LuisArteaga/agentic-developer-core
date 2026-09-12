@@ -8,8 +8,9 @@ repos:
       - id: ruff-format
 
   - repo: https://github.com/LuisArteaga/quality-gates-toolkit
-    # Immutable release tag (toolkit D-0007) — never a floating ref.
-    rev: v1.6.0
+    # Immutable release tag (toolkit D-0007) — never a floating ref. Lockstep
+    # with the ci.yml composite tag (contract test: single source of truth).
+    rev: v1.7.0
     hooks:
       - id: secret-scan
       - id: mypy

@@ -38,18 +38,24 @@ immutable release tag `v1.6.0` (toolkit D-0007: never a floating ref).
    `scripts/secret_scan.py` STAYS for local runs / `make secret-scan`;
    only the pre-commit wiring moves.
 2. **CI** (`.github/workflows/ci.yml`): a single job calling
-   `LuisArteaga/quality-gates-toolkit/.github/workflows/pr-checks.yml@v1.6.0`
-   with the full documented input set (coverage floor 89, `orchestrator
-   scripts` paths, tree-sitter prefetch, otel extras, `diff-exclude:
-   uv.lock`) and `enable-llm-review: true` — the toolkit's serial cost gate
-   (D-0001) reproduces ADR-0020/ADR-0052 behavior parity. Explicit secrets
+   `LuisArteaga/quality-gates-toolkit/.github/workflows/python-checks.yml@v1.7.0`
+   — the per-language Python composite (toolkit D-0020), so a Python-only
+   caller has no `Skipped` check entries by construction (the polyglot
+   `pr-checks.yml` remains the toolkit's polyglot single-entry option).
+   The caller passes the full documented input set (coverage floor 89,
+   `orchestrator scripts` paths, tree-sitter prefetch, otel extras,
+   `diff-exclude: uv.lock`) and `enable-llm-review: true` — the toolkit's
+   serial cost gate (D-0001, restated inside the language composite)
+   reproduces ADR-0020/ADR-0052 behavior parity. Explicit secrets
    mapping: `judge-token: ${{ secrets.GH_PAT }}` — `secrets: inherit` maps
    by NAME only, and an empty judge-token silently degrades to
    `github.token` → `github-actions[bot]` authorship, which the merge
    gate's trusted-identity check (ADR-0014) ignores. The caller grants
    `pull-requests: write` (a called workflow may only narrow scopes; the
    composite's llmreview job requests it — escalation otherwise dies as
-   startup_failure).
+   startup_failure). The pre-commit toolkit `rev` equals the composite tag
+   (`v1.7.0`) — the single-source-of-truth lockstep pinned by the contract
+   test.
 3. **Retirement**: `.github/workflows/pr-checks.yml`,
    `.github/workflows/llm-pr-review.yml`, and their structure tests
    (`scripts/test_pr_checks_workflow.py`,
@@ -100,7 +106,8 @@ immutable release tag `v1.6.0` (toolkit D-0007: never a floating ref).
 * quality-gates-toolkit DECISIONS.md (D-0001 serial cost gate, D-0004
   neutral defaults, D-0007 immutable release tags, D-0014 pinned tool
   versions, D-0015 additive judge-config union, D-0016 hook ownership
-  split, D-0017 importable judge package, D-0019 Python gate contract) —
+  split, D-0017 importable judge package, D-0019 Python gate contract,
+  D-0020 per-language composite contract) —
   [DECISIONS.md at tag v1.6.0](https://github.com/LuisArteaga/quality-gates-toolkit/blob/v1.6.0/DECISIONS.md)
   (T2, accessed 2026-09-12, fetched via `gh api` and cross-read against
   the v1.6.0 workflow sources).
@@ -117,4 +124,10 @@ immutable release tag `v1.6.0` (toolkit D-0007: never a floating ref).
 * Composite input contract
   [pr-checks.yml at tag v1.6.0](https://github.com/LuisArteaga/quality-gates-toolkit/blob/v1.6.0/.github/workflows/pr-checks.yml)
   (T1 — canonical source artifact, accessed 2026-09-12, fetched and
-  input names/defaults verified verbatim against the caller in this PR).
+  input names/defaults verified verbatim against the caller; the caller
+  initially wired this polyglot composite).
+* Per-language composite contract (D-0020) and the Python entry point
+  [python-checks.yml at tag v1.7.0](https://github.com/LuisArteaga/quality-gates-toolkit/blob/v1.7.0/.github/workflows/python-checks.yml)
+  (T1 — canonical source artifact, accessed 2026-09-12, fetched and the
+  input set / `needs` chain / relative `uses` refs verified verbatim;
+  the caller targets this composite as the first consumer).
