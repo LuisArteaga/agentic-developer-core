@@ -97,12 +97,24 @@ immutable release tag `v1.6.0` (toolkit D-0007: never a floating ref).
 
 ## Inspiration & References
 
-* quality-gates-toolkit DECISIONS: D-0001 (serial cost gate), D-0004
-  (neutral defaults), D-0007 (immutable release tags), D-0014 (pinned
-  tool versions), D-0015 (additive judge-config union), D-0016 (hook
-  ownership split), D-0017 (importable judge package), D-0019 (Python gate
-  contract).
-* Consumer precedent: `ot-telemetry-engine` (toolkit `@v1.0.2`, bump to
-  v1.6.0 tracked as a follow-up issue in that repository).
-* Toolkit README "Pre-commit hook" and `.pre-commit-hooks.yaml` at v1.6.0
-  (hook ownership split and `language_version: python3.12` rationale).
+* quality-gates-toolkit DECISIONS.md (D-0001 serial cost gate, D-0004
+  neutral defaults, D-0007 immutable release tags, D-0014 pinned tool
+  versions, D-0015 additive judge-config union, D-0016 hook ownership
+  split, D-0017 importable judge package, D-0019 Python gate contract) —
+  [DECISIONS.md at tag v1.6.0](https://github.com/LuisArteaga/quality-gates-toolkit/blob/v1.6.0/DECISIONS.md)
+  (T2, accessed 2026-09-12, fetched via `gh api` and cross-read against
+  the v1.6.0 workflow sources).
+* Consumer precedent: `ot-telemetry-engine` CI calling
+  `quality-gates-toolkit/.github/workflows/pr-checks.yml@v1.0.2` —
+  [ot-telemetry-engine ci.yml](https://github.com/LuisArteaga/ot-telemetry-engine/blob/main/.github/workflows/ci.yml)
+  (T2 — first-hand internal repo, accessed 2026-09-12, verified by
+  reading the caller file; bump to v1.6.0 tracked as a follow-up issue
+  in that repository).
+* Toolkit README "Pre-commit hook" section and hook interface
+  [.pre-commit-hooks.yaml at tag v1.6.0](https://github.com/LuisArteaga/quality-gates-toolkit/blob/v1.6.0/.pre-commit-hooks.yaml)
+  (T1 — canonical source artifact, accessed 2026-09-12, fetched and
+  hook ids/`language_version` pins confirmed verbatim).
+* Composite input contract
+  [pr-checks.yml at tag v1.6.0](https://github.com/LuisArteaga/quality-gates-toolkit/blob/v1.6.0/.github/workflows/pr-checks.yml)
+  (T1 — canonical source artifact, accessed 2026-09-12, fetched and
+  input names/defaults verified verbatim against the caller in this PR).
