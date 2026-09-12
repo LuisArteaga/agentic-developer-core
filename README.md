@@ -38,6 +38,10 @@ The Orchestrator runs a **phased LangGraph state machine** (not a free-form ReAc
 
 All failures route to **recovery**, which cleans up and re-queues the issue as `agent-ready`.
 
+## Diagrams
+
+[docs/diagrams/](docs/diagrams/index.md) documents the system as Mermaid.js diagrams (rendered natively by GitHub): the [setup flow](docs/diagrams/setup.md), the [usage process](docs/diagrams/process.md), the coarse [architecture overview](docs/diagrams/architecture-overview.md), and focused views of the [worker reasoning budget](docs/diagrams/detailed-worker-budget.md), [retry & workspace state](docs/diagrams/detailed-retry-workspace.md), the [telemetry pipeline](docs/diagrams/detailed-telemetry.md), and [PR judge review](docs/diagrams/detailed-judge-review.md).
+
 ## The autonomous loop
 
 The graph is compiled in [`orchestrator/graph.py`](orchestrator/graph.py); nodes live in [`orchestrator/nodes.py`](orchestrator/nodes.py).
