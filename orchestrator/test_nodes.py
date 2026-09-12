@@ -6069,45 +6069,91 @@ class TestMergeNodeCheckRunFailFast(unittest.TestCase):
 
             self.assertEqual(new_state["status"], "failed")
 
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_toolkit_composite_judge_check_escalates_without_budget(
+        self, mock_api, mock_commit_time
+    ):
+        """The toolkit composite's judge check name routes to escalation.
 
-class TestEvaluateCheckFailuresToolkitCheckNames(unittest.TestCase):
-    """Judge-fragment matching against the toolkit composite check names.
+        After ADR-0059 the judge check renders from the toolkit composite
+        as a nested-workflow name (``ci / llmreview / llm-pr-review``); the
+        default fragment must still classify it as judge infrastructure —
+        observed through the merge node: failed status, zero merge-fix
+        budget consumed.
+        """
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}}
+        ]
+        check_pages = [
+            {
+                "total_count": 1,
+                "check_runs": [
+                    self._check_run(
+                        "ci / llmreview / llm-pr-review",
+                        "timed_out",
+                        title="Judge workflow timed out",
+                        summary="Judge infrastructure failure.",
+                    )
+                ],
+            }
+        ]
 
-    After ADR-0059 the judge check renders from the toolkit composite as a
-    nested-workflow name containing ``llm-pr-review`` (e.g.
-    ``ci / llmreview / llm-pr-review``); the default fragment must still
-    classify it as judge infrastructure, and the per-gate deterministic
-    names (``ci / lint`` etc.) must stay fixable.
-    """
-
-    def _run(self, name):
-        return nodes_module._evaluate_check_failures(
-            [
-                {
-                    "name": name,
-                    "conclusion": "failure",
-                    "output": {"title": "t", "summary": "s"},
-                    "completed_at": "2026-01-01T00:00:00Z",
-                }
-            ],
-            nodes_module._DEFAULT_JUDGE_CHECK_FRAGMENTS,
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
         )
 
-    def test_toolkit_composite_judge_check_is_infra(self):
-        fixable, infra = self._run("ci / llmreview / llm-pr-review")
-        self.assertEqual(len(infra), 1)
-        self.assertEqual(fixable, [])
+        self.assertEqual(new_state["status"], "failed")
+        self.assertIsNone(new_state["attempts"].get("merge"))
+        assert new_state["feedback"] is not None
+        self.assertIn("escalated without consuming", new_state["feedback"])
+        self.assertIn("llm-pr-review", new_state["feedback"])
 
-    def test_toolkit_per_gate_checks_are_fixable(self):
-        for name in ("ci / lint", "ci / test", "ci / security", "ci / diffcoverage"):
-            fixable, infra = self._run(name)
-            self.assertEqual(len(fixable), 1)
-            self.assertEqual(infra, [])
+    @patch("orchestrator.nodes.get_commit_time")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_toolkit_per_gate_check_failure_routes_to_merge_fix(
+        self, mock_api, mock_commit_time
+    ):
+        """A failed toolkit per-gate check (e.g. ``ci / lint``) is fixable.
 
-    def test_flat_legacy_judge_name_is_still_infra(self):
-        fixable, infra = self._run("llm-pr-review")
-        self.assertEqual(len(infra), 1)
-        self.assertEqual(fixable, [])
+        The per-gate deterministic check names introduced by the toolkit
+        composite must NOT match the judge fragment: a failing
+        ``ci / lint`` breaks the poll into the Merge-Fix Loop with
+        structured check feedback.
+        """
+        pr_payloads = [
+            {"merged": False, "state": "open", "head": {"sha": self.HEAD_SHA}}
+        ]
+        check_pages = [
+            {
+                "total_count": 1,
+                "check_runs": [
+                    self._check_run(
+                        "ci / lint",
+                        "failure",
+                        title="ruff failed",
+                        summary="Lint gate failed.",
+                    )
+                ],
+            }
+        ]
+
+        new_state = self._run_merge_node(
+            mock_api,
+            mock_commit_time,
+            pr_payloads_by_call=pr_payloads,
+            check_runs_pages=check_pages,
+        )
+
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "merge_fix")
+        self.assertEqual(new_state["attempts"].get("merge"), 1)
+        assert new_state["feedback"] is not None
+        self.assertIn("merge-fix attempt 1/", new_state["feedback"])
+        self.assertIn("ci / lint", new_state["feedback"])
 
 
 class TestRecoveryOnException(unittest.TestCase):
