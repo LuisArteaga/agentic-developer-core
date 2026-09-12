@@ -22,6 +22,8 @@ from orchestrator.sandbox import (
     DEFAULT_SANDBOX_IMAGE,
     DEFAULT_SANDBOX_MEMORY,
     DEFAULT_SANDBOX_PIDS_LIMIT,
+    DEFAULT_SANDBOX_RUNTIME,
+    SANDBOX_RUNTIME_OVERRIDE,
     DockerSandboxRunner,
     SandboxConfigError,
     SandboxError,
@@ -30,6 +32,7 @@ from orchestrator.sandbox import (
     SandboxUnavailableError,
     build_sandbox_env,
     get_sandbox_runner,
+    resolve_sandbox_runtime,
 )
 
 
@@ -612,6 +615,73 @@ class TestGetSandboxRunner(unittest.TestCase):
         self.assertEqual(argv[argv.index("--memory") + 1], "2g")
         self.assertEqual(argv[argv.index("--pids-limit") + 1], "128")
         self.assertEqual(argv[argv.index("--") + 1], "custom-img")
+
+
+class TestResolveSandboxRuntime(unittest.TestCase):
+    def test_default_runtime_is_runsc(self):
+        # FR-4: gVisor is the default and a hard requirement — the
+        # preflight fails closed when it is unavailable.
+        with _clean_env({}):
+            self.assertEqual(resolve_sandbox_runtime(), "runsc")
+
+    def test_explicit_runsc_is_selected(self):
+        with _clean_env({"AGENT_SANDBOX_RUNTIME": " RunSC "}):
+            self.assertEqual(resolve_sandbox_runtime(), DEFAULT_SANDBOX_RUNTIME)
+
+    def test_runc_override_is_explicit_and_warned(self):
+        # The dev-only override is honored but loud: a warning names the
+        # override value and the shared-kernel trade-off.
+        with _clean_env({"AGENT_SANDBOX_RUNTIME": "runc"}):
+            with self.assertLogs("orchestrator.sandbox", level="WARNING") as logs:
+                resolved = resolve_sandbox_runtime()
+        self.assertEqual(resolved, SANDBOX_RUNTIME_OVERRIDE)
+        warning_text = "\n".join(logs.output)
+        assert SANDBOX_RUNTIME_OVERRIDE in warning_text
+        assert "gVisor" in warning_text
+
+    def test_unknown_runtime_fails_closed(self):
+        with _clean_env({"AGENT_SANDBOX_RUNTIME": "kata"}):
+            with self.assertRaises(SandboxConfigError):
+                resolve_sandbox_runtime()
+
+    def test_blank_runtime_fails_closed(self):
+        # A blank explicit value signals a broken deploy script: loud
+        # configuration error, never a silent fallback to the default.
+        with _clean_env({"AGENT_SANDBOX_RUNTIME": "   "}):
+            with self.assertRaises(SandboxConfigError):
+                resolve_sandbox_runtime()
+
+    def test_default_runtime_reaches_exec_argv(self):
+        # "Sandboxes start with --runtime=runsc" (FR-4 acceptance), verified
+        # behaviorally through the public runner path.
+        argv = self._exec_with_runtime_env({})
+        assert argv[argv.index("--runtime") + 1] == DEFAULT_SANDBOX_RUNTIME
+
+    def test_runc_override_reaches_exec_argv(self):
+        argv = self._exec_with_runtime_env({"AGENT_SANDBOX_RUNTIME": "runc"})
+        assert argv[argv.index("--runtime") + 1] == SANDBOX_RUNTIME_OVERRIDE
+
+    def _exec_with_runtime_env(self, extra_env):
+        captured = {}
+        script = [
+            (lambda cmd: _is_docker(cmd, "info"), _completed(0, stdout=b"27.0.3\n")),
+            (lambda cmd: _is_docker(cmd, "image"), _completed(0)),
+            (lambda cmd: _is_docker(cmd, "run"), _completed(0)),
+            (lambda cmd: _is_docker(cmd, "rm"), _completed(0)),
+        ]
+
+        def _capture(cmd, **kwargs):
+            if _is_docker(cmd, "run"):
+                captured["cmd"] = list(cmd)
+            return _scripted_run(script)(cmd, **kwargs)
+
+        with _clean_env(extra_env):
+            with patch("orchestrator.sandbox.subprocess.run", side_effect=_capture):
+                runner = get_sandbox_runner()
+                runner.create(Path("/tmp/whatever-workspace"))
+                runner.exec(["make", "verify"], timeout=10)
+                runner.destroy()
+        return captured["cmd"]
 
 
 class TestSandboxDefaults(unittest.TestCase):
