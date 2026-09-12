@@ -132,5 +132,4 @@ immutable release tag `v1.7.0` (toolkit D-0007: never a floating ref).
   (T1 — canonical source artifact, accessed 2026-09-12, fetched and the
   input set / `needs` chain / relative `uses` refs verified verbatim;
   the caller targets this composite as the first consumer).
-batim;
   the caller targets this composite as the first consumer).
