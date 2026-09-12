@@ -6070,6 +6070,46 @@ class TestMergeNodeCheckRunFailFast(unittest.TestCase):
             self.assertEqual(new_state["status"], "failed")
 
 
+class TestEvaluateCheckFailuresToolkitCheckNames(unittest.TestCase):
+    """Judge-fragment matching against the toolkit composite check names.
+
+    After ADR-0059 the judge check renders from the toolkit composite as a
+    nested-workflow name containing ``llm-pr-review`` (e.g.
+    ``ci / llmreview / llm-pr-review``); the default fragment must still
+    classify it as judge infrastructure, and the per-gate deterministic
+    names (``ci / lint`` etc.) must stay fixable.
+    """
+
+    def _run(self, name):
+        return nodes_module._evaluate_check_failures(
+            [
+                {
+                    "name": name,
+                    "conclusion": "failure",
+                    "output": {"title": "t", "summary": "s"},
+                    "completed_at": "2026-01-01T00:00:00Z",
+                }
+            ],
+            nodes_module._DEFAULT_JUDGE_CHECK_FRAGMENTS,
+        )
+
+    def test_toolkit_composite_judge_check_is_infra(self):
+        fixable, infra = self._run("ci / llmreview / llm-pr-review")
+        self.assertEqual(len(infra), 1)
+        self.assertEqual(fixable, [])
+
+    def test_toolkit_per_gate_checks_are_fixable(self):
+        for name in ("ci / lint", "ci / test", "ci / security", "ci / diffcoverage"):
+            fixable, infra = self._run(name)
+            self.assertEqual(len(fixable), 1)
+            self.assertEqual(infra, [])
+
+    def test_flat_legacy_judge_name_is_still_infra(self):
+        fixable, infra = self._run("llm-pr-review")
+        self.assertEqual(len(infra), 1)
+        self.assertEqual(fixable, [])
+
+
 class TestRecoveryOnException(unittest.TestCase):
     """ADR-0038: a node exception is recorded (status=failed, return state) so
     the status-based conditional edges route to recovery_node, which cleans the

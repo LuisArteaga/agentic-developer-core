@@ -81,7 +81,9 @@ To add a new check (e.g., `performance_compliance`):
    with tracer.start_as_current_span("performance_evaluation") as perf_span:
        perf_span.set_attribute("eval.dimension", "performance")
        # Call LLM and parse response
-       raw_resp = call_llm_for_review(review_model, SYSTEM_PROMPT_PERFORMANCE, diff, openrouter_api_key)
+       raw_resp = call_llm_for_review(
+           review_model, SYSTEM_PROMPT_PERFORMANCE, diff, openrouter_api_key
+       )
        perf_verdict, perf_reasoning, perf_findings = evaluate_response(raw_resp)
        # Log attributes
        perf_span.set_attribute("eval.verdict", perf_verdict)

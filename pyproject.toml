@@ -19,8 +19,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
-    "ruff>=0.3.0",
-    "mypy>=1.0.0",
+    # Dev-extras lockstep with the toolkit lint.yml pins (ADR-0059).
+    "ruff==0.16.6",
+    "mypy==2.3.1",
     "pytest-cov>=4.0.0",
     "semgrep>=1.0.0",
     "pip-audit>=2.0.0",
