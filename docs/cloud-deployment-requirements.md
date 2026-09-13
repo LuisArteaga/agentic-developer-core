@@ -77,6 +77,17 @@ operational procedures: [runbook-sandbox-runtime.md](runbook-sandbox-runtime.md)
 - Enforcement independent of the sandbox's cooperation (nftables/proxy layer on
   the host, INNOQ pattern); allowlist changes require root, not container access.
 
+Implemented by the two enforcement planes generated from one policy module:
+the host nftables ruleset (`orchestrator/egress.py::build_nftables_ruleset`,
+applied by root via `scripts/egress_setup.py`) and the stdlib CONNECT egress
+proxy (`orchestrator/egress_proxy.py`) with the allowlist merged from
+`DEFAULT_EGRESS_DOMAINS` ∪ `config/sources.toml` ∪
+`AGENT_SANDBOX_EGRESS_EXTRA_DOMAINS` (ADR-0060, issue #162); every sandbox
+unconditionally attaches to the dedicated egress network and receives proxy
+env (`orchestrator/sandbox.py`), the startup preflight verifies both planes
+fail-closed (`orchestrator/preflight.py`); operational procedures:
+[runbook-sandbox-egress.md](runbook-sandbox-egress.md).
+
 ### FR-6 Credential scoping
 
 - Migration guidance to a GitHub fine-grained PAT scoped to the single Target

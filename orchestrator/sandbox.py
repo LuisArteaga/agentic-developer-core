@@ -52,8 +52,19 @@ override that trades gVisor isolation for shared-kernel containers. Startup
 preflight lives in ``orchestrator.preflight`` (verifies daemon, kernel,
 binary and daemon-side runtime registration before the first cycle and is
 wired into the Process Supervisor's validation phase — fail closed).
+
+Egress lockdown (FR-5, issue #162 / ADR-0060): every sandbox container is
+attached to the dedicated, ICC-disabled egress network (``--network``) and
+receives HTTP(S)_PROXY env pointing at the host-side egress proxy — the
+only domain-capable route out (orchestrator.egress_proxy). There is no
+disable knob: a sandbox without egress enforcement is a misconfiguration,
+not a mode (fail closed). The proxy and the host nftables ruleset are
+generated from the same policy (``orchestrator.egress``) and applied at
+deployment time (``scripts/egress_setup.py``); the preflight verifies
+network + proxy reachability at startup in both runtime modes.
 """
 
+import ipaddress
 import json
 import logging
 import os
@@ -63,6 +74,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 
 logger = logging.getLogger("orchestrator.sandbox")
 
@@ -81,6 +93,22 @@ DEFAULT_SANDBOX_PIDS_LIMIT = "512"
 # dev-only override (loud warning, documented trade-off) — never a default.
 DEFAULT_SANDBOX_RUNTIME = "runsc"
 SANDBOX_RUNTIME_OVERRIDE = "runc"
+
+# Egress lockdown defaults (FR-5, issue #162 / ADR-0060). Sandboxes attach to
+# a dedicated Docker network with a fixed private subnet (no IPv6) and reach
+# the outside world only through the host-side egress proxy listening on the
+# network's gateway IP. The gateway is derived from the subnet (Docker
+# assigns the first usable host as gateway), so one knob governs both the
+# preflight's drift check and the injected proxy env.
+DEFAULT_SANDBOX_EGRESS_NETWORK = "agdc-sandbox-egress"
+DEFAULT_SANDBOX_EGRESS_SUBNET = "172.30.0.0/24"
+DEFAULT_EGRESS_PROXY_PORT = 3128
+# The subnet-derived default proxy URL (first usable host of the default
+# subnet + proxy port); used as the constructor fallback so the runner's
+# defaults stay environment-independent.
+DEFAULT_SANDBOX_EGRESS_PROXY_URL = "http://172.30.0.1:3128"
+DEFAULT_PROXY_PROBE_URL = "http://127.0.0.1:3128"
+_PROXY_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 
 # Credential env var names that must NEVER be requested into a sandbox
 # environment (FR-6). This is not an env-construction mechanism (ADR-0043's
@@ -229,6 +257,97 @@ def resolve_sandbox_runtime() -> str:
     )
 
 
+@dataclass(frozen=True)
+class SandboxEgressConfig:
+    """Resolved egress-lockdown configuration (FR-5, ADR-0060).
+
+    ``network`` is the dedicated Docker network every sandbox attaches to;
+    ``subnet`` is its fixed IPv4 subnet (the nftables ruleset matches sandbox
+    traffic by source subnet); ``proxy_url`` is the host-side egress proxy
+    URL injected into the sandbox environment.
+    """
+
+    network: str
+    subnet: ipaddress.IPv4Network
+    proxy_url: str
+
+    @property
+    def gateway(self) -> ipaddress.IPv4Address:
+        """The bridge gateway IP (Docker assigns the first usable host)."""
+        gateway = next(self.subnet.hosts(), None)
+        if gateway is None:
+            raise SandboxConfigError(
+                f"Egress subnet {self.subnet} has no usable host address to "
+                "derive the egress proxy gateway from"
+            )
+        return gateway
+
+
+def resolve_sandbox_egress() -> SandboxEgressConfig:
+    """Resolve the egress-lockdown configuration (FR-5, ADR-0060).
+
+    The proxy URL defaults to ``http://<first-usable-host-of-subnet>:<port>``
+    — Docker assigns the first usable host of an explicitly configured
+    subnet as the bridge gateway, so ``AGENT_SANDBOX_EGRESS_SUBNET`` is the
+    single source of truth for both the preflight's drift check and the
+    injected env. ``AGENT_SANDBOX_EGRESS_PROXY_URL`` overrides the URL for
+    exotic gateway setups. There is deliberately no disable knob: egress
+    lockdown is unconditional (a sandbox attached to a default-allow bridge
+    would silently undo FR-5; the documented setup path is the runbook's).
+
+    Every misconfiguration raises ``SandboxConfigError`` loudly: a blank
+    network name, an unparseable subnet, a subnet that is not private or
+    not IPv4 (the egress network is created without IPv6), or an override
+    URL without an http scheme.
+    """
+    network = os.getenv(
+        "AGENT_SANDBOX_EGRESS_NETWORK", DEFAULT_SANDBOX_EGRESS_NETWORK
+    ).strip()
+    if not network:
+        raise SandboxConfigError(
+            "AGENT_SANDBOX_EGRESS_NETWORK must not be blank: sandboxes "
+            "attach to the dedicated egress network (FR-5); there is no "
+            "egress-disabled mode"
+        )
+    subnet_raw = os.getenv(
+        "AGENT_SANDBOX_EGRESS_SUBNET", DEFAULT_SANDBOX_EGRESS_SUBNET
+    ).strip()
+    try:
+        subnet = ipaddress.ip_network(subnet_raw, strict=False)
+    except ValueError:
+        raise SandboxConfigError(
+            f"AGENT_SANDBOX_EGRESS_SUBNET {subnet_raw!r} is not a valid "
+            "IP network; the egress ruleset is generated for a fixed "
+            "private subnet"
+        ) from None
+    if subnet.version != 4:
+        raise SandboxConfigError(
+            f"AGENT_SANDBOX_EGRESS_SUBNET {subnet_raw!r} must be IPv4: the "
+            "egress network is created without IPv6 and the generated "
+            "nftables ruleset covers the IPv4 sandbox subnet only"
+        )
+    if not subnet.is_private:
+        raise SandboxConfigError(
+            f"AGENT_SANDBOX_EGRESS_SUBNET {subnet_raw!r} must be a private "
+            "range (RFC 1918 / documentation space) — a public bridge "
+            "subnet would defeat the egress boundary"
+        )
+    default_proxy_url = f"http://{next(subnet.hosts())}:{DEFAULT_EGRESS_PROXY_PORT}"
+    proxy_url = os.getenv("AGENT_SANDBOX_EGRESS_PROXY_URL", default_proxy_url).strip()
+    if not proxy_url:
+        raise SandboxConfigError(
+            "AGENT_SANDBOX_EGRESS_PROXY_URL must not be blank; unset it to "
+            "derive the proxy URL from the egress subnet gateway"
+        )
+    parsed = urlsplit(proxy_url)
+    if parsed.scheme != "http" or not parsed.hostname:
+        raise SandboxConfigError(
+            f"AGENT_SANDBOX_EGRESS_PROXY_URL {proxy_url!r} must be an "
+            "http://host:port URL pointing at the host-side egress proxy"
+        )
+    return SandboxEgressConfig(network=network, subnet=subnet, proxy_url=proxy_url)
+
+
 def get_sandbox_runner() -> SandboxRunner:
     """Return the configured sandbox backend (default: docker).
 
@@ -247,12 +366,15 @@ def get_sandbox_runner() -> SandboxRunner:
     if not image:
         image = DEFAULT_SANDBOX_IMAGE
     cpus, memory, pids_limit = _resolve_sandbox_caps()
+    egress = resolve_sandbox_egress()
     return DockerSandboxRunner(
         image=image,
         cpus=cpus,
         memory=memory,
         pids_limit=pids_limit,
         runtime=resolve_sandbox_runtime(),
+        egress_network=egress.network,
+        egress_proxy_url=egress.proxy_url,
     )
 
 
@@ -276,12 +398,16 @@ class DockerSandboxRunner:
         memory: str,
         pids_limit: str,
         runtime: str = DEFAULT_SANDBOX_RUNTIME,
+        egress_network: str = DEFAULT_SANDBOX_EGRESS_NETWORK,
+        egress_proxy_url: str = DEFAULT_SANDBOX_EGRESS_PROXY_URL,
     ):
         self._image = image
         self._cpus = cpus
         self._memory = memory
         self._pids_limit = pids_limit
         self._runtime = runtime
+        self._egress_network = egress_network
+        self._egress_proxy_url = egress_proxy_url
         self._workspace: Path | None = None
         self._containers: list[str] = []
 
@@ -337,11 +463,19 @@ class DockerSandboxRunner:
             self._pids_limit,
             "--runtime",
             self._runtime,
+            # Egress lockdown (FR-5, ADR-0060): attach to the dedicated
+            # ICC-disabled egress network and route HTTP(S) through the
+            # host-side proxy — the only domain-capable path out. Unconditional:
+            # there is no egress-disabled mode.
+            "--network",
+            self._egress_network,
             "-v",
             f"{self._workspace}:{SANDBOX_WORKSPACE_MOUNT}",
             "-w",
             SANDBOX_WORKSPACE_MOUNT,
         ]
+        for env_name in _PROXY_ENV_NAMES:
+            argv += ["-e", f"{env_name}={self._egress_proxy_url}"]
         for key, value in build_sandbox_env().items():
             argv += ["-e", f"{key}={value}"]
         argv += ["--", self._image, *args]

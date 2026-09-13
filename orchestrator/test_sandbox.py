@@ -9,6 +9,7 @@ interactions are scripted fakes — no Docker daemon is required (FR-9's
 no-container TDD requirement).
 """
 
+import ipaddress
 import json
 import os
 import subprocess
@@ -26,12 +27,14 @@ from orchestrator.sandbox import (
     SANDBOX_RUNTIME_OVERRIDE,
     DockerSandboxRunner,
     SandboxConfigError,
+    SandboxEgressConfig,
     SandboxError,
     SandboxExecResult,
     SandboxImageMissingError,
     SandboxUnavailableError,
     build_sandbox_env,
     get_sandbox_runner,
+    resolve_sandbox_egress,
     resolve_sandbox_runtime,
 )
 
@@ -236,9 +239,26 @@ class TestDockerSandboxRunnerExec(unittest.TestCase):
         self.assertEqual(argv[argv.index("--cpus") + 1], "2")
         self.assertEqual(argv[argv.index("--memory") + 1], "4g")
         self.assertEqual(argv[argv.index("--pids-limit") + 1], "512")
+        self.assertEqual(argv[argv.index("--runtime") + 1], DEFAULT_SANDBOX_RUNTIME)
+        # FR-5: every sandbox attaches to the dedicated egress network and
+        # routes HTTP(S) through the host-side proxy — unconditional.
+        self.assertEqual(argv[argv.index("--network") + 1], "agdc-sandbox-egress")
         self.assertEqual(argv[argv.index("-v") + 1], f"{self.workspace}:/workspace")
         self.assertEqual(argv[argv.index("-w") + 1], "/workspace")
-        self.assertNotIn("-e", argv)  # FR-6: no env leaks by default
+        # The only -e entries by default are the egress proxy vars (both
+        # upper- and lower-case so pip/npm/curl/apt honor them); no host env
+        # value (FR-6) and no secret name leaks into the sandbox.
+        env_values = [argv[i + 1] for i, flag in enumerate(argv) if flag == "-e"]
+        self.assertEqual(len(env_values), 4)
+        self.assertEqual(
+            sorted(env_values),
+            sorted(
+                f"{name}=http://172.30.0.1:3128"
+                for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+            ),
+        )
+        for secret in ("pat-secret", "or-secret", "/home/user", "/usr/bin"):
+            assert secret not in " ".join(argv)
         self.assertEqual(argv[argv.index("--") + 1], "verify-img")
         self.assertEqual(argv[-2:], ["make", "verify"])
         self.assertEqual(result.exit_code, 0)
@@ -271,10 +291,14 @@ class TestDockerSandboxRunnerExec(unittest.TestCase):
                 result = self.runner.exec(["make", "verify"], timeout=300)
         argv = captured["cmd"]
         self.assertEqual(result.exit_code, 0)
-        env_flags = argv[argv.index("-e") + 1 :]
-        # Only the allowlisted non-secret var is forwarded, exactly once.
-        self.assertEqual(argv.count("-e"), 1)
-        self.assertEqual(env_flags[0], "VERIFY_TARGET=ci")
+        env_flags = [argv[i + 1] for i, flag in enumerate(argv) if flag == "-e"]
+        # The 4 egress proxy vars plus exactly one allowlisted non-secret
+        # var, forwarded once; no secret ever reaches the sandbox.
+        self.assertEqual(len(env_flags), 5)
+        self.assertIn("VERIFY_TARGET=ci", env_flags)
+        joined = " ".join(env_flags)
+        for secret in ("pat-secret", "or-secret", "lf-public", "lf-secret"):
+            assert secret not in joined
 
     def test_exec_nonzero_exit_is_data_via_container_state(self):
         script = [
@@ -682,6 +706,117 @@ class TestResolveSandboxRuntime(unittest.TestCase):
                 runner.exec(["make", "verify"], timeout=10)
                 runner.destroy()
         return captured["cmd"]
+
+
+class TestResolveSandboxEgress(unittest.TestCase):
+    """FR-5 config resolution (issue #162 / ADR-0060): loud validation."""
+
+    def test_defaults_derive_proxy_url_from_subnet_gateway(self):
+        with _clean_env({}):
+            egress = resolve_sandbox_egress()
+        self.assertEqual(egress.network, "agdc-sandbox-egress")
+        self.assertEqual(str(egress.subnet), "172.30.0.0/24")
+        self.assertEqual(egress.gateway, ipaddress.ip_address("172.30.0.1"))
+        self.assertEqual(egress.proxy_url, "http://172.30.0.1:3128")
+
+    def test_explicit_network_and_subnet_are_honored(self):
+        with _clean_env(
+            {
+                "AGENT_SANDBOX_EGRESS_NETWORK": " my-egress-net ",
+                "AGENT_SANDBOX_EGRESS_SUBNET": "192.168.77.0/24",
+            }
+        ):
+            egress = resolve_sandbox_egress()
+        self.assertEqual(egress.network, "my-egress-net")
+        self.assertEqual(egress.gateway, ipaddress.ip_address("192.168.77.1"))
+        self.assertEqual(egress.proxy_url, "http://192.168.77.1:3128")
+
+    def test_explicit_proxy_url_overrides_derivation(self):
+        with _clean_env(
+            {"AGENT_SANDBOX_EGRESS_PROXY_URL": "http://192.168.77.254:9999"}
+        ):
+            egress = resolve_sandbox_egress()
+        self.assertEqual(egress.proxy_url, "http://192.168.77.254:9999")
+
+    def test_blank_network_fails_closed(self):
+        with _clean_env({"AGENT_SANDBOX_EGRESS_NETWORK": "  "}):
+            with self.assertRaises(SandboxConfigError) as ctx:
+                resolve_sandbox_egress()
+        assert "no egress-disabled mode" in str(ctx.exception)
+
+    def test_unparseable_subnet_fails_closed(self):
+        with _clean_env({"AGENT_SANDBOX_EGRESS_SUBNET": "not-a-subnet"}):
+            with self.assertRaises(SandboxConfigError):
+                resolve_sandbox_egress()
+
+    def test_public_subnet_fails_closed(self):
+        # A public bridge subnet would defeat the egress boundary entirely.
+        with _clean_env({"AGENT_SANDBOX_EGRESS_SUBNET": "1.2.3.0/24"}):
+            with self.assertRaises(SandboxConfigError) as ctx:
+                resolve_sandbox_egress()
+        assert "private" in str(ctx.exception)
+
+    def test_ipv6_subnet_fails_closed(self):
+        # The egress network is created without IPv6; the ruleset polices
+        # the IPv4 subnet only — an IPv6 subnet cannot be enforced.
+        with _clean_env({"AGENT_SANDBOX_EGRESS_SUBNET": "fd00::/64"}):
+            with self.assertRaises(SandboxConfigError) as ctx:
+                resolve_sandbox_egress()
+        assert "IPv4" in str(ctx.exception)
+
+    def test_blank_proxy_url_fails_closed(self):
+        with _clean_env({"AGENT_SANDBOX_EGRESS_PROXY_URL": "   "}):
+            with self.assertRaises(SandboxConfigError):
+                resolve_sandbox_egress()
+
+    def test_non_http_proxy_url_fails_closed(self):
+        with _clean_env({"AGENT_SANDBOX_EGRESS_PROXY_URL": "socks5://x:1080"}):
+            with self.assertRaises(SandboxConfigError) as ctx:
+                resolve_sandbox_egress()
+        assert "http://host:port" in str(ctx.exception)
+
+    def test_gateway_without_usable_host_fails_closed(self):
+        # Defensive edge (e.g. a /31-style network whose hosts() is empty):
+        # the gateway derivation must fail LOUDLY, not return None.
+        class _NoHostsNetwork(ipaddress.IPv4Network):
+            def hosts(self):
+                return iter(())
+
+        config = SandboxEgressConfig(
+            network="agdc-sandbox-egress",
+            subnet=_NoHostsNetwork("172.30.0.0/24"),
+            proxy_url="http://172.30.0.1:3128",
+        )
+        with self.assertRaises(SandboxConfigError) as ctx:
+            config.gateway
+        assert "no usable host address" in str(ctx.exception)
+
+    def test_resolved_egress_reaches_exec_argv(self):
+        # Behavioral: a custom subnet's derived gateway lands in the
+        # sandbox env (no proxy-url override needed).
+        captured = {}
+        script = [
+            (lambda cmd: _is_docker(cmd, "info"), _completed(0, stdout=b"27.0.3\n")),
+            (lambda cmd: _is_docker(cmd, "image"), _completed(0)),
+            (lambda cmd: _is_docker(cmd, "run"), _completed(0)),
+            (lambda cmd: _is_docker(cmd, "rm"), _completed(0)),
+        ]
+
+        def _capture(cmd, **kwargs):
+            if _is_docker(cmd, "run"):
+                captured["cmd"] = list(cmd)
+            return _scripted_run(script)(cmd, **kwargs)
+
+        with _clean_env({"AGENT_SANDBOX_EGRESS_SUBNET": "192.168.77.0/24"}):
+            with patch("orchestrator.sandbox.subprocess.run", side_effect=_capture):
+                runner = get_sandbox_runner()
+                runner.create(Path("/tmp/whatever-workspace"))
+                runner.exec(["true"], timeout=10)
+                runner.destroy()
+        argv = captured["cmd"]
+        self.assertEqual(argv[argv.index("--network") + 1], "agdc-sandbox-egress")
+        env_flags = [argv[i + 1] for i, flag in enumerate(argv) if flag == "-e"]
+        assert "HTTPS_PROXY=http://192.168.77.1:3128" in env_flags
 
 
 class TestSandboxDefaults(unittest.TestCase):

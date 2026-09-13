@@ -30,9 +30,16 @@ from orchestrator.preflight import (
 
 _RUNTIMES_FORMAT = "{{json .Runtimes}}"
 _VERSION_FORMAT = "{{.ServerVersion}}"
+_IPAM_FORMAT = "{{json .IPAM.Config}}"
 
 _RUNTIMES_WITH_RUNSC = '{"runc": {"path": "runc"}, "runsc": {"path": "/usr/bin/runsc"}}'
 _RUNTIMES_WITHOUT_RUNSC = '{"runc": {"path": "runc"}}'
+
+# The egress network inspection every run_preflight() performs (FR-5): a
+# healthy daemon answers with the default egress subnet. Appended to every
+# scripted daemon run below so the runtime checks' failure scenarios keep
+# their original ordering semantics.
+_EGRESS_IPAM_OK = b'[{"Subnet": "172.30.0.0/24", "Gateway": "172.30.0.1"}]'
 
 
 def _completed(returncode=0, stdout=b"", stderr=b""):
@@ -41,6 +48,21 @@ def _completed(returncode=0, stdout=b"", stderr=b""):
     res.stdout = stdout
     res.stderr = stderr
     return res
+
+
+# The egress network inspection every run_preflight() performs (FR-5): a
+# healthy daemon answers with the default egress subnet. Appended to every
+# scripted daemon run below so the runtime checks' failure scenarios keep
+# their original ordering semantics.
+_EGRESS_INSPECT_RULE = (
+    lambda cmd: (
+        len(cmd) > 3
+        and cmd[0] == "docker"
+        and cmd[1] == "network"
+        and cmd[2] == "inspect"
+    ),
+    _completed(0, stdout=_EGRESS_IPAM_OK),
+)
 
 
 def _scripted_run(script):
@@ -94,7 +116,8 @@ def _runsc_happy_script():
 
 
 class PreflightTestCase(unittest.TestCase):
-    """Shared fakes: a healthy host (kernel 6.8, runsc installed+registered)."""
+    """Shared fakes: a healthy host (kernel 6.8, runsc installed+registered,
+    egress network present, egress proxy reachable)."""
 
     def setUp(self):
         self._patches = [
@@ -106,16 +129,25 @@ class PreflightTestCase(unittest.TestCase):
                 "orchestrator.preflight.shutil.which",
                 return_value="/usr/bin/runsc",
             ),
+            # FR-5: the egress proxy TCP probe succeeds by default.
+            patch(
+                "orchestrator.preflight.socket.create_connection",
+                return_value=unittest.mock.MagicMock(),
+            ),
         ]
         for p in self._patches:
             p.start()
             self.addCleanup(p.stop)
 
+    @staticmethod
+    def _script_with_egress(script):
+        return [*script, _EGRESS_INSPECT_RULE]
+
     def assert_preflight_passes(self, script):
         with _clean_env({}):
             with patch(
                 "orchestrator.preflight.subprocess.run",
-                side_effect=_scripted_run(script),
+                side_effect=_scripted_run(self._script_with_egress(script)),
             ):
                 runtime = run_preflight()
         self.assertEqual(runtime, "runsc")
@@ -124,7 +156,7 @@ class PreflightTestCase(unittest.TestCase):
         with _clean_env({}):
             with patch(
                 "orchestrator.preflight.subprocess.run",
-                side_effect=_scripted_run(script),
+                side_effect=_scripted_run(self._script_with_egress(script)),
             ):
                 with self.assertRaises(SandboxError) as ctx:
                     run_preflight()
@@ -335,8 +367,9 @@ class TestRunPreflightContainerContext(PreflightTestCase):
 
 class TestRunPreflightRuncOverride(PreflightTestCase):
     def test_override_passes_without_gvisor_checks(self):
-        # runc mode: daemon reachability only — no kernel check (gVisor's
-        # 5.6 floor does not apply) and no runtimes probe.
+        # runc mode: daemon reachability, egress enforcement (FR-5 runs in
+        # both modes), and the loud shared-kernel warning — no kernel check
+        # (gVisor's 5.6 floor does not apply) and no runtimes probe.
         def _release_raises():
             raise AssertionError("kernel check must be skipped in runc mode")
 
@@ -348,12 +381,14 @@ class TestRunPreflightRuncOverride(PreflightTestCase):
                 with patch(
                     "orchestrator.preflight.subprocess.run",
                     side_effect=_scripted_run(
-                        [
-                            (
-                                lambda cmd: _is_docker_info(cmd, _VERSION_FORMAT),
-                                _completed(0, stdout=b"27.0.3\n"),
-                            )
-                        ]
+                        self._script_with_egress(
+                            [
+                                (
+                                    lambda cmd: _is_docker_info(cmd, _VERSION_FORMAT),
+                                    _completed(0, stdout=b"27.0.3\n"),
+                                )
+                            ]
+                        )
                     ),
                 ):
                     with self.assertLogs(
@@ -388,6 +423,167 @@ class TestRunningInControlPlaneContainer(unittest.TestCase):
 
     def test_default_markers_are_container_conventions(self):
         self.assertEqual(CONTAINER_MARKER_PATHS, ("/.dockerenv", "/run/.containerenv"))
+
+
+class TestEgressPreflight(PreflightTestCase):
+    """FR-5 fail-closed checks (issue #162): egress network + proxy probe."""
+
+    def test_missing_egress_network_fails_closed(self):
+        with _clean_env({}):
+            with patch(
+                "orchestrator.preflight.subprocess.run",
+                side_effect=_scripted_run(
+                    [
+                        (
+                            lambda cmd: _is_docker_info(cmd, _VERSION_FORMAT),
+                            _completed(0, stdout=b"27.0.3\n"),
+                        ),
+                        (
+                            lambda cmd: (
+                                len(cmd) > 3
+                                and cmd[0] == "docker"
+                                and cmd[1] == "network"
+                                and cmd[2] == "inspect"
+                            ),
+                            _completed(1, stderr=b"No such network"),
+                        ),
+                    ]
+                ),
+            ):
+                with self.assertRaises(SandboxUnavailableError) as ctx:
+                    run_preflight()
+        message = str(ctx.exception)
+        assert "agdc-sandbox-egress" in message
+        assert "egress_setup.py network" in message
+
+    def test_subnet_drift_fails_closed(self):
+        # The ruleset polices the CONFIGURED subnet only: a live network on a
+        # different subnet would silently void the lockdown — loud error.
+        with _clean_env({}):
+            with patch(
+                "orchestrator.preflight.subprocess.run",
+                side_effect=_scripted_run(
+                    [
+                        (
+                            lambda cmd: _is_docker_info(cmd, _VERSION_FORMAT),
+                            _completed(0, stdout=b"27.0.3\n"),
+                        ),
+                        (
+                            lambda cmd: (
+                                len(cmd) > 3
+                                and cmd[0] == "docker"
+                                and cmd[1] == "network"
+                                and cmd[2] == "inspect"
+                            ),
+                            _completed(
+                                0,
+                                stdout=b'[{"Subnet": "10.99.0.0/24"}]',
+                            ),
+                        ),
+                    ]
+                ),
+            ):
+                with self.assertRaises(SandboxConfigError) as ctx:
+                    run_preflight()
+        message = str(ctx.exception)
+        assert "drifted" in message
+        assert "172.30.0.0/24" in message
+
+    def test_unparseable_ipam_listing_fails_closed(self):
+        with _clean_env({}):
+            with patch(
+                "orchestrator.preflight.subprocess.run",
+                side_effect=_scripted_run(
+                    [
+                        (
+                            lambda cmd: _is_docker_info(cmd, _VERSION_FORMAT),
+                            _completed(0, stdout=b"27.0.3\n"),
+                        ),
+                        (
+                            lambda cmd: (
+                                len(cmd) > 3
+                                and cmd[0] == "docker"
+                                and cmd[1] == "network"
+                                and cmd[2] == "inspect"
+                            ),
+                            _completed(0, stdout=b"not-json"),
+                        ),
+                    ]
+                ),
+            ):
+                with self.assertRaises(SandboxConfigError) as ctx:
+                    run_preflight()
+        assert "unparseable IPAM" in str(ctx.exception)
+
+    def test_unreachable_egress_proxy_fails_closed(self):
+        with _clean_env({}):
+            with patch(
+                "orchestrator.preflight.socket.create_connection",
+                side_effect=OSError("connection refused"),
+            ):
+                with patch(
+                    "orchestrator.preflight.subprocess.run",
+                    side_effect=_scripted_run(
+                        [
+                            (
+                                lambda cmd: _is_docker_info(cmd, _VERSION_FORMAT),
+                                _completed(0, stdout=b"27.0.3\n"),
+                            ),
+                            _EGRESS_INSPECT_RULE,
+                        ]
+                    ),
+                ):
+                    with self.assertRaises(SandboxUnavailableError) as ctx:
+                        run_preflight()
+        message = str(ctx.exception)
+        assert "Egress proxy unreachable" in message
+        assert "127.0.0.1:3128" in message
+
+    def test_invalid_probe_url_fails_closed(self):
+        with _clean_env({"AGENT_EGRESS_PROXY_PROBE_URL": "ftp://x"}):
+            with patch(
+                "orchestrator.preflight.subprocess.run",
+                side_effect=_scripted_run(
+                    [
+                        (
+                            lambda cmd: _is_docker_info(cmd, _VERSION_FORMAT),
+                            _completed(0, stdout=b"27.0.3\n"),
+                        ),
+                        _EGRESS_INSPECT_RULE,
+                    ]
+                ),
+            ):
+                with self.assertRaises(SandboxConfigError) as ctx:
+                    run_preflight()
+        assert "AGENT_EGRESS_PROXY_PROBE_URL" in str(ctx.exception)
+
+    def test_inspect_subprocess_error_is_unavailable(self):
+        # A docker binary present but broken (OSError/timeout) is
+        # infrastructure unavailability, not a config error — fail closed.
+        with _clean_env({}):
+            with patch(
+                "orchestrator.preflight.subprocess.run",
+                side_effect=_scripted_run(
+                    [
+                        (
+                            lambda cmd: _is_docker_info(cmd, _VERSION_FORMAT),
+                            _completed(0, stdout=b"27.0.3\n"),
+                        ),
+                        (
+                            lambda cmd: (
+                                len(cmd) > 3
+                                and cmd[0] == "docker"
+                                and cmd[1] == "network"
+                                and cmd[2] == "inspect"
+                            ),
+                            OSError("docker binary vanished"),
+                        ),
+                    ]
+                ),
+            ):
+                with self.assertRaises(SandboxUnavailableError) as ctx:
+                    run_preflight()
+        assert "docker network inspect failed" in str(ctx.exception)
 
 
 class TestPreflightMain(unittest.TestCase):
