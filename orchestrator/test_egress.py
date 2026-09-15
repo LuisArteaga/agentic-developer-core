@@ -25,9 +25,11 @@ import ipaddress
 import os
 import signal
 import socket
+import threading
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from io import StringIO
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 from orchestrator import egress as egress_mod
@@ -43,7 +45,12 @@ from orchestrator.egress import (
     resolve_validated_destination,
     _validate_allowlist_entry,
 )
-from orchestrator.egress_proxy import EgressProxy, main as proxy_main
+from orchestrator.egress_proxy import (
+    EgressProxy,
+    close_client_writer,
+    deny_response,
+    main as proxy_main,
+)
 from orchestrator.sandbox import (
     SandboxConfigError,
     SandboxEgressConfig,
@@ -568,6 +575,114 @@ class TestEgressProxyWire(unittest.TestCase):
 
         self._run(scenario)
 
+    def test_connect_without_host_denied(self):
+        async def scenario():
+            upstream = await asyncio.start_server(_echo_handler, "127.0.0.1", 0)
+            proxy, servers, port = await self._start_proxy(
+                _static_resolver({"pypi.org": ("127.0.0.1", 1)})
+            )
+            try:
+                reader, writer, status = await self._connect_and_read_status(
+                    port, b"CONNECT :9999 HTTP/1.1\r\n\r\n"
+                )
+                assert status.startswith(b"HTTP/1.1 403"), status
+                writer.close()
+            finally:
+                await self._cleanup(servers, upstream)
+
+        self._run(scenario)
+
+    def test_silent_connect_timeout_closes_the_connection(self):
+        # A client that connects and then sends nothing vanishes mid-request:
+        # the handler must drop it without an answer (no 403, no crash) and
+        # stay healthy for the next client.
+        async def scenario():
+            proxy, servers, port = await self._start_proxy(
+                _static_resolver({"pypi.org": ("127.0.0.1", 1)})
+            )
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                # Send nothing: the request-line read times out and the
+                # handler closes the connection with no answer (and no
+                # WARNING — the drop is silent).
+                with self.assertNoLogs("orchestrator.egress_proxy", level="WARNING"):
+                    assert await asyncio.wait_for(reader.read(64), 10) == b""
+                writer.close()
+                await writer.wait_closed()
+
+                next_reader, next_writer = await asyncio.open_connection(
+                    "127.0.0.1", port
+                )
+                next_writer.write(b"CONNECT blocked.invalid:443 HTTP/1.1\r\n\r\n")
+                await next_writer.drain()
+                status = await asyncio.wait_for(next_reader.readline(), 5)
+                assert status.startswith(b"HTTP/1.1 403"), status
+                next_writer.close()
+                await next_writer.wait_closed()
+            finally:
+                for server in servers:
+                    server.close()
+                    await server.wait_closed()
+
+        with patch("orchestrator.egress_proxy.CONNECT_TIMEOUT_SECONDS", 0.2):
+            self._run(scenario)
+
+    def test_serve_serves_without_signal_fds_on_a_worker_thread(self):
+        """serve() must degrade gracefully where signal handlers are
+        unavailable (loop in a non-main thread): bind, answer requests, and
+        shut down cleanly on cancellation."""
+        proxy = EgressProxy(self.ALLOWED, resolver=_static_resolver({}))
+        bound = threading.Event()
+        holder = {}
+
+        original_start = proxy.start
+
+        async def start_and_record(addresses):
+            servers = await original_start(addresses)
+            holder["servers"] = servers
+            bound.set()
+            return servers
+
+        proxy.start = start_and_record
+
+        def run_in_thread():
+            loop = asyncio.new_event_loop()
+            holder["loop"] = loop
+            try:
+
+                async def runner():
+                    serve_task = asyncio.ensure_future(proxy.serve([("127.0.0.1", 0)]))
+                    holder["serve_task"] = serve_task
+                    await serve_task
+
+                with suppress(asyncio.CancelledError):
+                    loop.run_until_complete(runner())
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=run_in_thread, daemon=True)
+        thread.start()
+        try:
+            assert bound.wait(5), "serve() did not bind on the worker loop"
+            port = holder["servers"][0].sockets[0].getsockname()[1]
+
+            async def probe():
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.write(b"GET / HTTP/1.1\r\n\r\n")
+                await writer.drain()
+                status = await asyncio.wait_for(reader.readline(), 5)
+                writer.close()
+                await writer.wait_closed()
+                return status
+
+            status = asyncio.run(asyncio.wait_for(probe(), 10))
+            assert status.startswith(b"HTTP/1.1 403"), status
+        finally:
+            if "serve_task" in holder:
+                holder["loop"].call_soon_threadsafe(holder["serve_task"].cancel)
+            thread.join(5)
+        assert not thread.is_alive()
+
     def test_serve_binds_and_stops_on_sigterm(self):
         async def scenario():
             proxy = EgressProxy(self.ALLOWED, resolver=_static_resolver({}))
@@ -591,3 +706,112 @@ class TestEgressProxyWire(unittest.TestCase):
                 rc = proxy_main(["--bind", "127.0.0.1", "--port", "39313"])
         self.assertEqual(rc, 0)
         self.assertEqual(fake_serve.call_args.args[0], [("127.0.0.1", 39313)])
+
+    def test_main_swallows_keyboard_interrupt(self):
+        # SIGINT in the foreground proxy process is a normal shutdown:
+        # main() must return success, not a traceback.
+        with patch(
+            "orchestrator.egress_proxy.load_egress_policy",
+            return_value=self.ALLOWED,
+        ):
+            with patch.object(
+                EgressProxy,
+                "serve",
+                new_callable=AsyncMock,
+                side_effect=KeyboardInterrupt,
+            ):
+                rc = proxy_main(["--bind", "127.0.0.1", "--port", "39314"])
+        self.assertEqual(rc, 0)
+
+
+class _FakeClientWriter:
+    """Minimal StreamWriter double: records writes, optionally fails."""
+
+    def __init__(self, fail_drain: Exception | None = None):
+        self.written = b""
+        self._fail_drain = fail_drain
+
+    def write(self, data: bytes) -> None:
+        self.written += data
+
+    async def drain(self) -> None:
+        if self._fail_drain is not None:
+            raise self._fail_drain
+
+
+class TestDenyResponseContract(unittest.TestCase):
+    """``deny_response`` is the public deny protocol: answer 403, log
+    client/destination/reason, and survive a client that RSTs before
+    reading the answer."""
+
+    def test_answers_403_and_logs_the_refusal(self):
+        writer = _FakeClientWriter()
+        with self.assertLogs("orchestrator.egress_proxy", level="WARNING") as logs:
+            asyncio.run(
+                deny_response(
+                    cast(asyncio.StreamWriter, writer),
+                    "10.0.0.7:5555",
+                    "evil.example:443",
+                    "not allowlisted",
+                )
+            )
+        assert writer.written.startswith(b"HTTP/1.1 403"), writer.written
+        assert b"Connection: close" in writer.written
+        denial = "\n".join(logs.output)
+        assert "EGRESS DENY" in denial
+        assert "10.0.0.7:5555" in denial
+        assert "evil.example:443" in denial
+        assert "not allowlisted" in denial
+
+    def test_client_reset_before_reading_the_answer_is_swallowed(self):
+        writer = _FakeClientWriter(fail_drain=ConnectionResetError())
+        with self.assertLogs("orchestrator.egress_proxy", level="WARNING") as logs:
+            asyncio.run(
+                deny_response(
+                    cast(asyncio.StreamWriter, writer), "10.0.0.7:5555", "d:1", "r"
+                )
+            )  # must not raise
+        assert "EGRESS DENY" in "\n".join(logs.output)
+
+
+class TestCloseClientWriterContract(unittest.TestCase):
+    """Teardown must never let a vanished client crash the accept loop."""
+
+    def test_closes_a_healthy_writer(self):
+        class _QuietWriter:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            async def wait_closed(self):
+                pass
+
+        writer = _QuietWriter()
+        asyncio.run(close_client_writer(cast(asyncio.StreamWriter, writer)))
+        assert writer.closed
+
+    def test_swallows_close_and_wait_errors(self):
+        class _ExplodingClose:
+            def close(self):
+                raise OSError("transport already gone")
+
+            async def wait_closed(self):
+                raise AssertionError("close failed first")
+
+        class _ExplodingWait:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            async def wait_closed(self):
+                raise ConnectionResetError("client RST during teardown")
+
+        asyncio.run(close_client_writer(cast(asyncio.StreamWriter, _ExplodingClose())))
+
+        writer = _ExplodingWait()
+        asyncio.run(close_client_writer(cast(asyncio.StreamWriter, writer)))
+        assert writer.closed

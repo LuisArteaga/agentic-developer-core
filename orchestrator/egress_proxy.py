@@ -128,17 +128,17 @@ class EgressProxy:
             )
             target = self._parse_connect(request_line)
             if target is None:
-                await self._deny(writer, client, "-", "not a CONNECT request")
+                await deny_response(writer, client, "-", "not a CONNECT request")
                 return
             host, port = target
             allowed, reason = classify_target(host, self._allowlist)
             if not allowed:
-                await self._deny(writer, client, f"{host}:{port}", reason)
+                await deny_response(writer, client, f"{host}:{port}", reason)
                 return
             try:
                 pinned_ip, upstream_port = await self._resolve(host, port)
             except EgressDeniedError as e:
-                await self._deny(writer, client, f"{host}:{port}", str(e))
+                await deny_response(writer, client, f"{host}:{port}", str(e))
                 return
             logger.debug(
                 "EGRESS ALLOW client=%s host=%s pinned=%s:%s",
@@ -153,7 +153,7 @@ class EgressProxy:
                     timeout=CONNECT_TIMEOUT_SECONDS,
                 )
             except (OSError, TimeoutError) as e:
-                await self._deny(
+                await deny_response(
                     writer,
                     client,
                     f"{host}:{port}",
@@ -167,25 +167,15 @@ class EgressProxy:
         except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError):
             pass  # client vanished mid-request — nothing to answer
         finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
-                pass
+            await close_client_writer(writer)
 
     @staticmethod
     def _parse_connect(request_line: bytes) -> tuple[str, int] | None:
         """Extract ``(host, port)`` from a CONNECT request line, else None."""
-        try:
-            text = request_line.decode("latin-1").strip()
-        except UnicodeDecodeError:
-            return None
+        text = request_line.decode("latin-1").strip()
         if not text.upper().startswith(_CONNECT_PREFIX):
             return None
-        parts = text.split(" ")
-        if len(parts) < 2:
-            return None
-        target = parts[1]
+        target = text.split(" ")[1]
         parsed = urlsplit(f"//{target}")
         host = parsed.hostname
         raw_port = parsed.port
@@ -194,25 +184,6 @@ class EgressProxy:
         if raw_port is None:
             return None
         return host, raw_port
-
-    @staticmethod
-    async def _deny(
-        writer: asyncio.StreamWriter, client: str, destination: str, reason: str
-    ) -> None:
-        logger.warning(
-            "EGRESS DENY client=%s destination=%s reason=%s",
-            client,
-            destination,
-            reason,
-        )
-        try:
-            writer.write(
-                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
-                b"Connection: close\r\n\r\n"
-            )
-            await writer.drain()
-        except (ConnectionError, OSError):
-            pass
 
     @staticmethod
     async def _relay(
@@ -244,6 +215,50 @@ class EgressProxy:
             _pump(upstream_reader, client_writer),
             return_exceptions=True,
         )
+
+
+async def deny_response(
+    writer: asyncio.StreamWriter, client: str, destination: str, reason: str
+) -> None:
+    """Answer a refused CONNECT with ``HTTP/1.1 403`` and log the denial.
+
+    Public contract of the egress proxy's deny protocol (every refusal —
+    non-CONNECT input, non-allowlisted domain, unsafe DNS answer, failed
+    upstream — funnels here). The write is guarded: a sandbox that closes
+    its socket (RST) before reading the answer must not crash the proxy,
+    so the drain may raise ``ConnectionError``/``OSError`` and is swallowed
+    after the WARNING log records client, destination, and reason.
+    """
+    logger.warning(
+        "EGRESS DENY client=%s destination=%s reason=%s",
+        client,
+        destination,
+        reason,
+    )
+    try:
+        writer.write(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        await writer.drain()
+    except (ConnectionError, OSError):
+        pass
+
+
+async def close_client_writer(writer: asyncio.StreamWriter) -> None:
+    """Close the client side of a handled request, swallowing close errors.
+
+    Public contract of the proxy's per-connection teardown (the ``finally``
+    of every handled request): by the time the handler finishes, the sandbox
+    may already have RST-closed its socket, so ``close()``/``wait_closed()``
+    may raise ``ConnectionError``/``OSError`` — the teardown must never let
+    that escape into the accept loop, or one vanished client would take the
+    proxy down with it.
+    """
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except (ConnectionError, OSError):
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:

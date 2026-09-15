@@ -281,6 +281,18 @@ class TestConnectProbe(unittest.TestCase):
         finally:
             server.close()
 
+    def test_server_closing_before_answer_yields_no_status(self):
+        # A proxy that accepts and closes without answering (crashed proxy,
+        # RST race) must degrade to "no status" (0), not crash or hang.
+        server = _StatusServer(b"")
+        try:
+            code = setup_mod._connect_probe(
+                "169.254.169.254", 80, f"http://127.0.0.1:{server.port}"
+            )
+            self.assertEqual(code, 0)
+        finally:
+            server.close()
+
 
 class TestVerify(unittest.TestCase):
     def test_all_refusals_pass(self):
@@ -334,6 +346,15 @@ class TestMainRouting(unittest.TestCase):
         fake_verify.assert_called_once()
         assert fake_verify.call_args.kwargs["live"] is True
 
+    def test_rules_command_routes_to_apply_rules(self):
+        with patch.object(
+            setup_mod, "resolve_sandbox_egress", return_value=_egress_config()
+        ):
+            with patch.object(setup_mod, "_apply_rules", return_value=0) as fake_rules:
+                rc = setup_mod.main(["rules"])
+        self.assertEqual(rc, 0)
+        fake_rules.assert_called_once()
+
     def test_all_runs_sequence_and_stops_on_first_failure(self):
         with patch.object(
             setup_mod, "resolve_sandbox_egress", return_value=_egress_config()
@@ -343,6 +364,18 @@ class TestMainRouting(unittest.TestCase):
                     with patch.object(setup_mod, "_verify", return_value=0):
                         rc = setup_mod.main(["all"])
         self.assertEqual(rc, 1)
+
+    def test_all_stops_before_rules_when_network_fails(self):
+        with patch.object(
+            setup_mod, "resolve_sandbox_egress", return_value=_egress_config()
+        ):
+            with patch.object(setup_mod, "_ensure_network", return_value=1):
+                with patch.object(
+                    setup_mod, "_apply_rules", return_value=0
+                ) as fake_rules:
+                    rc = setup_mod.main(["all"])
+        self.assertEqual(rc, 1)
+        fake_rules.assert_not_called()
 
     def test_all_happy_path_runs_verify_last(self):
         with patch.object(
