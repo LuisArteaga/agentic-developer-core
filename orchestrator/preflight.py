@@ -28,23 +28,35 @@ Checks, in order (runsc mode — the default):
 ``AGENT_SANDBOX_RUNTIME=runc`` (the explicit dev-only override) skips the
 gVisor-specific checks and verifies only daemon reachability, after logging
 a loud multi-line warning about the shared-kernel trade-off.
+
+Egress enforcement (FR-5, issue #162 / ADR-0060) is verified in BOTH
+runtime modes: the dedicated egress network must exist with the configured
+subnet (the nftables ruleset is generated for that subnet — a drift would
+leave sandboxes unpoliced), and the host-side egress proxy must accept TCP
+connections. A missing network or unreachable proxy refuses the start —
+fail closed, matching the runtime posture.
 """
 
+import ipaddress
 import json
 import logging
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from orchestrator.sandbox import (
+    DEFAULT_PROXY_PROBE_URL,
     DEFAULT_SANDBOX_RUNTIME,
     SANDBOX_RUNTIME_OVERRIDE,
     SandboxConfigError,
     SandboxError,
     SandboxUnavailableError,
+    resolve_sandbox_egress,
     resolve_sandbox_runtime,
 )
 
@@ -185,6 +197,75 @@ def _check_runtime_registered() -> None:
         )
 
 
+def _check_egress_network(subnet: ipaddress.IPv4Network, network: str) -> None:
+    """Raise unless the egress network exists with the configured subnet.
+
+    The nftables ruleset polices sandbox traffic BY SOURCE SUBNET — if the
+    live network drifted to a different subnet, the applied rules no longer
+    match sandbox traffic and the lockdown is silently void. That mismatch
+    is a loud configuration error, never a warning.
+    """
+    fmt = "{{json .IPAM.Config}}"
+    try:
+        probe = subprocess.run(
+            ["docker", "network", "inspect", "--format", fmt, network],
+            capture_output=True,
+            timeout=_DAEMON_PROBE_TIMEOUT,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SandboxUnavailableError(f"docker network inspect failed: {e}") from e
+    if probe.returncode != 0:
+        raise SandboxUnavailableError(
+            f"Egress network {network!r} not found: run "
+            "`python3 scripts/egress_setup.py network` (root) per "
+            "docs/runbook-sandbox-egress.md — the orchestrator refuses to "
+            "run without egress enforcement (fail closed, ADR-0056 FR-5): "
+            + _snippet(probe.stderr)
+        )
+    try:
+        ipam = json.loads(probe.stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        raise SandboxConfigError(
+            f"docker network inspect returned an unparseable IPAM listing "
+            f"for {network!r}; the egress subnet cannot be verified — "
+            + _snippet(probe.stdout)
+        ) from None
+    live_subnets = {entry.get("Subnet") for entry in ipam if isinstance(entry, dict)}
+    if str(subnet) not in live_subnets:
+        raise SandboxConfigError(
+            f"Egress network {network!r} drifted: configured subnet "
+            f"{subnet} is not among the live subnets {sorted(filter(None, live_subnets))}. "
+            "Recreate the network via scripts/egress_setup.py and regenerate "
+            "the nftables ruleset (the lockdown polices the CONFIGURED "
+            "subnet only — see docs/runbook-sandbox-egress.md)"
+        )
+
+
+def _check_egress_proxy() -> None:
+    """Raise unless the host-side egress proxy accepts TCP connections."""
+    raw = os.getenv("AGENT_EGRESS_PROXY_PROBE_URL", DEFAULT_PROXY_PROBE_URL).strip()
+    parsed = urlsplit(raw if "//" in raw else f"//{raw}")
+    host = parsed.hostname
+    port = parsed.port or 3128
+    if not host or parsed.scheme not in ("", "http"):
+        raise SandboxConfigError(
+            f"AGENT_EGRESS_PROXY_PROBE_URL {raw!r} must be an http URL (no "
+            "scheme defaults to http), e.g. http://127.0.0.1:3128"
+        )
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            pass
+    except OSError as e:
+        raise SandboxUnavailableError(
+            f"Egress proxy unreachable at {host}:{port} ({e}): start it per "
+            "docs/runbook-sandbox-egress.md (host systemd unit, "
+            "`python -m orchestrator.egress_proxy`) — the orchestrator "
+            "refuses to run without the sandbox egress proxy (fail closed, "
+            "ADR-0056 FR-5)"
+        ) from e
+
+
 def run_preflight() -> str:
     """Verify the configured sandbox runtime; return the runtime name.
 
@@ -194,6 +275,14 @@ def run_preflight() -> str:
     """
     runtime = resolve_sandbox_runtime()
     _probe_daemon_version()
+    egress = resolve_sandbox_egress()
+    _check_egress_network(egress.subnet, egress.network)
+    _check_egress_proxy()
+    logger.info(
+        "Egress enforcement verified: network %s (%s) + proxy reachable.",
+        egress.network,
+        egress.subnet,
+    )
     if runtime == SANDBOX_RUNTIME_OVERRIDE:
         logger.warning(
             "*** SANDBOX PREFLIGHT: shared-kernel runtime runc ACTIVE — "
