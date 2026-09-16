@@ -408,6 +408,12 @@ def _probe_endpoint(path: str, token: str) -> tuple[int, Message | None, str]:
     failures (DNS, connection refused, timeout) raise
     ``SandboxUnavailableError``: the supervisor's crash backoff retries the
     whole start, so the probe deliberately does not retry internally.
+
+    The probe URL is always anchored to the hardcoded ``_GITHUB_API_BASE``
+    constant (https scheme); the ``Request`` is built from trusted
+    control-plane configuration, so no probe input can retarget the
+    scheme. This is the audited invariant behind the
+    ``dynamic-urllib-use-detected`` suppression on the ``urlopen`` call.
     """
     request = urllib.request.Request(
         f"{_GITHUB_API_BASE}{path}",
@@ -420,9 +426,7 @@ def _probe_endpoint(path: str, token: str) -> tuple[int, Message | None, str]:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(
-            request, timeout=_PAT_PROBE_TIMEOUT
-        ) as response:  # nosemgrep
+        with urllib.request.urlopen(request, timeout=_PAT_PROBE_TIMEOUT) as response:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected  # fmt: skip
             return (
                 response.status,
                 response.headers,
@@ -553,7 +557,8 @@ def check_pat_scopes() -> None:
         logger.info("PAT scope probe OK (%s): GET %s", probe.permission, path)
         if not token_described:
             logger.info(
-                "Token under validation: %s.", describe_token_type(token, headers)
+                "GitHub PAT class under validation: %s.",
+                describe_token_type(token, headers),
             )
             token_described = True
         if probe.feeds and probe.json_field:
