@@ -116,7 +116,13 @@ _PROXY_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 # is loud config validation on the opt-in allowlist override: requesting one
 # of these names raises instead of silently filtering, so the invariant "the
 # sandbox environment contains none of these under any configuration" holds
-# by construction.
+# by construction. The set is the documented orchestrator secret inventory
+# (.env.example + consumers: GH_PAT/GH_TOKEN/GITHUB_TOKEN tokens, OpenRouter,
+# Langfuse, SmithDB, and the OTLP headers string, whose value may embed an
+# Authorization header) — orchestrator/test_sandbox.py pins this set to the
+# documented inventory so a newly introduced secret cannot bypass it.
+# JUDGE_GH_TOKEN is deliberately absent: it is a Target-Repository CI secret
+# consumed by the judges' own workflow runs, never an orchestrator env var.
 FORBIDDEN_SANDBOX_ENV_NAMES = frozenset(
     {
         "GH_PAT",
@@ -125,6 +131,8 @@ FORBIDDEN_SANDBOX_ENV_NAMES = frozenset(
         "OPENROUTER_API_KEY",
         "LANGFUSE_PUBLIC_KEY",
         "LANGFUSE_SECRET_KEY",
+        "SMITHDB_API_KEY",
+        "OTEL_EXPORTER_OTLP_HEADERS",
     }
 )
 

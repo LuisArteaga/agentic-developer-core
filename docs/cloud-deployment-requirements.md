@@ -96,6 +96,20 @@ fail-closed (`orchestrator/preflight.py`); operational procedures:
 - Regression test asserting the sandbox environment contains none of
   `GH_PAT`/`OPENROUTER_API_KEY`/Langfuse keys under any configuration.
 
+Implemented by two layers (issue #163): the sandbox env invariant —
+`orchestrator/sandbox.py::FORBIDDEN_SANDBOX_ENV_NAMES` holds the full
+documented orchestrator secret inventory, `build_sandbox_env` rejects any
+allowlist override requesting one, and
+`orchestrator/test_sandbox.py::TestForbiddenSandboxEnvMatrix` regression-tests
+every secret name against every configuration — plus the startup PAT scope
+validation — `orchestrator/preflight.py::check_pat_scopes` probes the loop's
+own read endpoints behaviorally (GitHub exposes no scope-enumeration API for
+fine-grained PATs) and refuses to start with an actionable gap report;
+`python -m orchestrator.preflight --scopes-only` validates a staged token on
+any machine. Operational procedures, the Workflows-scope gotcha, and the
+fine-grained Checks-permission known gap:
+[runbook-pat-scoping.md](runbook-pat-scoping.md).
+
 ### FR-7 Resource caps & lifecycle mapping
 
 - Per-sandbox CPU/memory/PID/disk caps (fork-bomb/runaway-loop containment).
