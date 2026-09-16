@@ -26,6 +26,7 @@ from orchestrator.sandbox import (
     DEFAULT_SANDBOX_RUNTIME,
     SANDBOX_RUNTIME_OVERRIDE,
     DockerSandboxRunner,
+    FORBIDDEN_SANDBOX_ENV_NAMES,
     SandboxConfigError,
     SandboxEgressConfig,
     SandboxError,
@@ -123,6 +124,65 @@ class TestBuildSandboxEnv(unittest.TestCase):
         with _clean_env({"AGENT_SANDBOX_ENV_ALLOWLIST": "GH_TOKEN"}):
             with self.assertRaises(SandboxConfigError):
                 build_sandbox_env()
+
+
+class TestForbiddenSandboxEnvMatrix(unittest.TestCase):
+    """FR-6 regression matrix (issue #163): NO configuration path places an
+    orchestrator secret inside the sandbox environment.
+
+    Parametrized over the full documented secret inventory × the env-
+    construction configurations (default / allowlist override with the
+    secret present / override with the secret absent), plus an inventory
+    pin so a newly introduced orchestrator secret cannot silently bypass
+    the forbidden-name guard.
+    """
+
+    # The documented orchestrator secret inventory (.env.example + its
+    # consumers: orchestrator/nodes.py GitHub API auth, orchestrator/git.py
+    # credential helper, scripts/telemetry.py Langfuse/SmithDB/OTLP headers).
+    # A new secret in .env.example MUST be added to FORBIDDEN_SANDBOX_ENV_NAMES
+    # and here — the pin below fails loudly otherwise. JUDGE_GH_TOKEN is
+    # deliberately absent: it is a Target-Repository CI secret consumed by the
+    # judges' own workflow runs, never an orchestrator environment variable
+    # (issue #163 cross-cutting note).
+    DOCUMENTED_SECRET_INVENTORY = frozenset(
+        {
+            "GH_PAT",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "OPENROUTER_API_KEY",
+            "LANGFUSE_PUBLIC_KEY",
+            "LANGFUSE_SECRET_KEY",
+            "SMITHDB_API_KEY",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+        }
+    )
+
+    def test_documented_inventory_is_fully_rejected(self):
+        # Anti-drift pin: the forbidden-name guard must equal the documented
+        # secret inventory exactly — no secret left unprotected, no
+        # non-secret name blocked without documentation.
+        self.assertEqual(FORBIDDEN_SANDBOX_ENV_NAMES, self.DOCUMENTED_SECRET_INVENTORY)
+
+    def test_secrets_never_reach_sandbox_env_under_any_configuration(self):
+        for name in sorted(FORBIDDEN_SANDBOX_ENV_NAMES):
+            with self.subTest(secret=name):
+                # (a) default configuration: nothing is forwarded, ever.
+                with _clean_env({name: "secret-value", "PATH": "/usr/bin"}):
+                    self.assertEqual(build_sandbox_env(), {})
+                # (b) override requesting the secret while it is present:
+                # loud rejection, never a silent pass-through.
+                with _clean_env(
+                    {name: "secret-value", "AGENT_SANDBOX_ENV_ALLOWLIST": name}
+                ):
+                    with self.assertRaises(SandboxConfigError) as ctx:
+                        build_sandbox_env()
+                    assert name in str(ctx.exception)
+                # (c) override requesting the secret while it is absent:
+                # config validation is independent of the parent environment.
+                with _clean_env({"AGENT_SANDBOX_ENV_ALLOWLIST": name}):
+                    with self.assertRaises(SandboxConfigError):
+                        build_sandbox_env()
 
 
 class TestDockerSandboxRunnerCreate(unittest.TestCase):

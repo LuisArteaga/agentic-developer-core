@@ -151,22 +151,24 @@ def verify_reachability():
 
 
 def preflight_sandbox_runtime():
-    """Verify the sandbox runtime before the first cycle (ADR-0056 FR-4, #161).
+    """Verify sandbox runtime and credential scopes before the first cycle.
 
     Runs ``python -m orchestrator.preflight`` as a subprocess — NOT an import:
     the supervisor stays a zero-dependency process that never imports the
     orchestrator package (ADR-0015); it merely spawns it, exactly like
     ``run_iteration`` does. A non-zero exit (runtime missing, kernel too
-    old, runsc not registered with the daemon) refuses to start the
-    orchestrator: fail closed, never a silent degradation to shared-kernel
-    containers. ``AGENT_SANDBOX_RUNTIME=runc`` is honored as the explicit,
+    old, runsc not registered with the daemon, or the GitHub PAT failing
+    the FR-6 scope probes) refuses to start the orchestrator: fail closed,
+    never a silent degradation. The 180s subprocess bound covers the five
+    bounded GitHub API probes (10s each worst case) plus the daemon probes.
+    ``AGENT_SANDBOX_RUNTIME=runc`` is honored as the explicit,
     loudly-warned dev-only override.
     """
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "orchestrator.preflight"],
             capture_output=True,
-            timeout=90,
+            timeout=180,
         )
     except subprocess.SubprocessError as e:
         log(f"Sandbox runtime preflight could not run: {e}", "ERROR")
@@ -179,7 +181,7 @@ def preflight_sandbox_runtime():
         )
         log(f"Sandbox runtime preflight failed; refusing to start:\n{detail}", "ERROR")
         sys.exit(1)
-    log("Sandbox runtime preflight passed (ADR-0056 FR-4).")
+    log("Startup preflight passed (sandbox runtime FR-4 + PAT scopes FR-6).")
 
 
 def run_iteration(
