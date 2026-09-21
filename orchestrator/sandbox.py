@@ -31,11 +31,19 @@ dependency, same subprocess pattern as ``orchestrator.git``, ADR-0007):
   surface as client exit 1, and 125/126/127 are docker-reserved — so a
   non-zero ``docker run`` exit is classified by inspecting the container's
   recorded ``State`` (Status == "exited" → the command ran; its ExitCode is
-  data). This makes a false-green verify structurally impossible. Completed
-  exec containers are removed by ``destroy()`` (the caller's lifecycle hook),
-  keeping the exec path free of extra docker round-trips on success.
-- ``destroy`` removes any containers this runner instance spawned and is
-  idempotent; it is best-effort and never raises.
+  data). This makes a false-green verify structurally impossible. A completed
+  exec container is removed as soon as its command has been classified
+  (``remove_sandbox_container``) — success or data exit alike — so at most one
+  in-flight container exists per runner at any time. Rationale (FR-7, issue
+  #164): a stopped container keeps its writable layer, so a Worker command
+  that installs packages would otherwise accumulate megabytes per exec until
+  the cycle ends, and a crash would hand every one of them to the startup
+  sweep. ``destroy`` therefore only has leftovers to remove (an in-flight
+  container, or one whose removal failed).
+- ``destroy`` removes any container this runner instance still tracks and is
+  idempotent; it is best-effort — each removal is retried once and a
+  persistent failure is logged loudly with the container name (manual cleanup
+  is ``docker rm -f <name>``) — and never raises.
 
 Fail closed (issue #159 constraint, ADR-0056): there is NO host-side
 fallback. ``get_sandbox_runner`` only returns the Docker backend; an
@@ -68,6 +76,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -85,6 +94,23 @@ DEFAULT_SANDBOX_IMAGE = "python:3.12"
 DEFAULT_SANDBOX_CPUS = "2"
 DEFAULT_SANDBOX_MEMORY = "4g"
 DEFAULT_SANDBOX_PIDS_LIMIT = "512"
+# Bounded tmpfs for the container's scratch space (FR-7, issue #164): the
+# image's own /tmp lives in the container's writable layer, so without a cap
+# a runaway build can fill the host disk. Docker's default tmpfs ceiling is
+# 50% of host RAM (docs.docker.com/engine/storage/tmpfs), which is not a cap
+# in any useful sense on a 16 GB deployment host — hence an explicit size.
+DEFAULT_SANDBOX_TMPFS_SIZE = "512m"
+
+# Cycle-ownership labels (FR-7, issue #164). Every sandbox container carries
+# the managed marker; the cycle label names the issue cycle that owns it, so
+# the startup sweep can tell this deployment's orphans from containers it
+# never spawned. Label keys are pinned by orchestrator/test_sandbox.py.
+SANDBOX_MANAGED_LABEL = "agdc.sandbox.managed"
+SANDBOX_CYCLE_LABEL = "agdc.sandbox.cycle"
+
+# Removal attempts for one container (the first try plus one retry) before the
+# failure is escalated to an operator-facing ERROR (FR-7, issue #164).
+_REMOVE_ATTEMPTS = 2
 
 # Container runtime for sandbox containers (FR-4, issue #161). The default
 # ``runsc`` (gVisor user-space kernel) is a hard requirement: when it is not
@@ -153,6 +179,83 @@ class SandboxImageMissingError(SandboxError):
     """The configured sandbox image is not present on the host."""
 
 
+# Resource caps that can stop a command inside the sandbox (FR-7, issue
+# #164) and the actionable explanation each one owes the Worker. A cap hit is
+# a *failed attempt*, never runner infrastructure: the command did not run to
+# completion, so the deterministic gate stays red, but the raw output alone
+# ("Killed") tells the Worker nothing about how to proceed.
+CAP_HIT_MESSAGES = {
+    "memory": (
+        "the sandbox hit its memory cap (AGENT_SANDBOX_MEMORY) and the kernel "
+        "killed the command — reduce the command's memory footprint or raise "
+        "the cap for this deployment"
+    ),
+    "pids": (
+        "the sandbox hit its process cap (AGENT_SANDBOX_PIDS_LIMIT) and could "
+        "not fork — a runaway process tree (fork bomb) or an unbounded test "
+        "parallelism, not a missing dependency"
+    ),
+    "disk": (
+        "the sandbox ran out of disk space (bounded tmpfs scratch space, "
+        "AGENT_SANDBOX_TMPFS_SIZE) — reduce the artifact written, or raise the "
+        "cap for this deployment"
+    ),
+}
+
+
+def classify_cap_hit(exit_code: int, state: dict | None, output: str) -> str | None:
+    """Name the resource cap that stopped a command, if any (FR-7, #164).
+
+    Returns ``"memory"``, ``"pids"``, ``"disk"`` or ``None``. The signals are
+    deliberately conservative — a false positive would misdirect the Worker,
+    while a missed cap hit merely degrades to raw output:
+
+    - ``memory`` — Docker recorded ``OOMKilled`` on the container. The
+      authoritative signal: exit code 137 is ``SIGKILL`` and is *not*
+      sufficient on its own, since an external ``docker kill`` produces the
+      same code with ``OOMKilled: false``.
+    - ``pids`` — the command exited non-zero and reported a fork failure in
+      the kernel's own EAGAIN wording ("Resource temporarily unavailable",
+      usually after the shell's "can't fork:"/"unable to fork"). The exit code
+      is deliberately *not* pinned: the kernel rejects the fork rather than
+      killing the container, so the shell reports an ordinary failure with its
+      own code (busybox ``sh`` exits 2, bash 1), and a live probe on a
+      pids-limited container produced exactly
+      ``sh: can't fork: Resource temporarily unavailable`` with exit ``2``.
+    - ``disk`` — the output reports ``ENOSPC`` ("No space left on device").
+
+    Every classification requires a non-zero exit: a command that exited 0 ran
+    to its own completion, so a marker in its output is something it handled or
+    warned about, not the cap that stopped it (the caller only consults this on
+    the failed-exit path anyway).
+    """
+    if exit_code == 0:
+        return None
+    if state is not None and state.get("OOMKilled") is True:
+        return "memory"
+    lowered = output.lower()
+    if "no space left on device" in lowered:
+        return "disk"
+    if any(
+        marker in lowered
+        for marker in (
+            "resource temporarily unavailable",
+            "unable to fork",
+            "cannot fork",
+            "failed to fork",
+        )
+    ):
+        return "pids"
+    return None
+
+
+def cap_hit_message(cap_hit: str) -> str:
+    """Actionable explanation of a cap hit for the Worker (FR-7, #164)."""
+    return CAP_HIT_MESSAGES.get(
+        cap_hit, "the sandbox's resource caps stopped the command"
+    )
+
+
 @dataclass(frozen=True)
 class SandboxExecResult:
     """Outcome of one exec inside the sandbox.
@@ -163,12 +266,19 @@ class SandboxExecResult:
     marks that the command was killed at the exec timeout with partial
     output preserved (``exit_code`` is then the ``-1`` sentinel used by the
     Verify phase).
+
+    ``cap_hit`` names the resource cap that stopped the command (``"memory"``,
+    ``"pids"`` or ``"disk"``, see :func:`classify_cap_hit`) or ``None`` for a
+    command that ran to its own exit. A cap hit is data like any other failed
+    exit — the command did not complete, so the attempt fails — but the caller
+    owes the Worker an actionable explanation instead of raw output (FR-7).
     """
 
     exit_code: int
     output: str
     timed_out: bool = False
     duration_seconds: float = 0.0
+    cap_hit: str | None = None
 
 
 class SandboxRunner(Protocol):
@@ -208,12 +318,15 @@ def build_sandbox_env() -> dict[str, str]:
     return {name: os.environ[name] for name in requested if name in os.environ}
 
 
-def _resolve_sandbox_caps() -> tuple[str, str, str]:
+def _resolve_sandbox_caps() -> tuple[str, str, str, str]:
     """Resolve resource caps from the environment with loud validation."""
     cpus = os.getenv("AGENT_SANDBOX_CPUS", DEFAULT_SANDBOX_CPUS).strip()
     memory = os.getenv("AGENT_SANDBOX_MEMORY", DEFAULT_SANDBOX_MEMORY).strip()
     pids_limit = os.getenv(
         "AGENT_SANDBOX_PIDS_LIMIT", DEFAULT_SANDBOX_PIDS_LIMIT
+    ).strip()
+    tmpfs_size = os.getenv(
+        "AGENT_SANDBOX_TMPFS_SIZE", DEFAULT_SANDBOX_TMPFS_SIZE
     ).strip()
     try:
         cpus_value = float(cpus)
@@ -229,7 +342,17 @@ def _resolve_sandbox_caps() -> tuple[str, str, str]:
         )
     if not memory:
         raise SandboxConfigError("AGENT_SANDBOX_MEMORY must not be blank")
-    return cpus, memory, pids_limit
+    # A malformed tmpfs size would silently become a docker CLI usage error at
+    # the first exec, i.e. a sandbox that never starts — fail closed here. A
+    # zero magnitude is rejected too: it is syntactically fine but makes the
+    # scratch space unusable.
+    tmpfs_match = re.fullmatch(r"([0-9]+)([kmg]?)", tmpfs_size.lower())
+    if tmpfs_match is None or int(tmpfs_match.group(1)) <= 0:
+        raise SandboxConfigError(
+            "AGENT_SANDBOX_TMPFS_SIZE must be a positive size like '512m' or "
+            f"'1g', got {tmpfs_size!r}"
+        )
+    return cpus, memory, pids_limit, tmpfs_size
 
 
 def resolve_sandbox_runtime() -> str:
@@ -356,8 +479,17 @@ def resolve_sandbox_egress() -> SandboxEgressConfig:
     return SandboxEgressConfig(network=network, subnet=subnet, proxy_url=proxy_url)
 
 
-def get_sandbox_runner() -> SandboxRunner:
+def get_sandbox_runner(cycle_token: str | None = None) -> SandboxRunner:
     """Return the configured sandbox backend (default: docker).
+
+    ``cycle_token`` is the ownership token of the issue cycle requesting the
+    sandbox (FR-7, issue #164). It is stamped onto every container this runner
+    spawns as the ``SANDBOX_CYCLE_LABEL`` label, which is what lets the
+    startup sweep distinguish this deployment's orphans from containers it
+    never spawned. Callers normally do not pass it: the cycle-scoped lifecycle
+    (``orchestrator.sandbox_lifecycle``) owns the token and the runner's
+    lifetime, so a bare ``get_sandbox_runner()`` is only used by tests and
+    tooling that needs an unlabeled runner.
 
     Fail closed: any ``AGENT_SANDBOX_BACKEND`` value other than ``docker``
     raises ``SandboxConfigError`` — there is deliberately NO host-side
@@ -373,7 +505,7 @@ def get_sandbox_runner() -> SandboxRunner:
     image = os.getenv("AGENT_SANDBOX_IMAGE", DEFAULT_SANDBOX_IMAGE).strip()
     if not image:
         image = DEFAULT_SANDBOX_IMAGE
-    cpus, memory, pids_limit = _resolve_sandbox_caps()
+    cpus, memory, pids_limit, tmpfs_size = _resolve_sandbox_caps()
     egress = resolve_sandbox_egress()
     return DockerSandboxRunner(
         image=image,
@@ -383,6 +515,8 @@ def get_sandbox_runner() -> SandboxRunner:
         runtime=resolve_sandbox_runtime(),
         egress_network=egress.network,
         egress_proxy_url=egress.proxy_url,
+        tmpfs_size=tmpfs_size,
+        cycle_token=cycle_token,
     )
 
 
@@ -408,6 +542,8 @@ class DockerSandboxRunner:
         runtime: str = DEFAULT_SANDBOX_RUNTIME,
         egress_network: str = DEFAULT_SANDBOX_EGRESS_NETWORK,
         egress_proxy_url: str = DEFAULT_SANDBOX_EGRESS_PROXY_URL,
+        tmpfs_size: str = DEFAULT_SANDBOX_TMPFS_SIZE,
+        cycle_token: str | None = None,
     ):
         self._image = image
         self._cpus = cpus
@@ -416,6 +552,8 @@ class DockerSandboxRunner:
         self._runtime = runtime
         self._egress_network = egress_network
         self._egress_proxy_url = egress_proxy_url
+        self._tmpfs_size = tmpfs_size
+        self._cycle_token = cycle_token
         self._workspace: Path | None = None
         self._containers: list[str] = []
 
@@ -441,7 +579,7 @@ class DockerSandboxRunner:
         if inspect.returncode != 0:
             raise SandboxImageMissingError(
                 f"Sandbox image {self._image!r} not found on the host: "
-                f"{_stderr_snippet(inspect.stderr)} "
+                f"{stderr_snippet(inspect.stderr)} "
                 "(set AGENT_SANDBOX_IMAGE to an image that provides the "
                 "target repository's verify toolchain)"
             )
@@ -449,6 +587,11 @@ class DockerSandboxRunner:
 
     def exec(self, args: list[str], timeout: float) -> SandboxExecResult:
         """Run ``args`` inside the sandbox; non-zero exits are data.
+
+        Every spawn carries the resource caps (CPU/memory/PID/bounded tmpfs)
+        and, when the runner was created with a cycle token, the ownership
+        labels (FR-7). The container is removed as soon as the outcome has
+        been classified, so at most one container per runner exists at a time.
 
         Raises ``SandboxUnavailableError`` when the daemon is unreachable at
         exec time and ``SandboxError`` when the command could not run to
@@ -469,6 +612,10 @@ class DockerSandboxRunner:
             self._memory,
             "--pids-limit",
             self._pids_limit,
+            # Bounded scratch space (FR-7): /tmp is otherwise the container's
+            # writable layer with no ceiling but the host disk.
+            "--tmpfs",
+            f"/tmp:rw,size={self._tmpfs_size},mode=1777",
             "--runtime",
             self._runtime,
             # Egress lockdown (FR-5, ADR-0060): attach to the dedicated
@@ -477,6 +624,16 @@ class DockerSandboxRunner:
             # there is no egress-disabled mode.
             "--network",
             self._egress_network,
+            # Cycle ownership (FR-7, ADR-0061): the managed marker scopes the
+            # startup sweep to containers this deployment spawned; the cycle
+            # label names the cycle that owns the container, so a sweep keeps
+            # the sandboxes of a cycle it is about to resume.
+            "--label",
+            f"{SANDBOX_MANAGED_LABEL}=1",
+        ]
+        if self._cycle_token:
+            argv += ["--label", f"{SANDBOX_CYCLE_LABEL}={self._cycle_token}"]
+        argv += [
             "-v",
             f"{self._workspace}:{SANDBOX_WORKSPACE_MOUNT}",
             "-w",
@@ -515,6 +672,7 @@ class DockerSandboxRunner:
             raise SandboxUnavailableError(f"docker run failed: {e}") from e
         output = (proc.stdout or b"").decode("utf-8", errors="replace")
         if proc.returncode == 0:
+            self._remove_container(name)
             return SandboxExecResult(
                 exit_code=0,
                 output=output,
@@ -526,23 +684,33 @@ class DockerSandboxRunner:
         # contribute an exit code (which is data, not a runner failure).
         state = self._inspect_container_state(name)
         if state is not None and state.get("Status") == "exited":
-            return SandboxExecResult(
-                exit_code=int(state.get("ExitCode", proc.returncode)),
+            exit_code = int(state.get("ExitCode", proc.returncode))
+            result = SandboxExecResult(
+                exit_code=exit_code,
                 output=output,
                 timed_out=False,
                 duration_seconds=time.monotonic() - started,
+                cap_hit=classify_cap_hit(exit_code, state, output),
             )
+            self._remove_container(name)
+            return result
         self._remove_container(name)
         raise SandboxError(
             f"docker run failed without completing the command "
-            f"(client rc={proc.returncode}): {_stderr_snippet(proc.stdout)}"
+            f"(client rc={proc.returncode}): {stderr_snippet(proc.stdout)}"
         )
 
     def destroy(self) -> None:
-        """Remove containers spawned by this runner instance; idempotent."""
+        """Remove containers this runner instance still tracks; idempotent.
+
+        A completed exec already removed its own container, so in the happy
+        path there is nothing left to do — what remains is an in-flight
+        container (timeout/infrastructure path) or one whose removal failed.
+        A name is dropped from the tracking list only once its removal is
+        confirmed, so a repeated ``destroy`` retries exactly the leftovers.
+        """
         for name in list(self._containers):
             self._remove_container(name)
-        self._containers.clear()
 
     # -- docker helpers ------------------------------------------------------
 
@@ -563,7 +731,7 @@ class DockerSandboxRunner:
             raise SandboxUnavailableError(f"docker daemon probe failed: {e}") from e
         if probe.returncode != 0:
             raise SandboxUnavailableError(
-                "docker daemon unreachable: " + _stderr_snippet(probe.stderr)
+                "docker daemon unreachable: " + stderr_snippet(probe.stderr)
             )
 
     def _inspect_container_state(self, name: str) -> dict | None:
@@ -590,19 +758,110 @@ class DockerSandboxRunner:
             return None
         return state if isinstance(state, dict) else None
 
-    def _remove_container(self, name: str) -> None:
+    def _remove_container(self, name: str) -> bool:
+        """Remove one exec container and untrack it once it is gone.
+
+        Returns whether the container is gone. A successful removal drops the
+        name from the tracking list, so ``destroy`` only ever retries genuine
+        leftovers (a container whose removal failed earlier); a failed removal
+        keeps it tracked for that retry.
+        """
+        if not remove_sandbox_container(name, timeout=self._REMOVE_TIMEOUT):
+            return False
+        if name in self._containers:
+            self._containers.remove(name)
+        return True
+
+
+def remove_sandbox_container(name: str, timeout: int = 30) -> bool:
+    """Force-remove one sandbox container by name; never raises (FR-7, #164).
+
+    Best-effort by contract: cleanup must never block recovery routing, so a
+    failure is retried once and then logged loudly with the container name and
+    the manual-cleanup command (a sandbox that outlives its cycle is a
+    deployment problem an operator has to see). Returns True when the
+    container is gone — including when it was already gone, since ``docker rm
+    -f`` is idempotent and its "no such container" exit is indistinguishable
+    from a race the operator does not care about.
+    """
+    detail = "no output"
+    for attempt in range(1, _REMOVE_ATTEMPTS + 1):
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 ["docker", "rm", "-f", name],
                 capture_output=True,
-                timeout=self._REMOVE_TIMEOUT,
+                timeout=timeout,
                 shell=False,
             )
         except (OSError, subprocess.SubprocessError) as e:
-            logger.warning("Best-effort sandbox removal of %s failed: %s", name, e)
+            detail = str(e)
+        else:
+            if proc.returncode == 0:
+                return True
+            detail = stderr_snippet(proc.stderr) or stderr_snippet(proc.stdout)
+        if attempt < _REMOVE_ATTEMPTS:
+            logger.warning(
+                "Sandbox container removal attempt %d/%d failed for %s: %s",
+                attempt,
+                _REMOVE_ATTEMPTS,
+                name,
+                detail,
+            )
+    logger.error(
+        "Sandbox container %s could not be removed after %d attempts (%s); "
+        "manual cleanup required: docker rm -f %s",
+        name,
+        _REMOVE_ATTEMPTS,
+        detail,
+        name,
+    )
+    return False
 
 
-def _stderr_snippet(raw: bytes | None, limit: int = 300) -> str:
+def list_managed_sandbox_containers(timeout: int = 30) -> list[tuple[str, str]]:
+    """List this deployment's sandbox containers as ``(name, cycle)`` pairs.
+
+    Selects on the ``SANDBOX_MANAGED_LABEL`` marker only, so containers this
+    deployment never spawned are never candidates for the sweep; the second
+    element is the container's ``SANDBOX_CYCLE_LABEL`` value (empty string when
+    unlabeled), which the caller compares against the resumable cycle. Raises
+    ``SandboxUnavailableError`` when the daemon or the CLI is unavailable — the
+    sweep's caller decides how to degrade.
+    """
+    try:
+        listing = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"label={SANDBOX_MANAGED_LABEL}=1",
+                "--format",
+                f'{{{{.Names}}}} {{{{.Label "{SANDBOX_CYCLE_LABEL}"}}}}',
+            ],
+            capture_output=True,
+            timeout=timeout,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SandboxUnavailableError(f"docker ps failed: {e}") from e
+    if listing.returncode != 0:
+        raise SandboxUnavailableError(
+            "docker ps failed: " + stderr_snippet(listing.stderr)
+        )
+    containers: list[tuple[str, str]] = []
+    for line in listing.stdout.decode("utf-8", errors="replace").splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        name = fields[0]
+        cycle = fields[1] if len(fields) > 1 else ""
+        containers.append((name, cycle))
+    return containers
+
+
+def stderr_snippet(raw: bytes | None, limit: int = 300) -> str:
+    """Decode a captured stream for log/error messages, bounded and never empty."""
     text = (raw or b"").decode("utf-8", errors="replace").strip()
     if len(text) > limit:
         text = text[:limit] + "…"

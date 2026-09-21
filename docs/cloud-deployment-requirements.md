@@ -118,6 +118,20 @@ fine-grained Checks-permission known gap:
   preserved); destroyed on Failure Recovery and at cycle end; recreated on
   Stateful Resume if absent (fresh clone of the resumed branch).
 
+Implemented by the caps on every spawn (`orchestrator/sandbox.py::_resolve_sandbox_caps`
+→ `--cpus`/`--memory`/`--pids-limit`/bounded `--tmpfs`, env knobs
+`AGENT_SANDBOX_CPUS`/`AGENT_SANDBOX_MEMORY`/`AGENT_SANDBOX_PIDS_LIMIT`/`AGENT_SANDBOX_TMPFS_SIZE`,
+fail-closed validation) and the cycle-scoped lifecycle
+(`orchestrator/sandbox_lifecycle.py`: `acquire_cycle_sandbox`/`release_cycle_sandbox`
+bind the cycle's single sandbox identity, released on merge, Failure Recovery
+and Security-Block quarantine; `sweep_orphaned_sandboxes` removes at startup
+what a crash left behind, keeping only the containers of the cycle being
+resumed) with owner-based container cleanup in `orchestrator/sandbox.py`
+(`SANDBOX_MANAGED_LABEL`/`SANDBOX_CYCLE_LABEL`, `classify_cap_hit` — a cap hit is
+a failed attempt with actionable feedback, never runner infrastructure) —
+ADR-0061, issue #164; operational procedures:
+[runbook-sandbox-lifecycle.md](runbook-sandbox-lifecycle.md).
+
 ### FR-8 Deployment stack & operations
 
 - Ubuntu LTS on the VPS; minimum 4 dedicated cores / 8 GB RAM,
