@@ -697,27 +697,20 @@ class TestCodebaseTools(unittest.TestCase):
         res = patch_file("/etc/passwd", "root", "toot")
         self.assertIn("Access denied", res)
 
-    def _sandbox_stub(self, outcomes, create_error=None):
-        """Build a SandboxRunner stand-in driving run_command's sandbox seam.
+    def _sandbox_stub(self, outcomes):
+        """Build a cycle-sandbox stand-in driving run_command's sandbox seam.
 
         ``outcomes`` is consumed per exec call (entries: SandboxExecResult or
-        Exception instances); ``create_error`` makes create() raise (sandbox
-        unavailable at spawn). Records the create workspace, exec
-        ``(args, timeout)`` and destroy count so tests can assert the runner
+        Exception instances). Records the workspace it was acquired for and
+        the exec ``(args, timeout)`` calls, so tests can assert the sandbox
         contract without touching Docker. Patch target:
-        ``orchestrator.tools.get_sandbox_runner``.
+        ``orchestrator.tools.acquire_cycle_sandbox``.
         """
 
-        class _StubSandboxRunner:
+        class _StubCycleSandbox:
             def __init__(self):
-                self.created = None
+                self.workspaces = []
                 self.exec_calls = []
-                self.destroy_count = 0
-
-            def create(self, workspace):
-                if create_error is not None:
-                    raise create_error
-                self.created = workspace
 
             def exec(self, args, timeout):
                 self.exec_calls.append((list(args), timeout))
@@ -726,14 +719,15 @@ class TestCodebaseTools(unittest.TestCase):
                     raise outcome
                 return outcome
 
-            def destroy(self):
-                self.destroy_count += 1
-
-        return _StubSandboxRunner()
+        return _StubCycleSandbox()
 
     def _patched_runner(self, stub):
+        def _acquire(workspace):
+            stub.workspaces.append(workspace)
+            return stub
+
         return unittest.mock.patch(
-            "orchestrator.tools.get_sandbox_runner", return_value=stub
+            "orchestrator.tools.acquire_cycle_sandbox", side_effect=_acquire
         )
 
     def test_run_command_success(self):
@@ -742,11 +736,27 @@ class TestCodebaseTools(unittest.TestCase):
         with self._patched_runner(stub):
             res = run_command("python3 -c \"print('hello')\"")
         self.assertEqual(res.strip(), "hello")
-        # The runner contract: workspace bind at create, parsed args + the
-        # tool-level 300 s timeout at exec, exactly one lifecycle destroy.
-        self.assertEqual(stub.created, self.temp_dir_path)
+        # The sandbox contract: acquired for the project root, parsed args +
+        # the tool-level 300 s timeout at exec.
+        self.assertEqual(stub.workspaces, [self.temp_dir_path])
         self.assertEqual(stub.exec_calls, [(["python3", "-c", "print('hello')"], 300)])
-        self.assertEqual(stub.destroy_count, 1)
+
+    def test_run_command_cap_hit_reports_actionable_remedy(self):
+        """A resource cap hit is surfaced as an actionable error, not as a
+        silent partial output (issue #164 AC3)."""
+        stub = self._sandbox_stub(
+            [
+                SandboxExecResult(
+                    exit_code=137,
+                    output="partial\n",
+                    cap_hit="memory",
+                )
+            ]
+        )
+        with self._patched_runner(stub):
+            res = run_command("pytest -n 16")
+        self.assertIn("AGENT_SANDBOX_MEMORY", res)
+        self.assertIn("partial", res)
 
     def test_run_command_empty_output(self):
         """Sandbox success with no output keeps the no-output message."""
@@ -762,7 +772,7 @@ class TestCodebaseTools(unittest.TestCase):
         with self._patched_runner(stub):
             res = run_command("echo 'unmatched quote")
         self.assertIn("Failed to parse command string", res)
-        self.assertIsNone(stub.created)
+        self.assertEqual(stub.workspaces, [])
         self.assertEqual(stub.exec_calls, [])
         mock_run.assert_not_called()
 
@@ -773,7 +783,7 @@ class TestCodebaseTools(unittest.TestCase):
         with self._patched_runner(stub):
             res = run_command("")
         self.assertIn("Empty command", res)
-        self.assertIsNone(stub.created)
+        self.assertEqual(stub.workspaces, [])
         mock_run.assert_not_called()
 
     def test_run_command_timeout(self):
@@ -789,7 +799,6 @@ class TestCodebaseTools(unittest.TestCase):
             res = run_command("echo hi")
         self.assertIn("timed out after 300 seconds", res)
         self.assertIn("partial execution output", res)
-        self.assertEqual(stub.destroy_count, 1)
 
     def test_run_command_truncation_lines(self):
         """Sandbox output exceeding 150 lines is truncated (first 30 + last 100)."""
@@ -964,8 +973,6 @@ class TestCodebaseTools(unittest.TestCase):
             res = run_command("echo hi")
         self.assertIn("Failed to run command", res)
         self.assertIn("spawn failed", res)
-        # The lifecycle still completed on the failure path.
-        self.assertEqual(stub.destroy_count, 1)
 
     def test_run_command_timeout_with_no_output(self):
         """A sandbox timeout with no captured output returns the no-output timeout error."""
@@ -975,6 +982,18 @@ class TestCodebaseTools(unittest.TestCase):
         with self._patched_runner(stub):
             res = run_command("echo hi")
         self.assertIn("timed out after 300 seconds with no output", res)
+
+    def test_run_command_cap_hit_returns_actionable_error(self):
+        """AC3: a resource cap firing mid-command is reported to the Worker as
+        the named cap plus the remedy, with the partial output — not as a
+        generic failure the Worker has to guess about."""
+        stub = self._sandbox_stub(
+            [SandboxExecResult(exit_code=137, output="partial\n", cap_hit="pids")]
+        )
+        with self._patched_runner(stub):
+            res = run_command("make verify")
+        self.assertIn("AGENT_SANDBOX_PIDS_LIMIT", res)
+        self.assertIn("partial", res)
 
     # ------------------------------------------------------------------
     # Execution Sandbox containment (issue #160, FR-3): fail closed, no host
@@ -995,12 +1014,10 @@ class TestCodebaseTools(unittest.TestCase):
 
     def test_run_command_sandbox_unavailable_fails_closed(self):
         """A sandbox infrastructure failure returns a tool-level error string
-        (never a host fallback, never a crash) and still destroys the runner."""
-        failing = self._sandbox_stub(
-            [], create_error=SandboxUnavailableError("docker daemon unreachable")
-        )
+        (never a host fallback, never a crash)."""
         with unittest.mock.patch(
-            "orchestrator.tools.get_sandbox_runner", return_value=failing
+            "orchestrator.tools.acquire_cycle_sandbox",
+            side_effect=SandboxUnavailableError("docker daemon unreachable"),
         ):
             with unittest.mock.patch(
                 "subprocess.run",
@@ -1009,13 +1026,12 @@ class TestCodebaseTools(unittest.TestCase):
                 res = run_command("make verify")
         self.assertIn("Error: Execution Sandbox unavailable:", res)
         self.assertIn("docker daemon unreachable", res)
-        self.assertEqual(failing.destroy_count, 1)
 
     def test_run_command_sandbox_misconfiguration_fails_loudly(self):
         """A runner misconfiguration (SandboxConfigError, e.g. unsupported
         backend or credential env override) surfaces as the fail-closed error."""
         with unittest.mock.patch(
-            "orchestrator.tools.get_sandbox_runner",
+            "orchestrator.tools.acquire_cycle_sandbox",
             side_effect=SandboxConfigError(
                 "Unsupported AGENT_SANDBOX_BACKEND 'host': only 'docker' is "
                 "implemented and there is no host-side fallback"

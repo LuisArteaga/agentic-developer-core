@@ -13,12 +13,20 @@ import orchestrator.nodes as nodes_module
 from orchestrator.nodes import (
     claim_node,
     execute_node,
+    merge_node,
     plan_node,
+    recovery_node,
     verify_node,
 )
 from orchestrator.sandbox import (
     SandboxExecResult,
     SandboxUnavailableError,
+)
+from orchestrator.sandbox_lifecycle import (
+    acquire_cycle_sandbox,
+    bind_cycle,
+    cycle_token_for_issue,
+    release_cycle_sandbox,
 )
 from orchestrator.state import DEFAULT_STATE, AgentState
 
@@ -34,35 +42,43 @@ def _raw_structured_response(parsed, finish_reason="stop", parsing_error=None):
     return {"raw": raw_msg, "parsed": parsed, "parsing_error": parsing_error}
 
 
-def _verify_exec_result(exit_code=0, output="All tests passed.", timed_out=False):
-    """Build a SandboxExecResult for verify_node tests (sandbox seam)."""
+def _verify_exec_result(
+    exit_code=0, output="All tests passed.", timed_out=False, cap_hit=None
+):
+    """Build a SandboxExecResult for the nodes' sandbox seam."""
     return SandboxExecResult(
-        exit_code=exit_code, output=output, timed_out=timed_out, duration_seconds=0.1
+        exit_code=exit_code,
+        output=output,
+        timed_out=timed_out,
+        duration_seconds=0.1,
+        cap_hit=cap_hit,
     )
 
 
 def _verify_runner_stub(results):
-    """Build a SandboxRunner stand-in driving verify_node's sandbox seam.
+    """Build a cycle-sandbox stand-in driving the nodes' sandbox seam.
 
     ``results`` is consumed per exec call (entries: SandboxExecResult or
-    Exception). Records create/exec/destroy lifecycle calls so tests can
-    assert the runner contract without touching Docker. patch target:
-    ``orchestrator.nodes.get_sandbox_runner``.
+    Exception). Records the workspace it was acquired for and its exec calls
+    so tests can assert the sandbox contract without touching Docker. Patch
+    target: ``orchestrator.nodes.acquire_cycle_sandbox`` (the cycle's sandbox
+    is created and destroyed by the lifecycle module, not by the nodes).
     """
 
-    class _StubSandboxRunner:
+    class _StubCycleSandbox:
         def __init__(self):
-            self.created = None
+            self.workspaces = []
+            self.created = []
             self.exec_calls = []
             self.destroy_count = 0
 
         def create(self, workspace):
-            self.created = workspace
+            self.created.append(workspace)
 
         def exec(self, args, timeout):
             self.exec_calls.append((list(args), timeout))
             if not results:
-                raise AssertionError("unexpected extra exec call on stub runner")
+                raise AssertionError("unexpected extra exec call on stub sandbox")
             outcome = results.pop(0)
             if isinstance(outcome, Exception):
                 raise outcome
@@ -71,7 +87,22 @@ def _verify_runner_stub(results):
         def destroy(self):
             self.destroy_count += 1
 
-    return _StubSandboxRunner()
+    return _StubCycleSandbox()
+
+
+def _acquire_stub(sandbox):
+    """Build an ``acquire_cycle_sandbox`` stand-in returning ``sandbox``.
+
+    Records the workspace each acquisition asked for, so tests can assert
+    that a node acquires the sandbox for its own workspace without reaching
+    into the lifecycle module's state.
+    """
+
+    def _acquire(workspace):
+        sandbox.workspaces.append(workspace)
+        return sandbox
+
+    return _acquire
 
 
 def _make_verify_pass_runner():
@@ -134,7 +165,21 @@ class TestClaimNode(unittest.TestCase):
             check=True,
         )
 
+        # The startup sandbox sweep (ADR-0061) is hermetic here: it would
+        # otherwise run a real `docker ps` per claim. Its keep/remove logic is
+        # covered in test_sandbox_lifecycle; these tests assert the wiring —
+        # which cycle token the Claim-Node passes to it.
+        self.sweep_patcher = patch("orchestrator.nodes.sweep_orphaned_sandboxes")
+        self.mock_sweep = self.sweep_patcher.start()
+        # The Claim-Node also binds the cycle in the process-local lifecycle
+        # state; reset it so a test cannot leak a binding into the next one.
+        release_cycle_sandbox()
+        bind_cycle(None)
+
     def tearDown(self):
+        self.sweep_patcher.stop()
+        release_cycle_sandbox()
+        bind_cycle(None)
         # Restore environment variables
         for k, v in self.original_env.items():
             if v is None:
@@ -145,6 +190,44 @@ class TestClaimNode(unittest.TestCase):
         # Clean up directories
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
+
+    @patch("orchestrator.nodes._github_api_request")
+    def test_resume_sweep_is_told_which_cycle_to_spare(self, mock_api):
+        """AC2 (resume-ownership): a resumed cycle passes its own token to the
+        startup sweep, so the sweep keeps the containers of the cycle it is
+        about to continue instead of destroying a possibly-live sandbox."""
+        subprocess.run(
+            ["git", "checkout", "-b", "feat/issue-10"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+
+        resume_state = DEFAULT_STATE.copy()
+        resume_state["issue_number"] = 10
+        resume_state["status"] = "executing"
+        resume_state["phase"] = "executing"
+        resume_state["branch"] = "feat/issue-10"
+        state_module.save(resume_state)
+
+        new_state = claim_node(resume_state)
+
+        self.assertEqual(new_state["status"], "executing")
+        self.mock_sweep.assert_called_once_with(cycle_token_for_issue(10))
+        mock_api.assert_not_called()
+
+    @patch("orchestrator.nodes._github_api_request")
+    def test_fresh_cycle_sweeps_every_managed_container(self, mock_api):
+        """AC2: a fresh cycle has nothing to resume, so the sweep is given no
+        resumable token and every managed container is an orphan."""
+        mock_api.return_value = []
+
+        state = DEFAULT_STATE.copy()
+        state_module.save(state)
+
+        claim_node(state)
+
+        self.mock_sweep.assert_called_once_with(None)
 
     @patch("orchestrator.nodes._github_api_request")
     def test_normal_claim_flow(self, mock_api):
@@ -1295,12 +1378,12 @@ class TestVerifyNode(unittest.TestCase):
         self.logs_temp.cleanup()
 
     @patch("orchestrator.nodes._get_workspace_diff", return_value="")
-    @patch("orchestrator.nodes.get_sandbox_runner")
-    def test_verify_node_success(self, mock_get_runner, _mock_diff):
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
+    def test_verify_node_success(self, mock_acquire, _mock_diff):
         """Test successful verification: exit code 0, clears feedback and resets attempts."""
         # The sandbox runner stub reports a green make-verify execution.
         runner = _make_verify_pass_runner()
-        mock_get_runner.return_value = runner
+        mock_acquire.side_effect = _acquire_stub(runner)
 
         # Setup initial state with existing attempts and feedback
         state = DEFAULT_STATE.copy()
@@ -1320,15 +1403,15 @@ class TestVerifyNode(unittest.TestCase):
 
         # The gate ran inside the Execution Sandbox with the resolved default
         # command and timeout (AGENT_VERIFY_COMMAND unset in setUp), against
-        # the resolved workspace, and the runner lifecycle was completed.
+        # the resolved workspace. The sandbox itself is created and torn down
+        # by the cycle lifecycle (see test_sandbox_lifecycle), not here.
         self.assertEqual(runner.exec_calls, [(["make", "verify"], 300)])
-        self.assertEqual(runner.created, self.workspace_dir)
-        self.assertEqual(runner.destroy_count, 1)
+        self.assertEqual(runner.workspaces, [self.workspace_dir])
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
-    def test_verify_node_failure_retry(self, mock_get_runner):
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
+    def test_verify_node_failure_retry(self, mock_acquire):
         """Test verification failure with retry: increments attempts, saves feedback, transitions to executing."""
-        mock_get_runner.return_value = _verify_runner_stub(
+        mock_acquire.return_value = _verify_runner_stub(
             [_verify_exec_result(1, "AssertionError: 1 != 2")]
         )
 
@@ -1347,10 +1430,10 @@ class TestVerifyNode(unittest.TestCase):
         self.assertEqual(new_state["attempts"]["verify_cmd"], 2)
         self.assertEqual(new_state["feedback"], "AssertionError: 1 != 2")
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
-    def test_verify_node_failure_max_retries(self, mock_get_runner):
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
+    def test_verify_node_failure_max_retries(self, mock_acquire):
         """Test verification failure exceeding max retries: status transitions to failed."""
-        mock_get_runner.return_value = _verify_runner_stub(
+        mock_acquire.return_value = _verify_runner_stub(
             [_verify_exec_result(1, "AssertionError: 1 != 2")]
         )
 
@@ -1369,10 +1452,10 @@ class TestVerifyNode(unittest.TestCase):
         self.assertEqual(new_state["attempts"]["verify_cmd"], 3)
         self.assertEqual(new_state["feedback"], "AssertionError: 1 != 2")
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
-    def test_verify_node_timeout(self, mock_get_runner):
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
+    def test_verify_node_timeout(self, mock_acquire):
         """Test verification command timing out: captures timeout error, increments attempts."""
-        mock_get_runner.return_value = _verify_runner_stub(
+        mock_acquire.return_value = _verify_runner_stub(
             [
                 SandboxExecResult(
                     exit_code=-1,
@@ -1397,12 +1480,12 @@ class TestVerifyNode(unittest.TestCase):
         self.assertIn("timed out after 300 seconds", new_state["feedback"])
         self.assertIn("Starting tests...", new_state["feedback"])
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
-    def test_verify_node_large_output_under_line_limit(self, mock_get_runner):
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
+    def test_verify_node_large_output_under_line_limit(self, mock_acquire):
         """Test that verify_node correctly truncates output exceeding 10 KB even if it is under the line limit."""
         # Create a single extremely long line of 12 KB
         large_content = "A" * 12000
-        mock_get_runner.return_value = _verify_runner_stub(
+        mock_acquire.return_value = _verify_runner_stub(
             [_verify_exec_result(1, large_content)]
         )
 
@@ -1462,14 +1545,14 @@ class TestVerifyNodeSandboxFailClosed(unittest.TestCase):
         state_module.save(state)
         return state
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     def test_sandbox_infra_failure_records_and_returns_without_retry_budget(
-        self, mock_get_runner
+        self, mock_acquire
     ):
         runner = _verify_runner_stub(
             [SandboxUnavailableError("docker daemon unreachable")]
         )
-        mock_get_runner.return_value = runner
+        mock_acquire.return_value = runner
 
         new_state = verify_node(self._state())
 
@@ -1481,13 +1564,11 @@ class TestVerifyNodeSandboxFailClosed(unittest.TestCase):
         # untouched, so Recovery doesn't burn a make-verify attempt.
         self.assertNotIn("verify_cmd", new_state["attempts"])
         self.assertIsNone(new_state["feedback"])
-        # The runner lifecycle completed even on the failure path.
-        self.assertEqual(runner.destroy_count, 1)
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
-    def test_unexpected_node_error_still_records_and_returns(self, mock_get_runner):
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
+    def test_unexpected_node_error_still_records_and_returns(self, mock_acquire):
         runner = _verify_runner_stub([RuntimeError("unexpected runner bug")])
-        mock_get_runner.return_value = runner
+        mock_acquire.return_value = runner
 
         new_state = verify_node(self._state())
 
@@ -1603,11 +1684,11 @@ class TestBinEvalPhase(unittest.TestCase):
         "orchestrator.nodes._get_workspace_diff",
         return_value="diff --git a/f.py b/f.py\n+pass",
     )
-    @patch("orchestrator.nodes.get_sandbox_runner")
-    def test_bineval_pass_resets_attempts(self, mock_get_runner, _diff, mock_gh, _adrs):
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
+    def test_bineval_pass_resets_attempts(self, mock_acquire, _diff, mock_gh, _adrs):
         from orchestrator.nodes import verify_node
 
-        mock_get_runner.return_value = self._make_verify_pass_runner()
+        mock_acquire.return_value = self._make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
         with patch("orchestrator.nodes._run_bineval", return_value=_all_pass_result()):
             state = self._state(bineval=2)
@@ -1620,13 +1701,13 @@ class TestBinEvalPhase(unittest.TestCase):
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     def test_bineval_fail_retries_with_structured_feedback(
-        self, mock_get_runner, _diff, mock_gh, _adrs
+        self, mock_acquire, _diff, mock_gh, _adrs
     ):
         from orchestrator.nodes import verify_node
 
-        mock_get_runner.return_value = self._make_verify_pass_runner()
+        mock_acquire.return_value = self._make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
         fail = _result_with_fail(
             "2.1",
@@ -1647,13 +1728,13 @@ class TestBinEvalPhase(unittest.TestCase):
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     def test_bineval_fail_exhaustion_transitions_failed(
-        self, mock_get_runner, _diff, mock_gh, _adrs
+        self, mock_acquire, _diff, mock_gh, _adrs
     ):
         from orchestrator.nodes import verify_node
 
-        mock_get_runner.return_value = self._make_verify_pass_runner()
+        mock_acquire.return_value = self._make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
         fail = _result_with_fail(
             "4.2", "Robustness", "No regression risk", "removes safety check"
@@ -1669,13 +1750,13 @@ class TestBinEvalPhase(unittest.TestCase):
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     def test_bineval_llm_failure_treated_as_pass(
-        self, mock_get_runner, _diff, mock_gh, _adrs
+        self, mock_acquire, _diff, mock_gh, _adrs
     ):
         from orchestrator.nodes import verify_node
 
-        mock_get_runner.return_value = self._make_verify_pass_runner()
+        mock_acquire.return_value = self._make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
         with patch("orchestrator.nodes._run_bineval", return_value=None):
             state = self._state(bineval=1)
@@ -1686,11 +1767,11 @@ class TestBinEvalPhase(unittest.TestCase):
 
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="")
-    @patch("orchestrator.nodes.get_sandbox_runner")
-    def test_bineval_skipped_on_empty_diff(self, mock_get_runner, _diff, mock_gh):
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
+    def test_bineval_skipped_on_empty_diff(self, mock_acquire, _diff, mock_gh):
         from orchestrator.nodes import verify_node
 
-        mock_get_runner.return_value = self._make_verify_pass_runner()
+        mock_acquire.return_value = self._make_verify_pass_runner()
         state = self._state(bineval=2)
         new_state = verify_node(state)
         # Empty diff -> skip BinEval -> PASS path -> reset + PR transition.
@@ -1702,9 +1783,9 @@ class TestBinEvalPhase(unittest.TestCase):
 
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     def test_bineval_phase_enriches_diff_before_grading(
-        self, mock_get_runner, mock_gh, _adrs
+        self, mock_acquire, mock_gh, _adrs
     ):
         """AC: _run_bineval_phase enriches the diff with function context."""
         from orchestrator.nodes import verify_node
@@ -1714,7 +1795,7 @@ class TestBinEvalPhase(unittest.TestCase):
             "def my_func():\n    return 42\n", encoding="utf-8"
         )
 
-        mock_get_runner.return_value = self._make_verify_pass_runner()
+        mock_acquire.return_value = self._make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
 
         # Return a diff that references the workspace file
@@ -1760,9 +1841,9 @@ class TestBinEvalPhase(unittest.TestCase):
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     def test_bineval_not_starved_by_make_verify_failures(
-        self, mock_get_runner, _diff, mock_gh, _adrs
+        self, mock_acquire, _diff, mock_gh, _adrs
     ):
         """AC1 (issue #123): a BinEval FAIL after >=1 prior make-verify failures
         leaves at least one retry that injects BinEval structured feedback.
@@ -1781,9 +1862,7 @@ class TestBinEvalPhase(unittest.TestCase):
         pass_res = SandboxExecResult(
             exit_code=0, output="All tests passed.", duration_seconds=0.1
         )
-        mock_get_runner.return_value = _verify_runner_stub(
-            [fail_res, fail_res, pass_res]
-        )
+        mock_acquire.return_value = _verify_runner_stub([fail_res, fail_res, pass_res])
         mock_gh.return_value = {"body": "issue body"}
         fail = _result_with_fail(
             "2.1", "Simplicity", "No unnecessary abstraction", "speculative iface"
@@ -1814,9 +1893,9 @@ class TestBinEvalPhase(unittest.TestCase):
     @patch("orchestrator.nodes._load_adrs", return_value="")
     @patch("orchestrator.nodes._github_api_request")
     @patch("orchestrator.nodes._get_workspace_diff", return_value="diff content")
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     def test_mixed_sequence_counters_independent_and_bounded(
-        self, mock_get_runner, _diff, mock_gh, _adrs
+        self, mock_acquire, _diff, mock_gh, _adrs
     ):
         """Edge case (issue #123): a mixed verify-fail / bineval-fail sequence
         increments each gate's counter independently, and the total stays
@@ -1832,7 +1911,7 @@ class TestBinEvalPhase(unittest.TestCase):
             exit_code=0, output="All tests passed.", duration_seconds=0.1
         )
         # Sequence: vf, vp(bf), vf, vf  -> verify_cmd 1,2,3 (failed); bineval 1.
-        mock_get_runner.return_value = _verify_runner_stub(
+        mock_acquire.return_value = _verify_runner_stub(
             [fail_res, pass_res, fail_res, fail_res]
         )
         mock_gh.return_value = {"body": "issue body"}
@@ -2532,10 +2611,10 @@ class TestBinEvalLengthErrorRetryPhase(unittest.TestCase):
         "orchestrator.nodes._get_workspace_diff",
         return_value="diff --git a/f.py b/f.py\n+pass",
     )
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     def test_persistent_length_error_degrades_pass_without_semantic_attempt(
         self,
-        mock_get_runner,
+        mock_acquire,
         _diff,
         mock_gh,
         mock_get_llm,
@@ -2545,7 +2624,7 @@ class TestBinEvalLengthErrorRetryPhase(unittest.TestCase):
     ):
         from orchestrator.nodes import verify_node
 
-        mock_get_runner.return_value = _make_verify_pass_runner()
+        mock_acquire.return_value = _make_verify_pass_runner()
         mock_gh.return_value = {"body": "issue body"}
         mock_resolve.return_value = {"model": "m", "max_tokens": 8192}
         llm = unittest.mock.MagicMock()
@@ -4571,11 +4650,11 @@ class TestTestWriterNode(unittest.TestCase):
         self.workspace_temp.cleanup()
         self.logs_temp.cleanup()
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_success(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
         # Setup mock GitHub API response
         mock_github_api.return_value = {
@@ -4584,7 +4663,7 @@ class TestTestWriterNode(unittest.TestCase):
         }
         # Setup sandbox stub output (success, no bad errors)
         stub = _verify_runner_stub([_verify_exec_result(0, "Ran 5 tests in 0.1s\nOK")])
-        mock_get_runner.return_value = stub
+        mock_acquire.side_effect = _acquire_stub(stub)
 
         # Setup initial state
         state = DEFAULT_STATE.copy()
@@ -4604,19 +4683,18 @@ class TestTestWriterNode(unittest.TestCase):
         # Verify execute_worker was called
         mock_execute_worker.assert_called_once()
         # Discovery executed exactly once inside the sandbox, with the
-        # workspace bind and the 300 s exec timeout; lifecycle completed.
+        # workspace bind and the 300 s exec timeout.
         self.assertEqual(len(stub.exec_calls), 1)
         args, timeout = stub.exec_calls[0]
         self.assertEqual(args[:3], ["python3", "-m", "unittest"])
         self.assertEqual(timeout, 300)
-        self.assertEqual(stub.created, self.workspace_dir)
-        self.assertEqual(stub.destroy_count, 1)
+        self.assertEqual(stub.workspaces, [self.workspace_dir])
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_includes_behavior_not_structure_constraint(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
         """The Test-Writer instructions must carry the Behavior-Not-Structure
         constraint (issue #58) so generated tests specify behavior and do not
@@ -4626,7 +4704,7 @@ class TestTestWriterNode(unittest.TestCase):
             "title": "Fix a bug",
             "body": "There is a bug in main.py.",
         }
-        mock_get_runner.return_value = _verify_runner_stub(
+        mock_acquire.return_value = _verify_runner_stub(
             [_verify_exec_result(0, "Ran 5 tests in 0.1s\nOK")]
         )
 
@@ -4646,11 +4724,11 @@ class TestTestWriterNode(unittest.TestCase):
         self.assertIn("public", instructions.lower())
         self.assertIn("tautological", instructions.lower())
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_retry_and_success(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
         mock_github_api.return_value = {
             "title": "Fix a bug",
@@ -4663,7 +4741,7 @@ class TestTestWriterNode(unittest.TestCase):
                 _verify_exec_result(0, "Ran 5 tests\nOK"),
             ]
         )
-        mock_get_runner.return_value = stub
+        mock_acquire.return_value = stub
 
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -4677,21 +4755,21 @@ class TestTestWriterNode(unittest.TestCase):
         self.assertEqual(new_state["status"], "executing")
         self.assertEqual(new_state["phase"], "test_writing")
         self.assertEqual(mock_execute_worker.call_count, 2)
-        # One sandbox lifecycle per pre-verification attempt.
+        # Two pre-verification attempts, each an exec of the same cycle
+        # sandbox (created once for the cycle).
         self.assertEqual(len(stub.exec_calls), 2)
-        self.assertEqual(stub.destroy_count, 2)
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_all_attempts_fail(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
         mock_github_api.return_value = {"title": "Fix a bug", "body": "There is a bug."}
         stub = _verify_runner_stub(
             [_verify_exec_result(0, "\nModuleNotFoundError: No module named foo")] * 3
         )
-        mock_get_runner.return_value = stub
+        mock_acquire.return_value = stub
 
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -4711,21 +4789,21 @@ class TestTestWriterNode(unittest.TestCase):
 
         self.assertEqual(mock_execute_worker.call_count, 3)
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_sandbox_failure_records_and_returns(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
         """A sandbox infrastructure failure in pre-verification is an
         ADR-0038 record-and-return: state failed WITHOUT burning a
-        Test-Writer attempt (no retry loop), lifecycle still destroyed."""
+        Test-Writer attempt (no retry loop)."""
         mock_github_api.return_value = {
             "title": "Fix a bug",
             "body": "There is a bug in main.py.",
         }
         stub = _verify_runner_stub([SandboxUnavailableError("docker daemon down")])
-        mock_get_runner.return_value = stub
+        mock_acquire.return_value = stub
 
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -4741,17 +4819,51 @@ class TestTestWriterNode(unittest.TestCase):
         self.assertEqual(result["phase"], "test_writing")
         self.assertIn("test_writer: ", result["error"] or "")
         self.assertIn("docker daemon down", result["error"] or "")
-        # Infrastructure is NOT a test-quality failure: no retry, budget
-        # untouched, and the runner lifecycle completed.
+        # Infrastructure is NOT a test-quality failure: no retry and the
+        # retry budget stays untouched.
         self.assertEqual(mock_execute_worker.call_count, 1)
         self.assertEqual(result["attempts"], {})
-        self.assertEqual(stub.destroy_count, 1)
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
+    @patch("orchestrator.worker.execute_worker")
+    @patch("orchestrator.nodes._github_api_request")
+    def test_test_writer_node_cap_hit_is_a_failed_attempt_with_feedback(
+        self, mock_github_api, mock_execute_worker, mock_acquire
+    ):
+        """AC3: a cap firing during pre-verification is a failed Test-Writer
+        attempt (feedback names the cap and the remedy), not an infrastructure
+        failure — so the loop retries with actionable input."""
+        mock_github_api.return_value = {
+            "title": "Fix a bug",
+            "body": "There is a bug in main.py.",
+        }
+        stub = _verify_runner_stub(
+            [
+                _verify_exec_result(137, "Killed\n", cap_hit="memory"),
+                _verify_exec_result(0, "Ran 5 tests\nOK"),
+            ]
+        )
+        mock_acquire.return_value = stub
+
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+
+        from orchestrator.nodes import test_writer_node
+
+        new_state = test_writer_node(state)
+
+        # Two attempts: the capped one and the retry that passed.
+        self.assertEqual(mock_execute_worker.call_count, 2)
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["phase"], "test_writing")
+
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_test_writer_node_discovery_never_executes_on_host(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
         """Fail closed (issue #160): with a working sandbox, no host
         subprocess.run is ever invoked for pre-verification — the sentinel
@@ -4761,7 +4873,7 @@ class TestTestWriterNode(unittest.TestCase):
             "body": "There is a bug in main.py.",
         }
         stub = _verify_runner_stub([_verify_exec_result(0, "Ran 5 tests\nOK")])
-        mock_get_runner.return_value = stub
+        mock_acquire.return_value = stub
 
         state = DEFAULT_STATE.copy()
         state["issue_number"] = 10
@@ -4857,13 +4969,14 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         )
 
     def _make_node_mocks(
-        self, mock_github_api, mock_get_runner, stdout="Ran 5 tests\nOK", stderr=""
+        self, mock_github_api, mock_acquire, stdout="Ran 5 tests\nOK", stderr=""
     ):
         """Install the GitHub API mock and the pre-verification sandbox stub.
 
         Since issue #160 the unittest discovery runs inside the Execution
-        Sandbox, so the seam is ``orchestrator.nodes.get_sandbox_runner``: the
-        stub returns a single green discovery result (output composed as the
+        Sandbox, and since issue #164 that sandbox is the cycle's own
+        (ADR-0061), so the seam is ``orchestrator.nodes.acquire_cycle_sandbox``:
+        the stub returns a single green discovery result (output composed as the
         former ``stdout + "\\n" + stderr``); git traffic runs unmocked.
         """
         mock_github_api.return_value = {
@@ -4871,7 +4984,7 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
             "body": "There is a bug in main.py.",
         }
         stub = _verify_runner_stub([_verify_exec_result(0, stdout + "\n" + stderr)])
-        mock_get_runner.return_value = stub
+        mock_acquire.return_value = stub
         return stub
 
     # --- pure helper: _is_test_path ---------------------------------------
@@ -5027,7 +5140,7 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
     def test_node_without_plan_records_failure(self):
         """A missing development plan transitions to recovery via failed state."""
         with (
-            patch("orchestrator.nodes.get_sandbox_runner"),
+            patch("orchestrator.nodes.acquire_cycle_sandbox"),
             patch("orchestrator.worker.execute_worker"),
             patch("orchestrator.nodes._github_api_request") as mock_github_api,
         ):
@@ -5048,14 +5161,14 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
 
     # --- node-level behavior -------------------------------------------------
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_noop_test_phase_fails_all_attempts(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
         """A clean workspace (no diff at all) is a no-op: every attempt fails."""
-        self._make_node_mocks(mock_github_api, mock_get_runner)
+        self._make_node_mocks(mock_github_api, mock_acquire)
         self._init_repo()
 
         state = self._state_with_plan()
@@ -5079,11 +5192,11 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         plan_json = json.dumps({"rationale": "r", "tasks": []})
 
         with (
-            patch("orchestrator.nodes.get_sandbox_runner") as mock_get_runner,
+            patch("orchestrator.nodes.acquire_cycle_sandbox") as mock_acquire,
             patch("orchestrator.worker.execute_worker") as mock_execute_worker,
             patch("orchestrator.nodes._github_api_request") as mock_github_api,
         ):
-            self._make_node_mocks(mock_github_api, mock_get_runner)
+            self._make_node_mocks(mock_github_api, mock_acquire)
 
             state = self._state_with_plan(plan_json)
             state_module.save(state)
@@ -5097,13 +5210,13 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         self.assertIn("No test files were added or modified", second_instructions)
         self.assertIn("Write the tests before implementation", second_instructions)
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_added_test_file_passes_guard(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
-        self._make_node_mocks(mock_github_api, mock_get_runner)
+        self._make_node_mocks(mock_github_api, mock_acquire)
         self._init_repo()
         new_test = self.workspace_dir / "tests" / "test_feature.py"
         new_test.parent.mkdir(parents=True)
@@ -5119,14 +5232,14 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         self.assertEqual(result["status"], "executing")
         self.assertEqual(mock_execute_worker.call_count, 1)
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_modified_test_file_passes_guard(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
         """Extending an existing tracked test file counts as productive."""
-        self._make_node_mocks(mock_github_api, mock_get_runner)
+        self._make_node_mocks(mock_github_api, mock_acquire)
         self._init_repo()
         existing_test = self.workspace_dir / "tests" / "test_existing.py"
         existing_test.parent.mkdir(parents=True)
@@ -5149,14 +5262,14 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         self.assertEqual(result["status"], "executing")
         self.assertEqual(mock_execute_worker.call_count, 1)
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_plan_designated_test_target_passes_guard(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
         """A nonstandard test location named by the Plan Localization passes."""
-        self._make_node_mocks(mock_github_api, mock_get_runner)
+        self._make_node_mocks(mock_github_api, mock_acquire)
         self._init_repo()
         planned = self.workspace_dir / "spec" / "models" / "user_spec.rb"
         planned.parent.mkdir(parents=True)
@@ -5185,15 +5298,15 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         self.assertEqual(result["status"], "executing")
         self.assertEqual(mock_execute_worker.call_count, 1)
 
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     @patch("orchestrator.worker.execute_worker")
     @patch("orchestrator.nodes._github_api_request")
     def test_indeterminate_diff_fails_open(
-        self, mock_github_api, mock_execute_worker, mock_get_runner
+        self, mock_github_api, mock_execute_worker, mock_acquire
     ):
         """Outside a git repository the guard cannot judge: fail open."""
         # Workspace stays a plain temp dir (no git init).
-        self._make_node_mocks(mock_github_api, mock_get_runner)
+        self._make_node_mocks(mock_github_api, mock_acquire)
 
         with self.assertLogs("orchestrator.nodes", level="WARNING") as logs:
             state = self._state_with_plan()
@@ -6219,9 +6332,9 @@ class TestRecoveryOnException(unittest.TestCase):
 
     @patch("orchestrator.nodes._remove_label")
     @patch("orchestrator.nodes._add_label")
-    @patch("orchestrator.nodes.get_sandbox_runner")
+    @patch("orchestrator.nodes.acquire_cycle_sandbox")
     def test_verify_exception_routes_to_recovery(
-        self, mock_get_runner, mock_add_label, mock_remove_label
+        self, mock_acquire, mock_add_label, mock_remove_label
     ):
         from orchestrator.nodes import recovery_node, verify_node
 
@@ -6235,7 +6348,7 @@ class TestRecoveryOnException(unittest.TestCase):
         # sandbox runtime makes the runner raise SandboxUnavailableError (a
         # genuine infrastructure exception, not a non-zero exit), taking the
         # ADR-0038 recovery path.
-        mock_get_runner.return_value = _verify_runner_stub(
+        mock_acquire.return_value = _verify_runner_stub(
             [SandboxUnavailableError("docker daemon unreachable (test injection)")]
         )
         state = DEFAULT_STATE.copy()
@@ -6875,6 +6988,240 @@ class TestGetGithubRepositoryErrorBranch(unittest.TestCase):
 
         self.assertIn("GITHUB_REPOSITORY", str(ctx.exception))
         self.assertIn("no remote configured", str(ctx.exception))
+
+
+class TestSandboxCycleLifecycle(unittest.TestCase):
+    """Cycle-scoped sandbox lifecycle as the nodes drive it (issue #164, ADR-0061).
+
+    These tests run the REAL lifecycle module with only the backend factory
+    replaced, so every assertion is on an observable effect of a node run:
+    how many sandboxes the cycle created, whether a backend was torn down,
+    and what the workspace looked like between attempts. The lifecycle
+    module's own mechanics are unit-tested in test_sandbox_lifecycle.
+    """
+
+    def setUp(self):
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.workspace_dir = Path(self.workspace_temp.name).resolve()
+        self.logs_temp = tempfile.TemporaryDirectory()
+        self.logs_dir = Path(self.logs_temp.name).resolve()
+
+        self.original_env = {}
+        vars_to_set = {
+            "GITHUB_WORKSPACE": str(self.workspace_dir),
+            "AGENT_LOG_PATH": str(self.logs_dir),
+            "GITHUB_REPOSITORY": "test-owner/test-repo",
+            "AGENT_MODE": "local",
+            "AGENT_LABEL_READY": "agent-ready",
+            "AGENT_LABEL_IN_PROGRESS": "agent-in-progress",
+            "AGENT_LABEL_BLOCKED": "agent-blocked",
+            "AGENT_VERIFY_COMMAND": None,
+            "AGENT_MERGE_POLL_INTERVAL": "1",
+            "AGENT_MERGE_POLL_TIMEOUT": "2",
+            # The default hard-reset threshold (3) is out of reach for a
+            # two-attempt fixture; 1 makes the second attempt a real hard
+            # reset, which is the Hybrid Retry behavior under test.
+            "AGENT_RETRY_HARD_RESET_ATTEMPT": "1",
+        }
+        for k, v in vars_to_set.items():
+            self.original_env[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+        # A machine-local AGENT_TRUSTED_JUDGE_USER would reject the mocked
+        # judge reviews as untrusted (same scrubbing as TestMergeNode).
+        self.original_env["AGENT_TRUSTED_JUDGE_USER"] = os.environ.get(
+            "AGENT_TRUSTED_JUDGE_USER"
+        )
+        os.environ.pop("AGENT_TRUSTED_JUDGE_USER", None)
+
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(self.workspace_dir),
+            check=True,
+        )
+        self.tracked_file = self.workspace_dir / "README.md"
+        self.tracked_file.write_text("# Test Repo", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=str(self.workspace_dir), check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit"],
+            cwd=str(self.workspace_dir),
+            check=True,
+            capture_output=True,
+        )
+
+        # Reset the process-local cycle state around each test.
+        release_cycle_sandbox()
+        bind_cycle(None)
+        self.backend = _verify_runner_stub([])
+
+    def tearDown(self):
+        release_cycle_sandbox()
+        bind_cycle(None)
+        for k, v in self.original_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.workspace_temp.cleanup()
+        self.logs_temp.cleanup()
+
+    def _backend_patch(self):
+        """Replace the lifecycle's backend factory with the recording stub."""
+        return patch(
+            "orchestrator.sandbox_lifecycle.get_sandbox_runner",
+            return_value=self.backend,
+        )
+
+    def _verify_state(self):
+        state = DEFAULT_STATE.copy()
+        state["issue_number"] = 10
+        state["plan"] = '{"rationale": "...", "tasks": []}'
+        state_module.save(state)
+        return state
+
+    def test_verify_retry_reuses_the_cycle_sandbox_and_preserves_untracked_files(
+        self,
+    ):
+        """Hybrid Retry parity (AC1, AC4): the retry path re-uses the cycle's
+        sandbox, and the ADR-0034 hard reset — which reverts tracked files
+        only — leaves the Test-Writer's untracked artifacts in the workspace
+        the sandbox is bound to, exactly as it did before the sandbox
+        migration."""
+        untracked = self.workspace_dir / "test_new_feature.py"
+        untracked.write_text("def test_x():\n    assert True\n", encoding="utf-8")
+
+        self.backend = _verify_runner_stub(
+            [
+                _verify_exec_result(1, "AssertionError: 1 != 2"),
+                _verify_exec_result(1, "AssertionError: 1 != 2"),
+            ]
+        )
+        bind_cycle(cycle_token_for_issue(10))
+
+        with self._backend_patch():
+            # Attempt 1: the gate fails inside the sandbox.
+            first = verify_node(self._verify_state())
+            self.assertEqual(first["status"], "executing")
+            self.assertEqual(self.backend.created, [self.workspace_dir])
+
+            # The Worker's next attempt starts with a hard reset (threshold 1).
+            self.tracked_file.write_text("# Test Repo\n\nbroken edit", encoding="utf-8")
+            with patch(
+                "orchestrator.nodes._github_api_request",
+                return_value={"title": "Fix a bug", "body": "body"},
+            ):
+                with patch("orchestrator.worker.execute_worker"):
+                    execute_node(first)
+
+            # Attempt 2: same cycle, same sandbox — no re-creation in between.
+            second = verify_node(first)
+
+        self.assertEqual(second["status"], "executing")
+        self.assertEqual(self.backend.created, [self.workspace_dir])
+        self.assertEqual(len(self.backend.exec_calls), 2)
+        self.assertEqual(self.backend.destroy_count, 0)
+        # The hard reset reverted the tracked file and spared the untracked
+        # test artifact — the state the re-used sandbox sees.
+        self.assertEqual(self.tracked_file.read_text(encoding="utf-8"), "# Test Repo")
+        self.assertTrue(untracked.exists())
+
+    def test_verify_cap_hit_is_a_failed_attempt_with_actionable_feedback(self):
+        """AC3: a resource cap firing during the gate is a failed make-verify
+        attempt (budget consumed, routed back to execute) whose feedback names
+        the cap and the remedy — not a runner infrastructure failure."""
+        self.backend = _verify_runner_stub(
+            [_verify_exec_result(137, "Killed\n", cap_hit="memory")]
+        )
+        bind_cycle(cycle_token_for_issue(10))
+
+        with self._backend_patch():
+            new_state = verify_node(self._verify_state())
+
+        self.assertEqual(new_state["status"], "executing")
+        self.assertEqual(new_state["attempts"]["verify_cmd"], 1)
+        feedback = new_state["feedback"] or ""
+        self.assertIn("AGENT_SANDBOX_MEMORY", feedback)
+        self.assertIn("Killed", feedback)
+
+    def test_merge_success_destroys_the_cycle_sandbox(self):
+        """AC1: the success exit (clean merge) tears the cycle's sandbox down."""
+        self.backend = _verify_runner_stub([])
+        bind_cycle(cycle_token_for_issue(10))
+
+        def api_side_effect(method, path, body=None):
+            if method == "GET":
+                if path.endswith("/user"):
+                    return {"login": "test-judge-user"}
+                if path.endswith("/pulls/1"):
+                    return {"merged": True, "state": "closed"}
+                if "/pulls" in path and "/reviews" not in path:
+                    return [{"number": 1}]
+                if path.endswith("/reviews"):
+                    return []
+            raise ValueError(f"Unexpected API call: {method} {path}")
+
+        state = self._verify_state()
+        state["branch"] = "feat/issue-10"
+        state_module.save(state)
+
+        with self._backend_patch():
+            acquire_cycle_sandbox(self.workspace_dir)
+            with patch(
+                "orchestrator.nodes._github_api_request", side_effect=api_side_effect
+            ):
+                with patch(
+                    "orchestrator.nodes.get_commit_time",
+                    return_value="2026-06-27T12:00:00+00:00",
+                ):
+                    new_state = merge_node(state)
+
+        self.assertEqual(new_state["status"], "done")
+        self.assertEqual(self.backend.destroy_count, 1)
+
+    def test_recovery_destroys_the_cycle_sandbox(self):
+        """AC1: the failure exit (Recovery) tears the cycle's sandbox down."""
+        bind_cycle(cycle_token_for_issue(10))
+
+        with self._backend_patch():
+            acquire_cycle_sandbox(self.workspace_dir)
+            with patch("orchestrator.nodes._github_api_request"):
+                new_state = recovery_node(self._verify_state())
+
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(self.backend.destroy_count, 1)
+
+    def test_security_block_recovery_destroys_the_cycle_sandbox(self):
+        """AC1: the Security-Block quarantine path is a cycle end too — the
+        quarantined issue must not leave a sandbox behind."""
+        bind_cycle(cycle_token_for_issue(42))
+        state = self._verify_state()
+        state["issue_number"] = 42
+        state["error"] = "security_block: .env"
+        state_module.save(state)
+
+        with self._backend_patch():
+            acquire_cycle_sandbox(self.workspace_dir)
+            with patch("orchestrator.nodes._github_api_request"):
+                new_state = recovery_node(state)
+
+        self.assertEqual(new_state["status"], "failed")
+        self.assertEqual(self.backend.destroy_count, 1)
 
 
 if __name__ == "__main__":

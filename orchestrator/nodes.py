@@ -37,7 +37,14 @@ from orchestrator.outline import (
     build_outlines_for_files,
 )
 from orchestrator.path_safety import is_safe_path
-from orchestrator.sandbox import SandboxError, SandboxRunner, get_sandbox_runner
+from orchestrator.sandbox import SandboxError, cap_hit_message
+from orchestrator.sandbox_lifecycle import (
+    acquire_cycle_sandbox,
+    bind_cycle,
+    cycle_token_for_issue,
+    release_cycle_sandbox,
+    sweep_orphaned_sandboxes,
+)
 from orchestrator.snapshot import build_directory_tree
 from orchestrator.state import AgentState
 from orchestrator.tools import _truncate_output
@@ -361,6 +368,20 @@ def claim_node(state: AgentState) -> AgentState:
     ):
         resume = True
 
+    # 2b. Cycle ownership and orphan sweep (ADR-0061, FR-7). The Claim-Node is
+    # the cycle boundary: it declares which cycle owns sandboxes from here on
+    # and destroys the ones a crashed process left behind. On the resume path
+    # the sweep is given the resumed cycle's token and spares its containers —
+    # a resumed cycle may still be alive in another process (the Process
+    # Supervisor's restart can race its own child) and destroying a live
+    # sandbox is not a recoverable mistake. A fresh cycle has nothing to
+    # resume, so every managed container is an orphan.
+    resumable_cycle = (
+        cycle_token_for_issue(state.get("issue_number")) if resume else None
+    )
+    bind_cycle(resumable_cycle)
+    sweep_orphaned_sandboxes(resumable_cycle)
+
     # 3. Workspace Hygiene & Cloning
     try:
         # If the workspace directory doesn't exist or is not a git repo, clone it.
@@ -585,6 +606,10 @@ def claim_node(state: AgentState) -> AgentState:
             state["attempts"] = {}
             state["feedback"] = None
             state["pushed_at"] = None
+
+            # The claimed issue is the cycle from this point on: every sandbox
+            # this process spawns carries its ownership token (ADR-0061).
+            bind_cycle(cycle_token_for_issue(issue_num))
 
             _safe_telemetry(
                 start_orchestrator_loop, issue_number=issue_num, branch=branch_name
@@ -1458,12 +1483,16 @@ def verify_node(state: AgentState) -> AgentState:
     # are recorded-and-returned (ADR-0038) into Recovery WITHOUT consuming
     # the make-verify retry budget — they are infrastructure, not verification
     # failures.
-    runner: SandboxRunner | None = None
+    #
+    # The sandbox is the bound cycle's (ADR-0061): attempts 2..N re-use it
+    # instead of tearing down and re-creating it, so the workspace — and with
+    # it the untracked Test-Writer artifacts a hard reset deliberately spares
+    # (ADR-0034) — carries over between attempts, exactly as it did on the host
+    # before the sandbox migration.
     try:
-        runner = get_sandbox_runner()
-        runner.create(workspace_path)
+        sandbox = acquire_cycle_sandbox(workspace_path)
         logger.info("Running verification command in Execution Sandbox: %s", verify_cmd)
-        exec_result = runner.exec(args, timeout=timeout)
+        exec_result = sandbox.exec(args, timeout=timeout)
     except SandboxError as e:
         logger.error(
             "Execution Sandbox infrastructure failure (routing to Recovery; "
@@ -1484,13 +1513,24 @@ def verify_node(state: AgentState) -> AgentState:
         state_module.save(state)
         _safe_telemetry(end_orchestrator_phase, exit_code=1)
         return state
-    finally:
-        if runner is not None:
-            runner.destroy()
 
     exit_code = exec_result.exit_code
     timed_out = exec_result.timed_out
     raw_output = exec_result.output
+    if exec_result.cap_hit is not None:
+        # A resource cap fired (OOM, pids, scratch space). That is a failed
+        # attempt with partial output — NOT runner infrastructure — so it is
+        # folded into the verification feedback and the retry budget below,
+        # giving the Worker actionable text instead of an opaque exit code.
+        cap_message = cap_hit_message(exec_result.cap_hit)
+        logger.warning(
+            "Sandbox resource cap hit during verification (%s): %s",
+            exec_result.cap_hit,
+            cap_message,
+        )
+        raw_output = (
+            f"{cap_message}\nOutput captured before the cap fired:\n{raw_output}"
+        )
     if timed_out:
         raw_output = f"Error: Command '{verify_cmd}' timed out after {timeout} seconds.\nOutput captured before timeout:\n{raw_output}"
     output = _truncate_output(raw_output)
@@ -2824,6 +2864,11 @@ def merge_node(state: AgentState) -> AgentState:
         else:
             state["status"] = "done"
             state["feedback"] = None
+            # Cycle end (ADR-0061, FR-7): the clean merge is the success exit,
+            # so this cycle's sandbox is torn down here. Best-effort by
+            # contract — a container that refuses to be removed is logged
+            # loudly with its name and re-swept at the next startup.
+            release_cycle_sandbox()
             # Reset the merge-fix counter on a clean merge so a subsequent
             # issue cycle does not inherit a stale counter.
             attempts = state.get("attempts", {}).copy()
@@ -2864,6 +2909,14 @@ def recovery_node(state: AgentState) -> AgentState:
 
     workspace_env = os.getenv("GITHUB_WORKSPACE", ".")
     workspace_path = Path(workspace_env).resolve()
+
+    # Cycle end (ADR-0061, FR-7): Recovery is the failure exit — both the
+    # retry budget exhaustion path and the Security-Block quarantine path
+    # arrive here, and both must leave no sandbox behind. The teardown is
+    # best-effort by contract (an unremovable container is logged with its
+    # name for manual cleanup and re-swept at the next startup), so it can
+    # never block the label reset below.
+    release_cycle_sandbox()
 
     try:
         # 1. Clean up local workspace changes to maintain hygiene
@@ -3177,12 +3230,13 @@ def test_writer_node(state: AgentState) -> AgentState:
             # (ADR-0038) WITHOUT consuming a Test-Writer attempt — they are
             # infrastructure, not test-quality failures.
             logger.info("Running pre-verification check on generated tests...")
-            runner: SandboxRunner | None = None
+            # The cycle's sandbox is re-used, not re-created: the discovery
+            # command is one more exec of the same cycle-owned sandbox
+            # (ADR-0061).
             try:
-                runner = get_sandbox_runner()
-                runner.create(workspace_path)
+                sandbox = acquire_cycle_sandbox(workspace_path)
                 logger.info("Running unittest discovery in Execution Sandbox.")
-                exec_result = runner.exec(
+                exec_result = sandbox.exec(
                     [
                         "python3",
                         "-m",
@@ -3206,9 +3260,6 @@ def test_writer_node(state: AgentState) -> AgentState:
                     e,
                 )
                 raise
-            finally:
-                if runner is not None:
-                    runner.destroy()
 
             # The runner returns stdout+stderr combined (decoded); the
             # substring scan below is unaffected by the merge. A discovery
@@ -3224,7 +3275,23 @@ def test_writer_node(state: AgentState) -> AgentState:
             ]
             has_bad_error = any(err in output for err in bad_errors)
 
-            if has_bad_error:
+            if exec_result.cap_hit is not None:
+                # A resource cap fired before the discovery could finish, so
+                # the tests never really ran. That is a failed Test-Writer
+                # attempt with actionable feedback — NOT a runner
+                # infrastructure failure (issue #164 AC3).
+                cap_message = cap_hit_message(exec_result.cap_hit)
+                logger.warning(
+                    "Sandbox resource cap hit during Test-Writer "
+                    "pre-verification (%s): %s",
+                    exec_result.cap_hit,
+                    cap_message,
+                )
+                feedback = (
+                    f"{cap_message}\nOutput captured before the cap fired:\n{output}"
+                )
+                attempt += 1
+            elif has_bad_error:
                 logger.warning(
                     "Pre-verification failed due to syntax/import errors on attempt %d.",
                     attempt,

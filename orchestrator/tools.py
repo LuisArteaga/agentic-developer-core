@@ -6,7 +6,8 @@ from pathlib import Path
 
 from orchestrator import state
 from orchestrator.path_safety import is_safe_path
-from orchestrator.sandbox import SandboxError, SandboxRunner, get_sandbox_runner
+from orchestrator.sandbox import SandboxError, cap_hit_message
+from orchestrator.sandbox_lifecycle import acquire_cycle_sandbox
 from scripts.telemetry import record_security_block
 
 _logger = logging.getLogger("orchestrator.tools")
@@ -667,16 +668,16 @@ def run_command(command: str) -> str:
             f"outbound requests."
         )
 
-    # Run the command inside the Execution Sandbox (ADR-0056, FR-3): lazily
-    # create → exec → destroy per call. Sandbox infrastructure failures fail
-    # closed with a tool-level error string — never a host subprocess fallback
-    # and never a node crash. Non-zero command exits are data (returned as
-    # output), matching the pre-sandbox tool semantics.
-    runner: SandboxRunner | None = None
+    # Run the command inside the Execution Sandbox (ADR-0056, FR-3) — the
+    # cycle's sandbox (ADR-0061): the first run_command of a cycle creates it,
+    # every later command re-uses it, and the cycle's teardown destroys it.
+    # Sandbox infrastructure failures fail closed with a tool-level error
+    # string — never a host subprocess fallback and never a node crash.
+    # Non-zero command exits are data (returned as output), matching the
+    # pre-sandbox tool semantics.
     try:
-        runner = get_sandbox_runner()
-        runner.create(project_root)
-        exec_result = runner.exec(args, timeout=300)
+        sandbox = acquire_cycle_sandbox(project_root)
+        exec_result = sandbox.exec(args, timeout=300)
     except SandboxError as e:
         _logger.error(
             "Execution Sandbox failure in run_command (fail closed, no host "
@@ -686,11 +687,23 @@ def run_command(command: str) -> str:
         return f"Error: Execution Sandbox unavailable: {e}"
     except Exception as e:
         return f"Error: Failed to run command: {e}"
-    finally:
-        if runner is not None:
-            runner.destroy()
 
     output = exec_result.output
+
+    if exec_result.cap_hit is not None:
+        # A resource cap fired (OOM, pids, scratch space): the command did not
+        # complete, and the Worker needs to know why in order to retry with a
+        # smaller workload instead of guessing (issue #164 AC3).
+        cap_message = cap_hit_message(exec_result.cap_hit)
+        _logger.warning(
+            "Sandbox resource cap hit in run_command (%s): %s",
+            exec_result.cap_hit,
+            cap_message,
+        )
+        return (
+            f"Error: {cap_message}\nOutput captured before the cap fired:\n"
+            f"{_truncate_output(output)}"
+        )
 
     if exec_result.timed_out:
         if not output:

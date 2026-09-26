@@ -24,6 +24,9 @@ from orchestrator.sandbox import (
     DEFAULT_SANDBOX_MEMORY,
     DEFAULT_SANDBOX_PIDS_LIMIT,
     DEFAULT_SANDBOX_RUNTIME,
+    DEFAULT_SANDBOX_TMPFS_SIZE,
+    SANDBOX_CYCLE_LABEL,
+    SANDBOX_MANAGED_LABEL,
     SANDBOX_RUNTIME_OVERRIDE,
     DockerSandboxRunner,
     FORBIDDEN_SANDBOX_ENV_NAMES,
@@ -34,7 +37,11 @@ from orchestrator.sandbox import (
     SandboxImageMissingError,
     SandboxUnavailableError,
     build_sandbox_env,
+    cap_hit_message,
+    classify_cap_hit,
     get_sandbox_runner,
+    list_managed_sandbox_containers,
+    remove_sandbox_container,
     resolve_sandbox_egress,
     resolve_sandbox_runtime,
 )
@@ -48,12 +55,19 @@ def _completed(returncode=0, stdout=b"", stderr=b""):
     return res
 
 
-def _scripted_run(script):
+def _scripted_run(script, removals=None):
     """Build a subprocess.run stand-in from ``(predicate, outcome)`` rules.
 
     The first matching rule serves its outcome (a result object or an
     exception instance); a non-matching call fails the test loudly so
     unexpected docker invocations surface instead of silently passing.
+
+    ``docker rm -f`` is scripted as a success by default and recorded in
+    ``removals`` when a list is passed: every exec classification path
+    (success, data exit, timeout, infrastructure failure) removes its
+    container, so repeating that rule in every test would drown the intent
+    it is meant to preserve. A test that needs a failing removal scripts it
+    explicitly — explicit rules win, the default is the last resort.
     """
 
     def _run(cmd, **kwargs):
@@ -62,6 +76,10 @@ def _scripted_run(script):
                 if isinstance(outcome, Exception):
                     raise outcome
                 return outcome
+        if _is_docker(cmd, "rm"):
+            if removals is not None:
+                removals.append(list(cmd))
+            return _completed(0)
         raise AssertionError(f"Unexpected subprocess command: {cmd}")
 
     return _run
@@ -280,13 +298,17 @@ class TestDockerSandboxRunnerExec(unittest.TestCase):
 
     def test_exec_success_returns_data_and_default_env_is_absent(self):
         captured = {}
+        removals = []
 
         def _capture(cmd, **kwargs):
-            captured["cmd"] = list(cmd)
+            if _is_docker(cmd, "run"):
+                captured["cmd"] = list(cmd)
+                return _completed(0, stdout=b"green\n")
             if _is_docker(cmd, "info"):
                 return _completed(0, stdout=b"27.0.3\n")
-            if _is_docker(cmd, "run"):
-                return _completed(0, stdout=b"green\n")
+            if _is_docker(cmd, "rm"):
+                removals.append(list(cmd))
+                return _completed(0)
             raise AssertionError(f"Unexpected subprocess command: {cmd}")
 
         with _clean_env({"GH_PAT": "pat-secret", "HOME": "/home/user"}):
@@ -299,7 +321,18 @@ class TestDockerSandboxRunnerExec(unittest.TestCase):
         self.assertEqual(argv[argv.index("--cpus") + 1], "2")
         self.assertEqual(argv[argv.index("--memory") + 1], "4g")
         self.assertEqual(argv[argv.index("--pids-limit") + 1], "512")
+        # FR-7: bounded scratch space — /tmp is a size-capped tmpfs, not the
+        # container's unbounded writable layer.
+        self.assertEqual(
+            argv[argv.index("--tmpfs") + 1],
+            f"/tmp:rw,size={DEFAULT_SANDBOX_TMPFS_SIZE},mode=1777",
+        )
         self.assertEqual(argv[argv.index("--runtime") + 1], DEFAULT_SANDBOX_RUNTIME)
+        # FR-7: the ownership marker scopes the startup sweep to containers
+        # this deployment spawned. This runner was created without a cycle
+        # token, so no cycle label is attached.
+        labels = [argv[i + 1] for i, flag in enumerate(argv) if flag == "--label"]
+        self.assertEqual(labels, [f"{SANDBOX_MANAGED_LABEL}=1"])
         # FR-5: every sandbox attaches to the dedicated egress network and
         # routes HTTP(S) through the host-side proxy — unconditional.
         self.assertEqual(argv[argv.index("--network") + 1], "agdc-sandbox-egress")
@@ -334,7 +367,8 @@ class TestDockerSandboxRunnerExec(unittest.TestCase):
         ]
 
         def _capture(cmd, **kwargs):
-            captured["cmd"] = list(cmd)
+            if _is_docker(cmd, "run"):
+                captured["cmd"] = list(cmd)
             return _scripted_run(script)(cmd, **kwargs)
 
         with _clean_env(
@@ -576,6 +610,40 @@ class TestDockerSandboxRunnerDestroy(unittest.TestCase):
         for cmd in removals:
             self.assertEqual(cmd[:3], ["docker", "rm", "-f"])
 
+    def test_failed_exec_removal_keeps_the_container_tracked_for_destroy(self):
+        """A container whose removal fails during exec stays tracked, so
+        destroy() retries exactly that leftover (FR-7)."""
+        workspace = Path("/tmp/whatever-workspace")
+        runner = DockerSandboxRunner(
+            image="verify-img", cpus="2", memory="4g", pids_limit="512"
+        )
+        setup_script = [
+            (lambda cmd: _is_docker(cmd, "info"), _completed(0, stdout=b"27.0.3\n")),
+            (lambda cmd: _is_docker(cmd, "image"), _completed(0)),
+            (lambda cmd: _is_docker(cmd, "run"), _completed(0, stdout=b"ok")),
+            (lambda cmd: _is_docker(cmd, "rm"), _completed(1, stderr=b"device busy")),
+        ]
+        with patch(
+            "orchestrator.sandbox.subprocess.run",
+            side_effect=_scripted_run(setup_script),
+        ):
+            runner.create(workspace)
+            with self.assertLogs("orchestrator.sandbox", level="ERROR") as logs:
+                runner.exec(["true"], timeout=10)
+        # Loud, actionable: the container name and the manual command.
+        error_text = "\n".join(logs.output)
+        assert "could not be removed" in error_text
+        assert "docker rm -f agdc-sandbox-" in error_text
+
+        # The runtime recovers: destroy() retries the leftover and succeeds.
+        removals: list[list[str]] = []
+        with patch(
+            "orchestrator.sandbox.subprocess.run",
+            side_effect=_scripted_run([], removals=removals),
+        ):
+            runner.destroy()
+        self.assertEqual(len(removals), 1)
+
     def test_destroy_swallows_removal_errors(self):
         workspace = Path("/tmp/whatever-workspace")
         runner = DockerSandboxRunner(
@@ -699,6 +767,52 @@ class TestGetSandboxRunner(unittest.TestCase):
         self.assertEqual(argv[argv.index("--memory") + 1], "2g")
         self.assertEqual(argv[argv.index("--pids-limit") + 1], "128")
         self.assertEqual(argv[argv.index("--") + 1], "custom-img")
+
+    def test_invalid_tmpfs_cap_fails_loudly(self):
+        for value in ("0", "512mb", "1T", "-1m"):
+            with self.subTest(value=value):
+                with _clean_env({"AGENT_SANDBOX_TMPFS_SIZE": value}):
+                    with self.assertRaises(SandboxConfigError):
+                        get_sandbox_runner()
+
+    def test_blank_tmpfs_cap_fails_loudly(self):
+        with _clean_env({"AGENT_SANDBOX_TMPFS_SIZE": "   "}):
+            with self.assertRaises(SandboxConfigError):
+                get_sandbox_runner()
+
+    def test_tmpfs_cap_and_cycle_label_reach_exec_argv(self):
+        # FR-7: the cycle token threads through the factory into the
+        # container's ownership labels, and the scratch-space cap into the
+        # tmpfs mount — the two things the startup sweep and the cap-hit
+        # classifier depend on.
+        captured = {}
+        script = [
+            (lambda cmd: _is_docker(cmd, "info"), _completed(0, stdout=b"27.0.3\n")),
+            (lambda cmd: _is_docker(cmd, "image"), _completed(0)),
+            (lambda cmd: _is_docker(cmd, "run"), _completed(0)),
+        ]
+
+        def _capture(cmd, **kwargs):
+            if _is_docker(cmd, "run"):
+                captured["cmd"] = list(cmd)
+            return _scripted_run(script)(cmd, **kwargs)
+
+        with _clean_env({"AGENT_SANDBOX_TMPFS_SIZE": "1g"}):
+            with patch("orchestrator.sandbox.subprocess.run", side_effect=_capture):
+                runner = get_sandbox_runner(cycle_token="issue-164")
+                runner.create(Path("/tmp/whatever-workspace"))
+                runner.exec(["true"], timeout=10)
+                runner.destroy()
+        argv = captured["cmd"]
+        self.assertEqual(argv[argv.index("--tmpfs") + 1], "/tmp:rw,size=1g,mode=1777")
+        labels = [argv[i + 1] for i, flag in enumerate(argv) if flag == "--label"]
+        self.assertEqual(
+            labels,
+            [
+                f"{SANDBOX_MANAGED_LABEL}=1",
+                f"{SANDBOX_CYCLE_LABEL}=issue-164",
+            ],
+        )
 
 
 class TestResolveSandboxRuntime(unittest.TestCase):
@@ -877,6 +991,309 @@ class TestResolveSandboxEgress(unittest.TestCase):
         self.assertEqual(argv[argv.index("--network") + 1], "agdc-sandbox-egress")
         env_flags = [argv[i + 1] for i, flag in enumerate(argv) if flag == "-e"]
         assert "HTTPS_PROXY=http://192.168.77.1:3128" in env_flags
+
+
+class TestSandboxCapHitClassification(unittest.TestCase):
+    """FR-7 resource caps (issue #164): a cap hit is data, never infra."""
+
+    def test_oom_kill_is_a_memory_cap_hit(self):
+        # The authoritative memory signal is Docker's OOMKilled flag; exit
+        # code 137 alone is not enough (an external docker kill looks the
+        # same without an OOM kill).
+        self.assertEqual(
+            classify_cap_hit(137, {"Status": "exited", "OOMKilled": True}, ""),
+            "memory",
+        )
+
+    def test_killed_without_oom_is_not_a_cap_hit(self):
+        # An externally killed container (137, OOMKilled false) must not be
+        # reported as a memory cap: a false positive misdirects the Worker.
+        self.assertIsNone(
+            classify_cap_hit(137, {"Status": "exited", "OOMKilled": False}, "Killed")
+        )
+
+    def test_no_space_left_on_device_is_a_disk_cap_hit(self):
+        self.assertEqual(
+            classify_cap_hit(
+                1,
+                {"Status": "exited", "OOMKilled": False},
+                "OSError: No space left on device",
+            ),
+            "disk",
+        )
+
+    def test_fork_failure_is_a_pids_cap_hit(self):
+        for marker in (
+            "bash: fork: Resource temporarily unavailable",
+            "unable to fork",
+            "cannot fork",
+            "failed to fork",
+        ):
+            with self.subTest(marker=marker):
+                self.assertEqual(
+                    classify_cap_hit(
+                        1, {"Status": "exited", "OOMKilled": False}, marker
+                    ),
+                    "pids",
+                )
+
+    def test_fork_failure_is_a_pids_cap_hit_for_any_non_zero_exit_code(self):
+        # Live evidence (pids-limited alpine container, 2026-09-21): the shell
+        # reports the kernel's fork rejection with its OWN exit code —
+        # "sh: can't fork: Resource temporarily unavailable", exit 2. Pinning
+        # the exit code to 1/137 silently dropped a real cap hit.
+        self.assertEqual(
+            classify_cap_hit(
+                2,
+                {"Status": "exited", "OOMKilled": False},
+                "sh: can't fork: Resource temporarily unavailable",
+            ),
+            "pids",
+        )
+        self.assertEqual(classify_cap_hit(143, None, "unable to fork"), "pids")
+
+    def test_fork_marker_on_a_successful_exit_is_not_a_cap_hit(self):
+        # Conservative guard: a command that reported a fork error but still
+        # exited 0 ran to its own completion — not a cap hit.
+        self.assertIsNone(classify_cap_hit(0, {"Status": "exited"}, "unable to fork"))
+        self.assertIsNone(
+            classify_cap_hit(
+                0, {"Status": "exited"}, "warning: No space left on device, retried"
+            )
+        )
+
+    def test_ordinary_failure_is_not_a_cap_hit(self):
+        self.assertIsNone(
+            classify_cap_hit(1, {"Status": "exited", "OOMKilled": False}, "FAIL\n")
+        )
+
+    def test_missing_container_state_is_not_a_cap_hit(self):
+        self.assertIsNone(classify_cap_hit(1, None, "boom"))
+
+    def test_every_cap_message_names_its_cap_and_a_remedy(self):
+        expected = {
+            "memory": "AGENT_SANDBOX_MEMORY",
+            "pids": "AGENT_SANDBOX_PIDS_LIMIT",
+            "disk": "AGENT_SANDBOX_TMPFS_SIZE",
+        }
+        for cap_hit, env_name in expected.items():
+            with self.subTest(cap_hit=cap_hit):
+                message = cap_hit_message(cap_hit)
+                # The Worker needs the knob name (to ask for a bigger cap)
+                # and a hint about what to change in the command itself.
+                assert env_name in message
+                assert "cap" in message
+
+    def test_oom_kill_reaches_the_exec_result(self):
+        # Behavioral check through the runner: the cap hit is attached to the
+        # returned result (data), so call sites can turn it into actionable
+        # feedback instead of an opaque exit code.
+        workspace = Path("/tmp/whatever-workspace")
+        runner = DockerSandboxRunner(
+            image="verify-img", cpus="2", memory="4g", pids_limit="512"
+        )
+        script = [
+            (lambda cmd: _is_docker(cmd, "info"), _completed(0, stdout=b"27.0.3\n")),
+            (lambda cmd: _is_docker(cmd, "image"), _completed(0)),
+            (lambda cmd: _is_docker(cmd, "run"), _completed(137, stdout=b"Killed\n")),
+            (
+                lambda cmd: _is_docker(cmd, "inspect"),
+                _completed(
+                    0,
+                    stdout=json.dumps(
+                        {"Status": "exited", "ExitCode": 137, "OOMKilled": True}
+                    ).encode(),
+                ),
+            ),
+        ]
+        with patch(
+            "orchestrator.sandbox.subprocess.run", side_effect=_scripted_run(script)
+        ):
+            runner.create(workspace)
+            result = runner.exec(["make", "verify"], timeout=10)
+        self.assertEqual(result.exit_code, 137)
+        self.assertEqual(result.cap_hit, "memory")
+        self.assertFalse(result.timed_out)
+
+
+class TestSandboxContainerCleanup(unittest.TestCase):
+    """FR-7 lifecycle mechanics (issue #164): no container outlives its exec."""
+
+    def test_every_exec_outcome_removes_its_container(self):
+        # Success, data exit, timeout and infrastructure failure all remove
+        # the container before returning/raising: a crashed cycle leaves at
+        # most one in-flight container for the startup sweep.
+        outcomes = {
+            "success": (
+                [
+                    (lambda cmd: _is_docker(cmd, "run"), _completed(0, stdout=b"ok")),
+                ],
+                "return",
+            ),
+            "data_exit": (
+                [
+                    (
+                        lambda cmd: _is_docker(cmd, "run"),
+                        _completed(1, stdout=b"FAIL\n"),
+                    ),
+                    (
+                        lambda cmd: _is_docker(cmd, "inspect"),
+                        _completed(0, stdout=b'{"Status": "exited", "ExitCode": 1}'),
+                    ),
+                ],
+                "return",
+            ),
+            "timeout": (
+                [
+                    (
+                        lambda cmd: _is_docker(cmd, "run"),
+                        subprocess.TimeoutExpired(cmd="docker run", timeout=1),
+                    ),
+                ],
+                "return",
+            ),
+            "infrastructure": (
+                [
+                    (lambda cmd: _is_docker(cmd, "run"), _completed(1, stdout=b"boom")),
+                    (lambda cmd: _is_docker(cmd, "inspect"), _completed(1)),
+                ],
+                "raise",
+            ),
+        }
+        for name, (exec_rules, expectation) in outcomes.items():
+            with self.subTest(outcome=name):
+                removals: list[list[str]] = []
+                script = [
+                    (
+                        lambda cmd: _is_docker(cmd, "info"),
+                        _completed(0, stdout=b"27.0.3\n"),
+                    ),
+                    (lambda cmd: _is_docker(cmd, "image"), _completed(0)),
+                    *exec_rules,
+                ]
+                runner = DockerSandboxRunner(
+                    image="verify-img", cpus="2", memory="4g", pids_limit="512"
+                )
+                with patch(
+                    "orchestrator.sandbox.subprocess.run",
+                    side_effect=_scripted_run(script, removals=removals),
+                ):
+                    runner.create(Path("/tmp/whatever-workspace"))
+                    if expectation == "raise":
+                        with self.assertRaises(SandboxError):
+                            runner.exec(["make", "verify"], timeout=1)
+                    else:
+                        runner.exec(["make", "verify"], timeout=1)
+                    # destroy() has nothing left to do: the exec already
+                    # removed its container.
+                    runner.destroy()
+                self.assertEqual(len(removals), 1)
+                self.assertEqual(removals[0][:3], ["docker", "rm", "-f"])
+
+    def test_removal_retries_once_then_reports_failure(self):
+        attempts = []
+
+        def _run(cmd, **kwargs):
+            attempts.append(list(cmd))
+            return _completed(1, stderr=b"permission denied")
+
+        with patch("orchestrator.sandbox.subprocess.run", side_effect=_run):
+            with self.assertLogs("orchestrator.sandbox", level="ERROR") as logs:
+                removed = remove_sandbox_container("agdc-sandbox-deadbeef")
+        self.assertFalse(removed)
+        self.assertEqual(len(attempts), 2)
+        error_text = "\n".join(logs.output)
+        # The operator needs the container name and the manual command.
+        assert "agdc-sandbox-deadbeef" in error_text
+        assert "docker rm -f agdc-sandbox-deadbeef" in error_text
+        assert "permission denied" in error_text
+
+    def test_removal_succeeds_on_retry(self):
+        attempts = []
+
+        def _run(cmd, **kwargs):
+            attempts.append(list(cmd))
+            if len(attempts) == 1:
+                return _completed(1, stderr=b"temporary failure")
+            return _completed(0)
+
+        with patch("orchestrator.sandbox.subprocess.run", side_effect=_run):
+            removed = remove_sandbox_container("agdc-sandbox-retry")
+        self.assertTrue(removed)
+        self.assertEqual(len(attempts), 2)
+
+    def test_removal_survives_an_unavailable_cli(self):
+        with patch(
+            "orchestrator.sandbox.subprocess.run",
+            side_effect=OSError("docker gone"),
+        ):
+            with self.assertLogs("orchestrator.sandbox", level="ERROR"):
+                removed = remove_sandbox_container("agdc-sandbox-gone")
+        self.assertFalse(removed)
+
+    def test_removal_of_an_absent_container_counts_as_gone(self):
+        with patch(
+            "orchestrator.sandbox.subprocess.run",
+            side_effect=lambda cmd, **kwargs: _completed(
+                1,
+                stderr=(
+                    b"Error response from daemon: No such container: agdc-sandbox-old"
+                ),
+            ),
+        ):
+            with self.assertNoLogs("orchestrator.sandbox", level="ERROR"):
+                removed = remove_sandbox_container("agdc-sandbox-old")
+        # The removal's postcondition — no such container — already holds, so
+        # an already-gone container is gone: the startup sweep's
+        # listing-to-removal race must not demand manual cleanup of a container
+        # that does not exist.
+        self.assertTrue(removed)
+
+    def test_managed_container_listing_parses_names_and_cycles(self):
+        listing = (
+            b"agdc-sandbox-aaaa1111 issue-164\n"
+            b"agdc-sandbox-bbbb2222 issue-163\n"
+            b"agdc-sandbox-cccc3333 \n"
+            b"\n"
+        )
+        captured = {}
+
+        def _run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return _completed(0, stdout=listing)
+
+        with patch("orchestrator.sandbox.subprocess.run", side_effect=_run):
+            containers = list_managed_sandbox_containers()
+        self.assertEqual(
+            containers,
+            [
+                ("agdc-sandbox-aaaa1111", "issue-164"),
+                ("agdc-sandbox-bbbb2222", "issue-163"),
+                ("agdc-sandbox-cccc3333", ""),
+            ],
+        )
+        # The filter is the ownership marker: unmanaged containers are never
+        # candidates for the sweep.
+        listing_cmd = " ".join(captured["cmd"])
+        assert f"label={SANDBOX_MANAGED_LABEL}=1" in listing_cmd
+        assert f'{{{{.Label "{SANDBOX_CYCLE_LABEL}"}}}}' in listing_cmd
+
+    def test_managed_container_listing_fails_loudly_on_daemon_failure(self):
+        with patch(
+            "orchestrator.sandbox.subprocess.run",
+            side_effect=lambda cmd, **kwargs: _completed(1, stderr=b"cannot connect"),
+        ):
+            with self.assertRaises(SandboxUnavailableError) as ctx:
+                list_managed_sandbox_containers()
+        assert "cannot connect" in str(ctx.exception)
+
+    def test_managed_container_listing_fails_loudly_on_missing_cli(self):
+        with patch(
+            "orchestrator.sandbox.subprocess.run",
+            side_effect=OSError("docker gone"),
+        ):
+            with self.assertRaises(SandboxUnavailableError):
+                list_managed_sandbox_containers()
 
 
 class TestSandboxDefaults(unittest.TestCase):
