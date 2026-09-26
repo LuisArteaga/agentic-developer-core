@@ -4974,8 +4974,9 @@ class TestTestWriterNoOpGuard(unittest.TestCase):
         """Install the GitHub API mock and the pre-verification sandbox stub.
 
         Since issue #160 the unittest discovery runs inside the Execution
-        Sandbox, so the seam is ``orchestrator.nodes.get_sandbox_runner``: the
-        stub returns a single green discovery result (output composed as the
+        Sandbox, and since issue #164 that sandbox is the cycle's own
+        (ADR-0061), so the seam is ``orchestrator.nodes.acquire_cycle_sandbox``:
+        the stub returns a single green discovery result (output composed as the
         former ``stdout + "\\n" + stderr``); git traffic runs unmocked.
         """
         mock_github_api.return_value = {

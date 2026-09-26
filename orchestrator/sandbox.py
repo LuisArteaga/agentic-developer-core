@@ -112,6 +112,14 @@ SANDBOX_CYCLE_LABEL = "agdc.sandbox.cycle"
 # failure is escalated to an operator-facing ERROR (FR-7, issue #164).
 _REMOVE_ATTEMPTS = 2
 
+# ``docker rm -f`` reports an already-absent container on a non-zero exit
+# ("Error response from daemon: No such container: <name>"). That is the one
+# non-zero exit whose postcondition already holds, so it counts as gone;
+# treating it as a failure would raise a manual-cleanup ERROR for a container
+# that does not exist (the startup sweep's listing-to-removal race) and keep
+# the name in the runner's leftovers list forever.
+_ALREADY_GONE_MARKER = "no such container"
+
 # Container runtime for sandbox containers (FR-4, issue #161). The default
 # ``runsc`` (gVisor user-space kernel) is a hard requirement: when it is not
 # available the preflight refuses to start the orchestrator instead of
@@ -779,10 +787,12 @@ def remove_sandbox_container(name: str, timeout: int = 30) -> bool:
     Best-effort by contract: cleanup must never block recovery routing, so a
     failure is retried once and then logged loudly with the container name and
     the manual-cleanup command (a sandbox that outlives its cycle is a
-    deployment problem an operator has to see). Returns True when the
-    container is gone — including when it was already gone, since ``docker rm
-    -f`` is idempotent and its "no such container" exit is indistinguishable
-    from a race the operator does not care about.
+    deployment problem an operator has to see). Returns whether the container
+    is gone: ``True`` on a successful removal and on an already-absent
+    container, because ``docker rm -f``'s postcondition — no such container —
+    already holds there, and the startup sweep's listing-to-removal race is not
+    a failure an operator can act on. Every other non-zero exit (daemon
+    unreachable, permission denied) is a real failure and returns ``False``.
     """
     detail = "no output"
     for attempt in range(1, _REMOVE_ATTEMPTS + 1):
@@ -799,6 +809,8 @@ def remove_sandbox_container(name: str, timeout: int = 30) -> bool:
             if proc.returncode == 0:
                 return True
             detail = stderr_snippet(proc.stderr) or stderr_snippet(proc.stdout)
+            if _ALREADY_GONE_MARKER in detail.lower():
+                return True
         if attempt < _REMOVE_ATTEMPTS:
             logger.warning(
                 "Sandbox container removal attempt %d/%d failed for %s: %s",

@@ -115,6 +115,10 @@ cycle <token>)`.
   `Sandbox container <name> could not be removed after 2 attempts (<detail>); manual cleanup required: docker rm -f <name>`
   — and the name stays tracked, so a later `destroy()` retries exactly the
   leftovers.
+- A container that is already gone is gone, not a failure: `docker rm -f`
+  reports "No such container" on a non-zero exit and the postcondition already
+  holds. That is what keeps the sweep's listing-to-removal race from demanding
+  manual cleanup of a container that does not exist — §6.4 is the other case.
 - A wedged exec that hits the timeout kills both the `docker run` client and
   its container, and returns the partial output as verification feedback; it
   does not leave a running container behind.
@@ -182,7 +186,8 @@ docker rm -f <name>          # one container, explicit
 
 ### 6.4 ERROR: container could not be removed
 
-The removal retry pair failed (daemon unreachable or the container is stuck).
+The removal retry pair failed (daemon unreachable or the container is stuck —
+an already-absent container is not a failure and never produces this message).
 The message names the container and the manual command. Diagnose:
 
 ```bash

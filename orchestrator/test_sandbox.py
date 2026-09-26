@@ -1231,16 +1231,23 @@ class TestSandboxContainerCleanup(unittest.TestCase):
                 removed = remove_sandbox_container("agdc-sandbox-gone")
         self.assertFalse(removed)
 
-    def test_removal_of_an_absent_container_is_reported_as_failed(self):
+    def test_removal_of_an_absent_container_counts_as_gone(self):
         with patch(
             "orchestrator.sandbox.subprocess.run",
             side_effect=lambda cmd, **kwargs: _completed(
-                1, stderr=b"Error: No such container: agdc-sandbox-old"
+                1,
+                stderr=(
+                    b"Error response from daemon: No such container: agdc-sandbox-old"
+                ),
             ),
         ):
-            # A non-zero docker exit is a failure: the sweep must not claim a
-            # removal it cannot prove, but it must not raise either.
-            self.assertFalse(remove_sandbox_container("agdc-sandbox-old"))
+            with self.assertNoLogs("orchestrator.sandbox", level="ERROR"):
+                removed = remove_sandbox_container("agdc-sandbox-old")
+        # The removal's postcondition — no such container — already holds, so
+        # an already-gone container is gone: the startup sweep's
+        # listing-to-removal race must not demand manual cleanup of a container
+        # that does not exist.
+        self.assertTrue(removed)
 
     def test_managed_container_listing_parses_names_and_cycles(self):
         listing = (

@@ -131,7 +131,10 @@ cycle binding lives in the lifecycle module (it is a property of a *cycle*).
   then logged as an operator-facing ERROR naming the container id — never
   raised into the recovery path, and the name is dropped from the tracking list
   only once removal is confirmed, so a later `destroy()` retries exactly the
-  leftovers.
+  leftovers. An already-absent container counts as *gone*, not as a failure:
+  `docker rm -f` reports it on a non-zero exit and the postcondition ("no such
+  container") already holds, so the sweep's listing-to-removal race cannot
+  demand manual cleanup of a container that does not exist.
 - **A cap hit is a failed attempt, not runner infrastructure.**
   `classify_cap_hit` returns `memory` / `pids` / `disk` / `None` from
   conservative signals, and `cap_hit_message` supplies the actionable
