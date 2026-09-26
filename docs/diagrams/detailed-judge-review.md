@@ -8,7 +8,7 @@ One diagram; rendered natively by GitHub.
 
 ```mermaid
 flowchart TD
-    PUSH["PR push event"] --> CI["CI quality gates<br/>quality-gates-toolkit composite, v1.7.0<br/>lint, test, coverage, semgrep, pip-audit"]
+    PUSH["PR push event"] --> CI["CI quality gates<br/>quality-gates-toolkit composite, v1.8.9<br/>lint, test, coverage, semgrep, pip-audit"]
 
     CI -->|"all green - serial cost gate"| RUNJUDGE["Run LLM review<br/>scripts/review.py"]
 
@@ -70,7 +70,7 @@ flowchart TD
 - **ADR-0036 / ADR-0055** — bounded merge-fix loop; check-run fail-fast with
   dual triage (judge-infrastructure vs. fixable product-CI failure).
 - **ADR-0050 / ADR-0059** — Reusable Judge Workflow delivery; origin repo
-  consumes the toolkit composite (`v1.7.0`) with an explicit judge-token
+  consumes the toolkit composite (`v1.8.9`) with an explicit judge-token
   mapping.
 - **Code** — `scripts/review.py` (writer), `orchestrator/nodes.py`
   (`merge_node` parser: `_extract_review_findings`, `_evaluate_check_failures`),

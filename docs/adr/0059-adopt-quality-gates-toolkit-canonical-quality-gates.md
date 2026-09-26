@@ -4,6 +4,34 @@
 * **Date**: 2026-09-12
 * **Deciders**: Luis Arteaga & The Architect
 
+**Amended 2026-09-26:** the consumed toolkit tag moved from `v1.7.0` to
+`v1.8.9` — still an immutable release tag (D-0007) — in
+`.github/workflows/ci.yml` and `.pre-commit-config.yaml`, with `TOOLKIT_TAG` in
+`scripts/test_ci_workflow_contract.py` following it. The caller shape is
+unchanged: every input the caller passes still exists at `v1.8.9` with the same
+name and default (diffing the two tags' `workflow_call` input blocks shows one
+changed line — the internal `toolkit-ref` default, which this caller does not
+pass), and the four consumed hook ids (`secret-scan`, `mypy`,
+`semgrep`, `pip-audit`) are unchanged. No lockstep move is needed elsewhere —
+the toolkit's `lint.yml` pins still read `RUFF_VERSION 0.16.6` /
+`MYPY_VERSION 2.3.1`, so the `ruff-pre-commit` rev and the `pyproject.toml`
+dev extras stay exactly as decided below. Behavior the judges gain with the
+tag: a bounded completion cap (D-0021, default 32768 — this caller's
+`config/factory.json` sets no judge `max_tokens`, so the default applies), a
+per-call wall-clock ceiling with timeout re-route (D-0022), severity-blind
+findings that must block the merge (D-0023), persistence of an undelivered
+review body (D-0024), a bounded Semgrep ruleset-fetch retry shared by the hook
+and `security.yml` (D-0025), the `<findings>`-block answer contract with a
+one-shot retry and a fallback ladder for a still-unusable answer
+(D-0026/D-0027), and a `fallback_model` validation boundary (D-0028 — all four
+judge entries here name a fallback distinct from their `model`, so no warning
+fires). The composite also gained an optional `batch-budget-chars` input
+(judge-diff batching for large diffs); it is deliberately NOT adopted here.
+`judge-token` stays mapped to `GH_PAT`: since D-0005 an identity-less run posts
+a comment review, so the PAT is no longer required for the review to be
+delivered, but the explicit mapping keeps ADR-0014's trusted-author check
+satisfied without depending on that fallback.
+
 ## Context and Problem Statement
 
 The quality-gate stack of this repository was extracted into the public
@@ -26,20 +54,21 @@ had to be manually re-ported into the origin copies.
 
 We decide to make the origin repository dogfood its own product: all CI
 quality gates and pre-commit hooks are consumed from the toolkit at the
-immutable release tag `v1.7.0` (toolkit D-0007: never a floating ref).
+immutable release tag `v1.7.0` (toolkit D-0007: never a floating ref; moved to
+`v1.8.9` by the 2026-09-26 amendment).
 
 ## Decision
 
 1. **Pre-commit** (`.pre-commit-config.yaml`): two sources only —
    `ruff-pre-commit` at `v0.16.6` (lockstep with the toolkit lint.yml pin;
    the toolkit ships no ruff hook by design, D-0016) and the toolkit at
-   `v1.7.0` providing `secret-scan`, `mypy` (language: system, advisory —
+   `v1.8.9` providing `secret-scan`, `mypy` (language: system, advisory —
    the CI lint pin stays authoritative), `semgrep` (1.65.0 → 1.177.0,
    toolkit-pinned isolated env), and `pip-audit` (2.10.1). The local
    `scripts/secret_scan.py` STAYS for local runs / `make secret-scan`;
    only the pre-commit wiring moves.
 2. **CI** (`.github/workflows/ci.yml`): a single job calling
-   `LuisArteaga/quality-gates-toolkit/.github/workflows/python-checks.yml@v1.7.0`
+   `LuisArteaga/quality-gates-toolkit/.github/workflows/python-checks.yml@v1.8.9`
    — the per-language Python composite (toolkit D-0020), so a Python-only
    caller has no `Skipped` check entries by construction (the polyglot
    `pr-checks.yml` remains the toolkit's polyglot single-entry option).
@@ -55,7 +84,7 @@ immutable release tag `v1.7.0` (toolkit D-0007: never a floating ref).
    `pull-requests: write` (a called workflow may only narrow scopes; the
    composite's llmreview job requests it — escalation otherwise dies as
    startup_failure). The pre-commit toolkit `rev` equals the composite tag
-   (`v1.7.0`) — the single-source-of-truth lockstep pinned by the contract
+   (`v1.8.9`) — the single-source-of-truth lockstep pinned by the contract
    test.
 3. **Retirement**: `.github/workflows/pr-checks.yml`,
    `.github/workflows/llm-pr-review.yml`, and their structure tests
@@ -132,4 +161,13 @@ immutable release tag `v1.7.0` (toolkit D-0007: never a floating ref).
   (T1 — canonical source artifact, accessed 2026-09-12, fetched and the
   input set / `needs` chain / relative `uses` refs verified verbatim;
   the caller targets this composite as the first consumer).
-  the caller targets this composite as the first consumer).
+* Toolkit decision register at the amended tag (D-0021 bounded completion cap,
+  D-0022 per-call wall-clock ceiling, D-0023 finding promotion threshold,
+  D-0024 undelivered review body, D-0025 ruleset-fetch retry, D-0026
+  `<findings>` answer contract, D-0027 fallback ladder, D-0028 `fallback_model`
+  validation) —
+  [DECISIONS.md at tag v1.8.9](https://github.com/LuisArteaga/quality-gates-toolkit/blob/v1.8.9/DECISIONS.md)
+  (T2, accessed 2026-09-26, fetched via `gh api` and cross-read against the
+  v1.8.9 `python-checks.yml` input block, `lint.yml` version pins,
+  `judge_config.py` and `.pre-commit-hooks.yaml`; the composite's
+  `toolkit-ref` default resolves to the same tag).

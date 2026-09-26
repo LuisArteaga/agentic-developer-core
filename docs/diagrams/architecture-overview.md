@@ -90,7 +90,7 @@ flowchart TD
   allowlist.
 - **ADR-0056** — split-plane Execution Sandbox (Docker + gVisor runsc).
 - **ADR-0050 / ADR-0059** — Reusable Judge Workflow delivery; quality-gates
-  toolkit as canonical gate provider (v1.7.0).
+  toolkit as canonical gate provider (v1.8.9).
 - **Code** — `scripts/entrypoint.py`, `orchestrator/__main__.py`,
   `orchestrator/graph.py`, `orchestrator/nodes.py`, `orchestrator/worker.py`,
   `orchestrator/tools.py`, `orchestrator/research_tools.py`,
