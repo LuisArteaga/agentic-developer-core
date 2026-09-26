@@ -15,7 +15,7 @@ on:
 
 jobs:
   ci:
-    uses: LuisArteaga/quality-gates-toolkit/.github/workflows/python-checks.yml@v1.7.0
+    uses: LuisArteaga/quality-gates-toolkit/.github/workflows/python-checks.yml@v1.8.9
     permissions:
       contents: read
       # Required: the composite declares an llmreview job requesting

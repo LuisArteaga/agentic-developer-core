@@ -19,7 +19,7 @@ and source files it is grounded in.
 ## Revision note
 
 Diagrams reflect `main` as of 2026-09 (after ADR-0059: quality gates and the
-judge pipeline are consumed from the quality-gates-toolkit at `v1.7.0`).
+judge pipeline are consumed from the quality-gates-toolkit at `v1.8.9`).
 Behavior that is configurable is drawn with its current default and marked as
 configurable — thresholds can drift; the source ADRs and code files listed in
 each diagram are the ground truth. Where code and an ADR could disagree, the

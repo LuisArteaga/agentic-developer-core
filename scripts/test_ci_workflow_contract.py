@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 PRE_COMMIT_CONFIG_PATH = REPO_ROOT / ".pre-commit-config.yaml"
 
-TOOLKIT_TAG = "v1.7.0"
+TOOLKIT_TAG = "v1.8.9"
 TOOLKIT_COMPOSITE_USES = (
     "LuisArteaga/quality-gates-toolkit/.github/workflows/python-checks.yml@"
     + TOOLKIT_TAG
